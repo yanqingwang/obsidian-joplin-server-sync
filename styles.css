@@ -1,0 +1,5 @@
+/* Joplin Server Sync - minimal styles */
+.joplin-sync-status { font-size: 12px; padding: 0 8px; }
+.joplin-sync-status.syncing { color: var(--text-accent); }
+.joplin-sync-status.ok { color: var(--text-success); }
+.joplin-sync-status.error { color: var(--text-error); }

@@ -1,0 +1,29 @@
+export type ConflictStrategy = 'duplicate' | 'local-wins' | 'remote-wins';
+
+export interface PluginSettings {
+  serverUrl: string;
+  email: string;
+  password: string;
+  syncIntervalSec: number;
+  syncOnStartup: boolean;
+  conflictStrategy: ConflictStrategy;
+  excludePatterns: string[];
+  attachmentFolder: string;
+  maxAttachmentMB: number;
+  clientId: string;
+  logLevel: 'error' | 'info' | 'debug';
+}
+
+export const DEFAULT_SETTINGS: PluginSettings = {
+  serverUrl: '',
+  email: '',
+  password: '',
+  syncIntervalSec: 300,
+  syncOnStartup: false,
+  conflictStrategy: 'duplicate',
+  excludePatterns: ['.obsidian/', '_conflicts/', 'templates/'],
+  attachmentFolder: 'attachments',
+  maxAttachmentMB: 100,
+  clientId: '',
+  logLevel: 'info',
+};

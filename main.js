@@ -1780,17 +1780,28 @@ var SyncEngine = class {
         }
       }
       let done = 0;
+      let fail = 0;
+      try {
+        await this.plugin.api.login();
+      } catch {
+      }
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
-          const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
-          const parentId = folderMap.get(dir) || rootFolderId;
-          await this.uploadNote(file, parentId);
-          done++;
-          this.plugin.statusBar.setProgress(done, files.length, "push");
+          try {
+            const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+            const parentId = folderMap.get(dir) || rootFolderId;
+            await this.uploadNote(file, parentId);
+            done++;
+          } catch (e) {
+            fail++;
+            if (fail <= 3)
+              console.error("[joplin-sync] upload failed:", file.path, e?.message || e);
+          }
+          this.plugin.statusBar.setProgress(done + fail, files.length, "push");
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian8.Notice("Force push: cleared " + deleted + ", uploaded " + done + " notes");
+      new import_obsidian8.Notice("Force push: cleared " + deleted + ", uploaded " + done + " notes" + (fail ? ", " + fail + " failed" : ""));
       this.plugin.logSync("push", done, 0);
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {

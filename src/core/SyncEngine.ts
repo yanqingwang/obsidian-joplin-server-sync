@@ -255,18 +255,25 @@ export class SyncEngine {
         }
       }
 
-      let done = 0;
+      let done = 0; let fail = 0;
+      // Refresh login before uploading notes (session may expire during folder creation)
+      try { await this.plugin.api.login(); } catch { void 0; }
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
-          const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
-          const parentId = folderMap.get(dir) || rootFolderId;
-          await this.uploadNote(file, parentId);
-          done++;
-          this.plugin.statusBar.setProgress(done, files.length, 'push');
+          try {
+            const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
+            const parentId = folderMap.get(dir) || rootFolderId;
+            await this.uploadNote(file, parentId);
+            done++;
+          } catch (e: any) {
+            fail++;
+            if (fail <= 3) console.error('[joplin-sync] upload failed:', file.path, e?.message || e);
+          }
+          this.plugin.statusBar.setProgress(done + fail, files.length, 'push');
         }));
         await this.plugin.mapping.flush();
       }
-      new Notice('Force push: cleared ' + deleted + ', uploaded ' + done + ' notes');
+      new Notice('Force push: cleared ' + deleted + ', uploaded ' + done + ' notes' + (fail ? ', ' + fail + ' failed' : ''));
       this.plugin.logSync('push', done, 0);
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {

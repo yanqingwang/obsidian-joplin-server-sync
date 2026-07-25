@@ -302,7 +302,17 @@ var JoplinServerApi = class {
       throw new ApiError(res.status, res.text);
     if (!res.json)
       throw new ApiError(res.status, "delta body is not JSON: " + res.text.slice(0, 200));
-    return res.json;
+    const raw = res.json;
+    const items = raw.items || [];
+    for (const item of items) {
+      if (item.item_name)
+        item.name = item.item_name;
+      if (item.jop_updated_time)
+        item.updated_time = item.jop_updated_time;
+      if (item.type !== void 0)
+        item.type = Number(item.type);
+    }
+    return { items, has_more: !!raw.has_more, cursor: raw.cursor };
   }
   async acquireLock(type, clientType, clientId) {
     const res = await this.exec("POST", "/api/locks", {

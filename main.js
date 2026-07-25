@@ -1584,7 +1584,24 @@ var SyncEngine = class {
       encryption_cipher_text: "",
       markup_language: 1
     };
-    const result = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
+    const payload = this.serializer.serialize(item);
+    const result = await this.plugin.api.putItem(id + ".md", payload);
+    const raw = await this.plugin.api.getItem(id + ".md");
+    if (raw) {
+      const remote = this.serializer.unserialize(raw);
+      const remoteHash = await sha256(remote.body ?? "");
+      if (remoteHash !== hash) {
+        console.warn("[joplin-sync] verify failed for: " + file.path + " retrying...");
+        await this.plugin.api.putItem(id + ".md", payload);
+        const raw2 = await this.plugin.api.getItem(id + ".md");
+        if (raw2) {
+          const remote2 = this.serializer.unserialize(raw2);
+          if (await sha256(remote2.body ?? "") !== hash) {
+            throw new Error("Content verification failed after retry: " + file.path);
+          }
+        }
+      }
+    }
     this.plugin.mapping.upsert({
       joplinId: id,
       path: file.path,
@@ -1935,7 +1952,7 @@ var SyncEngine = class {
   }
 };
 async function sha256(text) {
-  const data = typeof text === "string" ? new TextEncoder().encode(text) : text;
+  const data = typeof text === "string" ? new TextEncoder().encode(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")) : text;
   const digest = await crypto.subtle.digest("SHA-256", data);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }

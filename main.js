@@ -268,34 +268,18 @@ var JoplinServerApi = class {
     return res.arrayBuffer;
   }
   async putItem(name, content, force = false) {
-    const res = await this.rawRequest("PUT", this.itemPath(name, "/content") + (force ? "?force=1" : ""), {
+    const res = await this.exec("PUT", this.itemPath(name, "/content") + (force ? "?force=1" : ""), {
       body: content,
       contentType: "application/octet-stream"
     });
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
-    const fields = this.parseJoplinFields(res.text);
-    if (!fields.id)
-      throw new ApiError(res.status, "PUT response missing id field: " + res.text.slice(0, 200));
-    return { id: fields.id, updated_time: fields.updated_time };
-  }
-  parseJoplinFields(text) {
-    const result = { id: "", updated_time: 0 };
-    const lines = text.split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i];
-      const sep = line.indexOf(":");
-      if (sep > 0) {
-        const key = line.slice(0, sep).trim();
-        if (key === "id")
-          result.id = line.slice(sep + 1).trim();
-        if (key === "updated_time")
-          result.updated_time = new Date(line.slice(sep + 1).trim()).getTime();
-      }
-      if (result.id && result.updated_time)
-        break;
-    }
-    return result;
+    if (!res.json)
+      throw new ApiError(res.status, "PUT response not JSON: " + res.text.slice(0, 200));
+    return {
+      id: res.json.id || "",
+      updated_time: res.json.updated_time || Date.now()
+    };
   }
   async deleteItem(name) {
     const res = await this.exec("DELETE", this.itemPath(name));

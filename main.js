@@ -877,10 +877,12 @@ var LocalPusher = class {
   }
   async pushAll() {
     const changes = this.queue.drain();
+    let ok = 0;
     const failed = [];
     for (const change of changes) {
       try {
         await this.pushOne(change);
+        ok++;
       } catch (e) {
         console.error("[joplin-sync] push failed: " + change.path, e);
         failed.push(change);
@@ -888,6 +890,7 @@ var LocalPusher = class {
     }
     if (failed.length)
       this.queue.requeue(failed);
+    return { ok, fail: failed.length };
   }
   async pushOne(c) {
     switch (c.kind) {
@@ -1131,12 +1134,16 @@ var DeltaPuller = class {
   async pullAll() {
     let cursor = this.plugin.mapping.getDeltaCursor();
     const pendingNotes = [];
+    let ok = 0;
+    let fail = 0;
     while (true) {
       const page = await this.plugin.api.delta(cursor || void 0);
       for (const d of page.items) {
         try {
           await this.applyChange(d, pendingNotes);
+          ok++;
         } catch (e) {
+          fail++;
           console.error("[joplin-sync] apply delta failed", d.name, e);
         }
       }
@@ -1145,9 +1152,16 @@ var DeltaPuller = class {
       if (!page.has_more)
         break;
     }
-    for (const note of pendingNotes)
-      await this.applyNote(note);
+    for (const note of pendingNotes) {
+      try {
+        await this.applyNote(note);
+        ok++;
+      } catch {
+        fail++;
+      }
+    }
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
+    return { ok, fail };
   }
   async applyChange(d, pendingNotes) {
     if (d.name.startsWith(".resource/")) {
@@ -1589,10 +1603,11 @@ var SyncEngine = class {
         await new InitialSync(this.plugin).run();
       }
       this.state = 1 /* Pushing */;
-      await this.pusher.pushAll();
-      this.plugin.statusBar.setProgress(0, 1, "pulling");
+      const pushResult = await this.pusher.pushAll();
+      this.plugin.statusBar.setProgress(pushResult.ok, Math.max(pushResult.ok, 1), "push");
       this.state = 2 /* Pulling */;
-      await this.deltaPuller.pullAll();
+      const pullResult = await this.deltaPuller.pullAll();
+      this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), "pull");
       this.state = 3 /* Resolving */;
       let resolvedCount = 0;
       for (const t of [...this.plugin.mapping.tombstones]) {
@@ -1600,9 +1615,9 @@ var SyncEngine = class {
         this.plugin.mapping.clearTombstone(t.joplinId);
         resolvedCount++;
       }
-      const totalItems = this.plugin.mapping.all().length;
-      this.plugin.statusBar.setOk(Date.now(), totalItems);
-      this.plugin.logSync("sync", totalItems, 0);
+      const totalMapped = this.plugin.mapping.all().length;
+      this.plugin.statusBar.setOk(Date.now(), totalMapped);
+      this.plugin.logSync("sync", totalMapped, pushResult.fail + pullResult.fail);
     } catch (e) {
       this.state = 4 /* Error */;
       console.error("[joplin-sync]", e);

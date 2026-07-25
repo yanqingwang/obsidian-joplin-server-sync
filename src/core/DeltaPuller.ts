@@ -17,16 +17,19 @@ export class DeltaPuller {
     this.resources = new ResourceManager(plugin);
   }
 
-  async pullAll(): Promise<void> {
+  async pullAll(): Promise<{ ok: number; fail: number }> {
     let cursor = this.plugin.mapping.getDeltaCursor();
     const pendingNotes: JoplinItem[] = [];
+    let ok = 0; let fail = 0;
 
     while (true) {
       const page = await this.plugin.api.delta(cursor || undefined);
       for (const d of page.items) {
         try {
           await this.applyChange(d, pendingNotes);
+          ok++;
         } catch (e) {
+          fail++;
           console.error('[joplin-sync] apply delta failed', d.name, e);
         }
       }
@@ -34,8 +37,9 @@ export class DeltaPuller {
       if (!page.has_more) break;
     }
 
-    for (const note of pendingNotes) await this.applyNote(note);
+    for (const note of pendingNotes) { try { await this.applyNote(note); ok++; } catch { fail++; } }
     this.plugin.mapping.setDeltaCursor(cursor ?? '');
+    return { ok, fail };
   }
 
   private async applyChange(d: DeltaItem, pendingNotes: JoplinItem[]): Promise<void> {

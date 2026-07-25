@@ -15,18 +15,20 @@ export class LocalPusher {
     this.resources = new ResourceManager(plugin);
   }
 
-  async pushAll(): Promise<void> {
+  async pushAll(): Promise<{ ok: number; fail: number }> {
     const changes = this.queue.drain();
-    const failed: LocalChange[] = [];
+    let ok = 0; const failed: LocalChange[] = [];
     for (const change of changes) {
       try {
         await this.pushOne(change);
+        ok++;
       } catch (e) {
         console.error('[joplin-sync] push failed: ' + change.path, e);
         failed.push(change);
       }
     }
     if (failed.length) this.queue.requeue(failed);
+    return { ok, fail: failed.length };
   }
 
   private async pushOne(c: LocalChange): Promise<void> {

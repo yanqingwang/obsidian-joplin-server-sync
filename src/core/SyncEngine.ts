@@ -141,11 +141,12 @@ export class SyncEngine {
       }
 
       this.state = SyncState.Pushing;
-      await this.pusher.pushAll();
-      this.plugin.statusBar.setProgress(0, 1, 'pulling');
+      const pushResult = await this.pusher.pushAll();
+      this.plugin.statusBar.setProgress(pushResult.ok, Math.max(pushResult.ok, 1), 'push');
 
       this.state = SyncState.Pulling;
-      await this.deltaPuller.pullAll();
+      const pullResult = await this.deltaPuller.pullAll();
+      this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), 'pull');
 
       this.state = SyncState.Resolving;
       let resolvedCount = 0;
@@ -155,9 +156,9 @@ export class SyncEngine {
         resolvedCount++;
       }
 
-      const totalItems = this.plugin.mapping.all().length;
-      this.plugin.statusBar.setOk(Date.now(), totalItems);
-      this.plugin.logSync('sync', totalItems, 0);
+      const totalMapped = this.plugin.mapping.all().length;
+      this.plugin.statusBar.setOk(Date.now(), totalMapped);
+      this.plugin.logSync('sync', totalMapped, pushResult.fail + pullResult.fail);
     } catch (e: any) {
       this.state = SyncState.Error;
       console.error('[joplin-sync]', e);

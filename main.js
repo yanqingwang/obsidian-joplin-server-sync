@@ -252,7 +252,7 @@ var JoplinServerApi = class {
     return "/api/items/root:/" + encodeURIComponent(name) + ":" + suffix;
   }
   async getItem(name) {
-    const res = await this.exec("GET", this.itemPath(name, "/content"));
+    const res = await this.rawRequest("GET", this.itemPath(name, "/content"));
     if (res.status === 404)
       return null;
     if (res.status !== 200)
@@ -260,7 +260,7 @@ var JoplinServerApi = class {
     return res.text;
   }
   async getItemBinary(name) {
-    const res = await this.exec("GET", this.itemPath(name, "/content"));
+    const res = await this.rawRequest("GET", this.itemPath(name, "/content"));
     if (res.status === 404)
       throw new ApiError(404, "Not found");
     if (res.status !== 200)

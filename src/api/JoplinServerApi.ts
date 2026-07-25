@@ -91,14 +91,14 @@ export class JoplinServerApi {
   }
 
   async getItem(name: string): Promise<string | null> {
-    const res = await this.exec('GET', this.itemPath(name, '/content'));
+    const res = await this.rawRequest('GET', this.itemPath(name, '/content'));
     if (res.status === 404) return null;
     if (res.status !== 200) throw new ApiError(res.status, res.text);
     return res.text;
   }
 
   async getItemBinary(name: string): Promise<ArrayBuffer> {
-    const res = await this.exec('GET', this.itemPath(name, '/content'));
+    const res = await this.rawRequest('GET', this.itemPath(name, '/content'));
     if (res.status === 404) throw new ApiError(404, 'Not found');
     if (res.status !== 200) throw new ApiError(res.status, res.text);
     return res.arrayBuffer;

@@ -259,25 +259,29 @@ export class SyncEngine {
           if (e2ee.isEncrypted(item)) {
             try {
               const decryptedSerialized = await e2ee.decryptItem(item);
-              if (decryptedSerialized) {
+              if (decryptedSerialized !== null && decryptedSerialized !== undefined) {
                 const decrypted = this.serializer.unserialize(decryptedSerialized);
                 body = decrypted.body ?? '';
               } else {
-                failed++; continue;
+                failed++;
+                console.warn('[joplin-sync] decrypt returned null for: ' + stat.name);
+                continue;
               }
             } catch (e: any) {
-              console.warn('[joplin-sync] decrypt failed: ' + stat.name + ' - ' + e.message);
-              failed++; continue;
+              console.warn('[joplin-sync] decrypt failed: ' + stat.name + ' - ' + (e.message || e));
+              failed++;
+              continue;
             }
           }
 
-          const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+          const title = item.title || 'Untitled';
+          const sanitized = title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
           let path = sanitized + '.md';
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
           if (existing) {
-            await this.plugin.app.vault.modify(existing as TFile, body);
+            await this.plugin.app.vault.modify(existing as TFile, body || '');
           } else {
-            await this.plugin.app.vault.create(path, body);
+            await this.plugin.app.vault.create(path, body || '');
           }
           const hash = await sha256(body);
           this.plugin.mapping.upsert({
@@ -287,7 +291,7 @@ export class SyncEngine {
           done++;
         } catch (e: any) {
           failed++;
-          console.error('[joplin-sync] force-pull failed: ' + stat.name, e);
+          console.error('[joplin-sync] force-pull failed item: ' + stat.name, e?.message || e?.toString() || 'unknown error');
         }
         this.plugin.statusBar.setProgress(done + failed, remoteStats.length);
       }

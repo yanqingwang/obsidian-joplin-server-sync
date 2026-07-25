@@ -66,7 +66,7 @@ export class JoplinSerializer {
       const line = lines[i];
       if (line.trim() === '') { bodyEndIndex = i; break; }
       const sep = line.indexOf(':');
-      if (sep < 0) throw new Error('Invalid metadata line: ' + line);
+      if (sep < 0) continue; // skip unknown lines (tolerate forward-compat)
       const key = line.slice(0, sep).trim();
       const value = line.slice(sep + 1).trim();
       item[key] = TIME_FIELDS.has(key) ? this.parseTime(value) : this.coerce(key, value);
@@ -74,7 +74,7 @@ export class JoplinSerializer {
 
     const headerBody = lines.slice(0, bodyEndIndex);
     item.title = headerBody[0] ?? '';
-    if (item.type_ === ModelType.Note) {
+    if (Number(item.type_) === ModelType.Note) {
       item.body = headerBody.slice(2).join('\n');
     }
     item.type_ = Number(item.type_);

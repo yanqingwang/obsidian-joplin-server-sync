@@ -1,7 +1,7 @@
 {
  "id": "joplin-server-sync",
  "name": "Joplin Server Sync",
- "version": "0.3.14",
+ "version": "0.3.15",
  "minAppVersion": "1.6.0",
  "description": "Sync vault with Joplin Server — bidirectional, attachments, tags, links.",
  "author": "rosswang",

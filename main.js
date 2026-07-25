@@ -1751,8 +1751,18 @@ var SyncEngine = class {
     }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing("force pull...");
+      this.plugin.statusBar.setSyncing("force pull: clearing local...");
       await this.plugin.api.login();
+      const allFiles = this.plugin.app.vault.getFiles();
+      let delCount = 0;
+      for (const f of allFiles) {
+        if (f.extension === "md") {
+          await this.plugin.app.vault.delete(f);
+          delCount++;
+        }
+      }
+      this.plugin.mapping.setDeltaCursor("");
+      console.log("[joplin-sync] force pull: deleted " + delCount + " local files");
       const rootFolderId = await this.ensureRootFolder();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;

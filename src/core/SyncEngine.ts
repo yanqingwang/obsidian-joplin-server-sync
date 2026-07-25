@@ -217,19 +217,50 @@ export class SyncEngine {
       const allRemote = await this.listAllRemoteItems();
       for (const stat of allRemote) {
         if (stat.name === 'info.json') continue;
-        try {
-          await this.plugin.api.deleteItem(stat.name);
-          deleted++;
-        } catch { }
+        try { await this.plugin.api.deleteItem(stat.name); deleted++; } catch { }
       }
-      console.log('[joplin-sync] force push: deleted ' + deleted + ' remote items');
+      console.log('[joplin-sync] force push: deleted ' + deleted);
 
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
+
+      // Build folder hierarchy on server
+      const folderMap = new Map<string, string>(); // dirpath -> joplinId
+      folderMap.set('', rootFolderId);
+      const dirs = new Set<string>();
+      for (const f of files) {
+        const d = f.path.substring(0, f.path.lastIndexOf('/'));
+        if (d) dirs.add(d);
+      }
+      for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
+        const parent = dp.includes('/') ? folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) : rootFolderId;
+        if (!parent) continue;
+        const fid = createJoplinId();
+        const title = dp.split('/').pop() || dp;
+        const now = Date.now();
+        const item: JoplinItem = {
+          id: fid, parent_id: parent, title,
+          created_time: now, updated_time: now,
+          user_created_time: now, user_updated_time: now,
+          type_: ModelType.Folder, encryption_applied: 0, encryption_cipher_text: '',
+        };
+        const payload = this.serializer.serialize(item);
+        const st = await this.plugin.api.putItem(fid + '.md', payload);
+        if (st && st.id) {
+          this.plugin.mapping.upsert({
+            joplinId: fid, path: dp + '/', type: ModelType.Folder,
+            localHash: '', remoteUpdatedTime: (st as any).updated_time || now, syncedAt: now,
+          });
+          folderMap.set(dp, fid);
+        }
+      }
+
       let done = 0;
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
-          await this.uploadNote(file, rootFolderId);
+          const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
+          const parentId = folderMap.get(dir) || rootFolderId;
+          await this.uploadNote(file, parentId);
           done++;
           this.plugin.statusBar.setProgress(done, files.length, 'push');
         }));

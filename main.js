@@ -1725,13 +1725,56 @@ var SyncEngine = class {
         } catch {
         }
       }
-      console.log("[joplin-sync] force push: deleted " + deleted + " remote items");
+      console.log("[joplin-sync] force push: deleted " + deleted);
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
+      const folderMap = /* @__PURE__ */ new Map();
+      folderMap.set("", rootFolderId);
+      const dirs = /* @__PURE__ */ new Set();
+      for (const f of files) {
+        const d = f.path.substring(0, f.path.lastIndexOf("/"));
+        if (d)
+          dirs.add(d);
+      }
+      for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
+        const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) : rootFolderId;
+        if (!parent)
+          continue;
+        const fid = createJoplinId();
+        const title = dp.split("/").pop() || dp;
+        const now = Date.now();
+        const item = {
+          id: fid,
+          parent_id: parent,
+          title,
+          created_time: now,
+          updated_time: now,
+          user_created_time: now,
+          user_updated_time: now,
+          type_: 2 /* Folder */,
+          encryption_applied: 0,
+          encryption_cipher_text: ""
+        };
+        const payload = this.serializer.serialize(item);
+        const st = await this.plugin.api.putItem(fid + ".md", payload);
+        if (st && st.id) {
+          this.plugin.mapping.upsert({
+            joplinId: fid,
+            path: dp + "/",
+            type: 2 /* Folder */,
+            localHash: "",
+            remoteUpdatedTime: st.updated_time || now,
+            syncedAt: now
+          });
+          folderMap.set(dp, fid);
+        }
+      }
       let done = 0;
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
-          await this.uploadNote(file, rootFolderId);
+          const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+          const parentId = folderMap.get(dir) || rootFolderId;
+          await this.uploadNote(file, parentId);
           done++;
           this.plugin.statusBar.setProgress(done, files.length, "push");
         }));

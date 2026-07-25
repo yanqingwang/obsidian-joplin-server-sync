@@ -42,7 +42,8 @@ var DEFAULT_SETTINGS = {
   attachmentFolder: "attachments",
   maxAttachmentMB: 100,
   clientId: "",
-  logLevel: "info"
+  logLevel: "info",
+  syncLog: []
 };
 
 // src/settings/SettingsTab.ts
@@ -103,6 +104,27 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.excludePatterns = v.split(",").map((s) => s.trim()).filter(Boolean);
       await this.plugin.saveSettings();
     }));
+    new import_obsidian.Setting(containerEl).setName("Sync history").setHeading();
+    const log = this.plugin.settings.syncLog;
+    if (log.length === 0) {
+      containerEl.createEl("p", { text: "No sync history yet." });
+    } else {
+      const tbl = containerEl.createEl("table");
+      const thead = tbl.createEl("thead");
+      const hr = thead.createEl("tr");
+      hr.createEl("th", { text: "Time" });
+      hr.createEl("th", { text: "Type" });
+      hr.createEl("th", { text: "OK" });
+      hr.createEl("th", { text: "Fail" });
+      const tbody = tbl.createEl("tbody");
+      for (const e of log) {
+        const tr = tbody.createEl("tr");
+        tr.createEl("td", { text: new Date(e.time).toLocaleTimeString() });
+        tr.createEl("td", { text: e.type });
+        tr.createEl("td", { text: String(e.ok) });
+        tr.createEl("td", { text: String(e.fail) });
+      }
+    }
   }
 };
 
@@ -1470,6 +1492,7 @@ var SyncEngine = class {
         this.plugin.mapping.clearTombstone(t.joplinId);
       }
       this.plugin.statusBar.setOk(Date.now());
+      this.plugin.logSync("sync", 0, 0);
     } catch (e) {
       this.state = 4 /* Error */;
       console.error("[joplin-sync]", e);
@@ -1518,6 +1541,7 @@ var SyncEngine = class {
         await this.plugin.mapping.flush();
       }
       new import_obsidian7.Notice("Force push: " + done + " notes uploaded");
+      this.plugin.logSync("push", done, 0);
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
@@ -1580,6 +1604,7 @@ var SyncEngine = class {
       this.plugin.mapping.setDeltaCursor(cursor ?? "");
       await this.plugin.mapping.flush();
       new import_obsidian7.Notice("Force pull: " + done + " notes, " + failed + " failed");
+      this.plugin.logSync("pull", done, failed);
     } finally {
       this.running = false;
       this.plugin.statusBar.setIdle();
@@ -1713,5 +1738,11 @@ var JoplinSyncPlugin = class extends import_obsidian8.Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  logSync(type, ok, fail) {
+    this.settings.syncLog.unshift({ time: Date.now(), type, ok, fail });
+    if (this.settings.syncLog.length > 5)
+      this.settings.syncLog.length = 5;
+    void this.saveSettings();
   }
 };

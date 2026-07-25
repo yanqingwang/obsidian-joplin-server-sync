@@ -1,5 +1,12 @@
 export type ConflictStrategy = 'duplicate' | 'local-wins' | 'remote-wins';
 
+export interface SyncLogEntry {
+  time: number;
+  type: string;
+  ok: number;
+  fail: number;
+}
+
 export interface PluginSettings {
   serverUrl: string;
   email: string;
@@ -12,6 +19,7 @@ export interface PluginSettings {
   maxAttachmentMB: number;
   clientId: string;
   logLevel: 'error' | 'info' | 'debug';
+  syncLog: SyncLogEntry[];
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -26,4 +34,5 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   maxAttachmentMB: 100,
   clientId: '',
   logLevel: 'info',
+  syncLog: [],
 };

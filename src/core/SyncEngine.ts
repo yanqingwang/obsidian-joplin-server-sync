@@ -150,6 +150,7 @@ export class SyncEngine {
       }
 
       this.plugin.statusBar.setOk(Date.now());
+      this.plugin.logSync('sync', 0, 0);
     } catch (e: any) {
       this.state = SyncState.Error;
       console.error('[joplin-sync]', e);
@@ -193,6 +194,7 @@ export class SyncEngine {
         await this.plugin.mapping.flush();
       }
       new Notice('Force push: ' + done + ' notes uploaded');
+      this.plugin.logSync('push', done, 0);
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
@@ -246,6 +248,7 @@ export class SyncEngine {
       this.plugin.mapping.setDeltaCursor(cursor ?? '');
       await this.plugin.mapping.flush();
       new Notice('Force pull: ' + done + ' notes, ' + failed + ' failed');
+      this.plugin.logSync('pull', done, failed);
     } finally {
       this.running = false;
       this.plugin.statusBar.setIdle();

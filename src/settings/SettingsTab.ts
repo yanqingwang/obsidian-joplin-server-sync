@@ -108,5 +108,28 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
           this.plugin.settings.excludePatterns = v.split(',').map(s => s.trim()).filter(Boolean);
           await this.plugin.saveSettings();
         }));
+
+    // Sync log
+    new Setting(containerEl).setName('Sync history').setHeading();
+    const log = this.plugin.settings.syncLog;
+    if (log.length === 0) {
+      containerEl.createEl('p', { text: 'No sync history yet.' });
+    } else {
+      const tbl = containerEl.createEl('table');
+      const thead = tbl.createEl('thead');
+      const hr = thead.createEl('tr');
+      hr.createEl('th', { text: 'Time' });
+      hr.createEl('th', { text: 'Type' });
+      hr.createEl('th', { text: 'OK' });
+      hr.createEl('th', { text: 'Fail' });
+      const tbody = tbl.createEl('tbody');
+      for (const e of log) {
+        const tr = tbody.createEl('tr');
+        tr.createEl('td', { text: new Date(e.time).toLocaleTimeString() });
+        tr.createEl('td', { text: e.type });
+        tr.createEl('td', { text: String(e.ok) });
+        tr.createEl('td', { text: String(e.fail) });
+      }
+    }
   }
 }

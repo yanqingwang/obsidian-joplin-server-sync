@@ -230,6 +230,54 @@ export class EncryptionService {
     return bytes;
   }
 
+/** Encrypt a serialized item string → encryption_cipher_text (method=StringV1) */
+  async encryptItem(serialized: string, masterKeyId: string): Promise<string> {
+    const key = this.loadedKeys.get(masterKeyId);
+    if (!key) throw new Error('Master key not loaded: ' + masterKeyId);
+    const chunks: string[] = [];
+    const CHUNK_SIZE = 5000; // Joplin default chunk size
+    for (let i = 0; i < serialized.length; i += CHUNK_SIZE) {
+      const chunk = serialized.slice(i, i + CHUNK_SIZE);
+      const encrypted = await this.encryptChunk(key, chunk);
+      chunks.push(encrypted);
+    }
+    return this.buildHeader(EncryptionMethod.StringV1, masterKeyId, chunks);
+  }
+
+  /** Encrypt a plaintext chunk → hex-encoded nonce+ciphertext+tag */
+  private async encryptChunk(key: CryptoKey, plain: string): Promise<string> {
+    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
+    const encoded = new TextEncoder().encode(plain);
+    const encrypted = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: this.buf(nonce), tagLength: GCM_TAG_BITS },
+      key, this.buf(encoded),
+    );
+    const encryptedBytes = new Uint8Array(encrypted);
+    const combined = this.concat(nonce, encryptedBytes);
+    return this.bytesToHex(combined);
+  }
+
+  /** Build Joplin header hex: [3B len][1B ver][2B method][32B masterKeyId] + chunks */
+  private buildHeader(method: number, masterKeyId: string, chunks: string[]): string {
+    const headerBytes = new Uint8Array(1 + 2 + 32);
+    let p = 0;
+    headerBytes[p++] = 1; // version
+    headerBytes[p++] = (method >> 8) & 0xFF;
+    headerBytes[p++] = method & 0xFF;
+    const mkBytes = this.hexToBytes(masterKeyId);
+    headerBytes.set(mkBytes, p); p += 32;
+    const headerHex = this.bytesToHex(headerBytes);
+    // 3-byte header length in hex
+    const hLenHex = (headerBytes.length).toString(16).padStart(6, '0');
+    let out = hLenHex + headerHex;
+    for (const chunk of chunks) {
+      const chunkBytes = chunk.length / 2;
+      out += (chunkBytes).toString(16).padStart(6, '0') + chunk;
+    }
+    return out;
+  }
+
   get hasLoadedKeys(): boolean { return this.loadedKeys.size > 0; }
   get availableMasterKeys(): string[] { return [...this.masterKeyItems.keys()]; }
+  get firstLoadedKeyId(): string | null { return this.loadedKeys.keys().next().value ?? null; }
 }

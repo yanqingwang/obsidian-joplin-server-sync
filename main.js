@@ -943,6 +943,37 @@ var LocalPusher = class {
       encryption_cipher_text: "",
       markup_language: 1
     };
+    const e2ee = this.plugin.e2ee;
+    const mkId = e2ee.firstLoadedKeyId;
+    if (mkId && this.plugin.engine.e2eeActive) {
+      const serialized = this.serializer.serialize(item);
+      const encryptedCt = await e2ee.encryptItem(serialized, mkId);
+      const cipherItem = {
+        id,
+        parent_id: parentId,
+        title: "",
+        body: "",
+        created_time: item.created_time,
+        updated_time: item.updated_time,
+        user_created_time: item.user_created_time,
+        user_updated_time: item.user_updated_time,
+        type_: 1 /* Note */,
+        encryption_applied: 1,
+        encryption_cipher_text: encryptedCt,
+        markup_language: 1
+      };
+      const cipherSerialized = this.serializer.serialize(cipherItem);
+      const res2 = await this.plugin.api.putItem(id + ".md", cipherSerialized);
+      this.plugin.mapping.upsert({
+        joplinId: id,
+        path,
+        type: 1 /* Note */,
+        localHash: hash,
+        remoteUpdatedTime: res2.updated_time,
+        syncedAt: Date.now()
+      });
+      return;
+    }
     const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
     this.plugin.mapping.upsert({
       joplinId: id,
@@ -1422,6 +1453,7 @@ var SyncEngine = class {
     this.running = false;
     this.state = 0 /* Idle */;
     this.timer = null;
+    this.e2eeActive = false;
     this.syncInfo = new SyncInfoHandler(plugin.api);
   }
   // ============ Phase 1: Legacy full upload ============
@@ -1434,6 +1466,7 @@ var SyncEngine = class {
     try {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
@@ -1551,6 +1584,7 @@ var SyncEngine = class {
       this.plugin.statusBar.setSyncing();
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
       if (!this.plugin.mapping.getDeltaCursor()) {
         await new InitialSync(this.plugin).run();
       }
@@ -1601,6 +1635,7 @@ var SyncEngine = class {
     try {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0;
@@ -1988,11 +2023,60 @@ var EncryptionService = class {
       bytes[i] = bin.charCodeAt(i);
     return bytes;
   }
+  /** Encrypt a serialized item string → encryption_cipher_text (method=StringV1) */
+  async encryptItem(serialized, masterKeyId) {
+    const key = this.loadedKeys.get(masterKeyId);
+    if (!key)
+      throw new Error("Master key not loaded: " + masterKeyId);
+    const chunks = [];
+    const CHUNK_SIZE = 5e3;
+    for (let i = 0; i < serialized.length; i += CHUNK_SIZE) {
+      const chunk2 = serialized.slice(i, i + CHUNK_SIZE);
+      const encrypted = await this.encryptChunk(key, chunk2);
+      chunks.push(encrypted);
+    }
+    return this.buildHeader(9 /* StringV1 */, masterKeyId, chunks);
+  }
+  /** Encrypt a plaintext chunk → hex-encoded nonce+ciphertext+tag */
+  async encryptChunk(key, plain) {
+    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
+    const encoded = new TextEncoder().encode(plain);
+    const encrypted = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: this.buf(nonce), tagLength: GCM_TAG_BITS },
+      key,
+      this.buf(encoded)
+    );
+    const encryptedBytes = new Uint8Array(encrypted);
+    const combined = this.concat(nonce, encryptedBytes);
+    return this.bytesToHex(combined);
+  }
+  /** Build Joplin header hex: [3B len][1B ver][2B method][32B masterKeyId] + chunks */
+  buildHeader(method, masterKeyId, chunks) {
+    const headerBytes = new Uint8Array(1 + 2 + 32);
+    let p = 0;
+    headerBytes[p++] = 1;
+    headerBytes[p++] = method >> 8 & 255;
+    headerBytes[p++] = method & 255;
+    const mkBytes = this.hexToBytes(masterKeyId);
+    headerBytes.set(mkBytes, p);
+    p += 32;
+    const headerHex = this.bytesToHex(headerBytes);
+    const hLenHex = headerBytes.length.toString(16).padStart(6, "0");
+    let out = hLenHex + headerHex;
+    for (const chunk2 of chunks) {
+      const chunkBytes = chunk2.length / 2;
+      out += chunkBytes.toString(16).padStart(6, "0") + chunk2;
+    }
+    return out;
+  }
   get hasLoadedKeys() {
     return this.loadedKeys.size > 0;
   }
   get availableMasterKeys() {
     return [...this.masterKeyItems.keys()];
+  }
+  get firstLoadedKeyId() {
+    return this.loadedKeys.keys().next().value ?? null;
   }
 };
 

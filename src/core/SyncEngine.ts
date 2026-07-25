@@ -22,6 +22,7 @@ export class SyncEngine {
   private pusher!: LocalPusher;
   private deltaPuller!: DeltaPuller;
   private timer: number | null = null;
+  e2eeActive = false;
 
   constructor(private plugin: JoplinSyncPlugin) {
     this.syncInfo = new SyncInfoHandler(plugin.api);
@@ -34,6 +35,7 @@ export class SyncEngine {
     try {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
@@ -132,6 +134,7 @@ export class SyncEngine {
       this.plugin.statusBar.setSyncing();
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
 
       if (!this.plugin.mapping.getDeltaCursor()) {
         await new InitialSync(this.plugin).run();
@@ -182,6 +185,7 @@ export class SyncEngine {
     try {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0;

@@ -77,6 +77,30 @@ export class LocalPusher {
       markup_language: 1,
     };
 
+    // E2EE: encrypt if keys are loaded and target has E2EE enabled
+    const e2ee = this.plugin.e2ee;
+    const mkId = e2ee.firstLoadedKeyId;
+    if (mkId && this.plugin.engine.e2eeActive) {
+      const serialized = this.serializer.serialize(item);
+      const encryptedCt = await e2ee.encryptItem(serialized, mkId);
+      const cipherItem: JoplinItem = {
+        id, parent_id: parentId, title: '',
+        body: '',
+        created_time: item.created_time, updated_time: item.updated_time,
+        user_created_time: item.user_created_time, user_updated_time: item.user_updated_time,
+        type_: ModelType.Note,
+        encryption_applied: 1, encryption_cipher_text: encryptedCt,
+        markup_language: 1,
+      };
+      const cipherSerialized = this.serializer.serialize(cipherItem);
+      const res = await this.plugin.api.putItem(id + '.md', cipherSerialized);
+      this.plugin.mapping.upsert({
+        joplinId: id, path, type: ModelType.Note,
+        localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
+      });
+      return;
+    }
+
     const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(item));
     this.plugin.mapping.upsert({
       joplinId: id, path, type: ModelType.Note,

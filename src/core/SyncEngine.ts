@@ -253,6 +253,7 @@ export class SyncEngine {
     try {
       this.plugin.statusBar.setSyncing('force pull...');
       await this.plugin.api.login();
+      const rootFolderId = await this.ensureRootFolder();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
 
@@ -282,9 +283,8 @@ export class SyncEngine {
         }
       }
 
-      // Pass 3: download notes (skip encrypted items we cannot decrypt)
+      // Pass 3: download notes
       let done = 0; let failed = 0; let skipped = 0;
-      const rootId = this.plugin.mapping.rootFolderId;
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
         if (stat.name.startsWith('.resource/')) continue;
@@ -293,13 +293,7 @@ export class SyncEngine {
           if (!raw) continue;
           const item = this.serializer.unserialize(raw);
 
-          // Skip non-note items
           if (item.type_ !== ModelType.Note) { skipped++; continue; }
-
-          // Skip items not under our root folder (old server data)
-          if (rootId && item.parent_id !== rootId && !this.plugin.mapping.getById(item.parent_id)) {
-            skipped++; continue;
-          }
 
           // E2EE handling
           let body = item.body ?? '';

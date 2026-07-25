@@ -1754,6 +1754,7 @@ var SyncEngine = class {
     try {
       this.plugin.statusBar.setSyncing("force pull...");
       await this.plugin.api.login();
+      const rootFolderId = await this.ensureRootFolder();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
       for (const stat of remoteStats) {
@@ -1785,7 +1786,6 @@ var SyncEngine = class {
       let done = 0;
       let failed = 0;
       let skipped = 0;
-      const rootId = this.plugin.mapping.rootFolderId;
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
           continue;
@@ -1797,10 +1797,6 @@ var SyncEngine = class {
             continue;
           const item = this.serializer.unserialize(raw);
           if (item.type_ !== 1 /* Note */) {
-            skipped++;
-            continue;
-          }
-          if (rootId && item.parent_id !== rootId && !this.plugin.mapping.getById(item.parent_id)) {
             skipped++;
             continue;
           }

@@ -281,11 +281,8 @@ export class SyncEngine {
           const raw = await this.plugin.api.getItem(stat.name);
           if (!raw) continue;
           const item = this.serializer.unserialize(raw);
-
-          // Feed master keys during the same pass
           if (item.type_ === 9) { e2ee.feedMasterKey(item); continue; }
-
-          if (item.type_ !== ModelType.Note) { skipped++; continue; }
+          if (item.type_ !== ModelType.Note || !item.title) { skipped++; continue; }
 
           // E2EE handling
           let body = item.body ?? '';
@@ -324,7 +321,12 @@ export class SyncEngine {
           done++;
         } catch (e: any) {
           failed++;
-          console.error('[joplin-sync] force-pull failed item: ' + stat.name, e?.message || e?.toString() || 'unknown error');
+          const errMsg = e?.message || e?.toString() || 'unknown error';
+          // If session expired, try refreshing login once
+          if (errMsg.includes('401') || errMsg.includes('session')) {
+            try { await this.plugin.api.login(); } catch {}
+          }
+          if (failed <= 5) console.error('[joplin-sync] force-pull:', stat.name, errMsg);
         }
         this.plugin.statusBar.setProgress(done + failed, remoteStats.length);
       }

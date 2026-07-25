@@ -1787,7 +1787,7 @@ var SyncEngine = class {
             e2ee.feedMasterKey(item);
             continue;
           }
-          if (item.type_ !== 1 /* Note */) {
+          if (item.type_ !== 1 /* Note */ || !item.title) {
             skipped++;
             continue;
           }
@@ -1830,7 +1830,15 @@ var SyncEngine = class {
           done++;
         } catch (e) {
           failed++;
-          console.error("[joplin-sync] force-pull failed item: " + stat.name, e?.message || e?.toString() || "unknown error");
+          const errMsg = e?.message || e?.toString() || "unknown error";
+          if (errMsg.includes("401") || errMsg.includes("session")) {
+            try {
+              await this.plugin.api.login();
+            } catch {
+            }
+          }
+          if (failed <= 5)
+            console.error("[joplin-sync] force-pull:", stat.name, errMsg);
         }
         this.plugin.statusBar.setProgress(done + failed, remoteStats.length);
       }

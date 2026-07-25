@@ -1213,7 +1213,7 @@ var DeltaPuller = class {
       if (!page.has_more)
         break;
     }
-    const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
+    const folders = allItems.filter((i) => i.type_ === 2 /* Folder */).sort((a, b) => (a.parent_id ? 1 : 0) - (b.parent_id ? 1 : 0) || (a.title || "").localeCompare(b.title || ""));
     const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
     const resources = allItems.filter((i) => i.type_ === 4 /* Resource */);
     for (const f of folders) {
@@ -1323,6 +1323,14 @@ var DeltaPuller = class {
     const mapping = this.plugin.mapping.getById(item.id);
     const dirPath = path.replace(/\/$/, "");
     if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+      if (parentPath && !this.plugin.app.vault.getAbstractFileByPath(parentPath.replace(/\/$/, ""))) {
+        this.watcher.suppress(parentPath.replace(/\/$/, ""));
+        try {
+          await this.plugin.app.vault.createFolder(parentPath.replace(/\/$/, ""));
+        } catch {
+        }
+        this.watcher.release(parentPath.replace(/\/$/, ""));
+      }
       this.watcher.suppress(dirPath);
       await this.plugin.app.vault.createFolder(dirPath).catch(() => {
       });
@@ -1367,6 +1375,13 @@ var DeltaPuller = class {
   async writeFile(path, content) {
     this.watcher.suppress(path);
     try {
+      const parentDir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      if (parentDir && !this.plugin.app.vault.getAbstractFileByPath(parentDir)) {
+        try {
+          await this.plugin.app.vault.createFolder(parentDir);
+        } catch {
+        }
+      }
       const existing = this.plugin.app.vault.getAbstractFileByPath(path);
       if (existing instanceof import_obsidian7.TFile)
         await this.plugin.app.vault.modify(existing, content);

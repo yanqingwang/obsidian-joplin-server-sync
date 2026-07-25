@@ -61,8 +61,9 @@ export class DeltaPuller {
       if (!page.has_more) break;
     }
 
-    // Second pass: process folders first, then notes — so directories exist before we write files
-    const folders = allItems.filter(i => i.type_ === ModelType.Folder);
+    // Second pass: process folders first (sorted by depth), then notes
+    const folders = allItems.filter(i => i.type_ === ModelType.Folder)
+      .sort((a, b) => (a.parent_id ? 1 : 0) - (b.parent_id ? 1 : 0) || (a.title || '').localeCompare(b.title || ''));
     const notes = allItems.filter(i => i.type_ === ModelType.Note);
     const resources = allItems.filter(i => i.type_ === ModelType.Resource);
 
@@ -151,6 +152,12 @@ export class DeltaPuller {
     const mapping = this.plugin.mapping.getById(item.id);
     const dirPath = path.replace(/\/$/, '');
     if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+      // Ensure parent directory exists first
+      if (parentPath && !this.plugin.app.vault.getAbstractFileByPath(parentPath.replace(/\/$/, ''))) {
+        this.watcher.suppress(parentPath.replace(/\/$/, ''));
+        try { await this.plugin.app.vault.createFolder(parentPath.replace(/\/$/, '')); } catch {}
+        this.watcher.release(parentPath.replace(/\/$/, ''));
+      }
       this.watcher.suppress(dirPath);
       await this.plugin.app.vault.createFolder(dirPath).catch(() => {});
       this.watcher.release(dirPath);
@@ -188,6 +195,11 @@ export class DeltaPuller {
   private async writeFile(path: string, content: string): Promise<void> {
     this.watcher.suppress(path);
     try {
+      // Ensure parent directory exists
+      const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+      if (parentDir && !this.plugin.app.vault.getAbstractFileByPath(parentDir)) {
+        try { await this.plugin.app.vault.createFolder(parentDir); } catch {}
+      }
       const existing = this.plugin.app.vault.getAbstractFileByPath(path);
       if (existing instanceof TFile) await this.plugin.app.vault.modify(existing, content);
       else await this.plugin.app.vault.create(path, content);

@@ -51,25 +51,25 @@ export default class JoplinSyncPlugin extends Plugin {
 
     this.addCommand({
       id: 'joplin-show-about',
-      name: 'Joplin Server Sync: About / Status',
+      name: 'About / Status',
       callback: () => {
         const total = this.mapping.all().length;
-        new Notice('Joplin Server Sync v0.1.0\nMapped items: ' + total + '\nDelta cursor: ' + (this.mapping.getDeltaCursor() ? 'yes' : 'no'));
+        new Notice('v0.1.1\nMapped items: ' + total + '\nDelta cursor: ' + (this.mapping.getDeltaCursor() ? 'yes' : 'no'));
       },
     });
   }
 
-  async onunload() {
-    await this.engine?.shutdown();
-    await this.mapping?.flush();
+  onunload(): void {
+    void this.engine?.shutdown();
+    void this.mapping?.flush();
   }
 
-  async loadSettings() {
-    const data = await this.loadData();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+  async loadSettings(): Promise<void> {
+    const data: Record<string, unknown> | null = await this.loadData() as Record<string, unknown> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
   }
 
-  async saveSettings() {
+  async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
   }
 }

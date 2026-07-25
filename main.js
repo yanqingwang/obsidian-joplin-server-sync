@@ -124,26 +124,27 @@ var JoplinServerApi = class {
     });
     if (res.status !== 200)
       throw new Error("Login failed (" + res.status + "): " + res.text);
-    this.sessionId = res.json.id;
+    const body = res.json;
+    this.sessionId = body.id;
   }
   async exec(method, path, opts = {}) {
     if (!this.sessionId)
       await this.login();
     const maxRetries = opts.retries ?? 3;
     for (let attempt = 0; ; attempt++) {
-      const param = {
-        url: this.trimSlash(this.getConfig().baseUrl) + path,
-        method,
-        headers: {
-          "X-API-AUTH": this.sessionId,
-          "X-API-MIN-VERSION": "2.6.0"
-        },
-        body: opts.body,
-        throw: false
+      const headers = {
+        "X-API-AUTH": this.sessionId,
+        "X-API-MIN-VERSION": "2.6.0"
       };
       if (opts.contentType)
-        param.headers["Content-Type"] = opts.contentType;
-      const res = await (0, import_obsidian2.requestUrl)(param);
+        headers["Content-Type"] = opts.contentType;
+      const res = await (0, import_obsidian2.requestUrl)({
+        url: this.trimSlash(this.getConfig().baseUrl) + path,
+        method,
+        headers,
+        body: opts.body,
+        throw: false
+      });
       if (res.status === 401 && attempt === 0) {
         await this.login();
         continue;
@@ -152,7 +153,12 @@ var JoplinServerApi = class {
         await this.sleep(Math.pow(4, attempt) * 1e3);
         continue;
       }
-      return res;
+      return {
+        status: res.status,
+        text: res.text,
+        json: res.json,
+        arrayBuffer: res.arrayBuffer
+      };
     }
   }
   itemPath(name, suffix = "") {
@@ -218,7 +224,7 @@ var JoplinServerApi = class {
     return u.replace(/\/+$/, "");
   }
   sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+    return new Promise((r) => window.setTimeout(r, ms));
   }
 };
 var ApiError = class extends Error {
@@ -452,10 +458,9 @@ var JoplinSerializer = class {
       lines.push("");
     }
     for (const key of order) {
-      let value = item[key] ?? DEFAULTS[key] ?? "";
-      if (TIME_FIELDS.has(key))
-        value = this.formatTime(value);
-      lines.push(key + ": " + value);
+      const rawValue = item[key];
+      const value = rawValue ?? DEFAULTS[key] ?? "";
+      lines.push(key + ": " + (TIME_FIELDS.has(key) ? this.formatTime(Number(value)) : String(value)));
     }
     return lines.join("\n");
   }
@@ -478,7 +483,7 @@ var JoplinSerializer = class {
     }
     const headerBody = lines.slice(0, bodyEndIndex);
     item.title = headerBody[0] ?? "";
-    if (Number(item.type_) === 1 /* Note */) {
+    if (item.type_ === 1 /* Note */) {
       item.body = headerBody.slice(2).join("\n");
     }
     item.type_ = Number(item.type_);
@@ -745,20 +750,20 @@ var JoplinSyncPlugin = class extends import_obsidian4.Plugin {
     });
     this.addCommand({
       id: "joplin-show-about",
-      name: "Joplin Server Sync: About / Status",
+      name: "About / Status",
       callback: () => {
         const total = this.mapping.all().length;
-        new import_obsidian4.Notice("Joplin Server Sync v0.1.0\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
+        new import_obsidian4.Notice("v0.1.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
       }
     });
   }
-  async onunload() {
-    await this.engine?.shutdown();
-    await this.mapping?.flush();
+  onunload() {
+    void this.engine?.shutdown();
+    void this.mapping?.flush();
   }
   async loadSettings() {
     const data = await this.loadData();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
   }
   async saveSettings() {
     await this.saveData(this.settings);

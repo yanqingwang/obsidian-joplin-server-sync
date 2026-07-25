@@ -1,4 +1,4 @@
-import { requestUrl, RequestUrlParam } from 'obsidian';
+import { requestUrl } from 'obsidian';
 import { Paginated, RemoteItemStat, DeltaItem, SyncLock, LockType } from './models';
 
 interface ApiConfig { baseUrl: string; email: string; password: string; }
@@ -21,30 +21,31 @@ export class JoplinServerApi {
       throw: false,
     });
     if (res.status !== 200) throw new Error('Login failed (' + res.status + '): ' + res.text);
-    this.sessionId = res.json.id;
+    const body = res.json as Record<string, unknown>;
+    this.sessionId = body.id as string;
   }
 
   private async exec(method: string, path: string, opts: {
     body?: string | ArrayBuffer;
     contentType?: string;
     retries?: number;
-  } = {}): Promise<RequestUrlParam & { status: number; text: string; json: any; arrayBuffer: ArrayBuffer }> {
+  } = {}): Promise<{ status: number; text: string; json: Record<string, unknown>; arrayBuffer: ArrayBuffer }> {
     if (!this.sessionId) await this.login();
     const maxRetries = opts.retries ?? 3;
 
     for (let attempt = 0; ; attempt++) {
-      const param: any = {
+      const headers: Record<string, string> = {
+        'X-API-AUTH': this.sessionId!,
+        'X-API-MIN-VERSION': '2.6.0',
+      };
+      if (opts.contentType) headers['Content-Type'] = opts.contentType;
+      const res = await requestUrl({
         url: this.trimSlash(this.getConfig().baseUrl) + path,
         method,
-        headers: {
-          'X-API-AUTH': this.sessionId!,
-          'X-API-MIN-VERSION': '2.6.0',
-        },
+        headers,
         body: opts.body,
         throw: false,
-      };
-      if (opts.contentType) param.headers['Content-Type'] = opts.contentType;
-      const res = await requestUrl(param);
+      });
 
       if (res.status === 401 && attempt === 0) {
         await this.login();
@@ -54,7 +55,12 @@ export class JoplinServerApi {
         await this.sleep(Math.pow(4, attempt) * 1000);
         continue;
       }
-      return res as any;
+      return {
+        status: res.status,
+        text: res.text,
+        json: res.json as Record<string, unknown>,
+        arrayBuffer: res.arrayBuffer,
+      };
     }
   }
 
@@ -75,7 +81,7 @@ export class JoplinServerApi {
       contentType: 'application/octet-stream',
     });
     if (res.status !== 200) throw new ApiError(res.status, res.text);
-    return res.json;
+    return res.json as unknown as { id: string; updated_time: number };
   }
 
   async deleteItem(name: string): Promise<void> {
@@ -87,14 +93,14 @@ export class JoplinServerApi {
     const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
     const res = await this.exec('GET', '/api/items/root:/:/children' + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
-    return res.json;
+    return res.json as unknown as Paginated<RemoteItemStat>;
   }
 
   async delta(cursor?: string): Promise<Paginated<DeltaItem>> {
     const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
     const res = await this.exec('GET', '/api/items/root:/:/delta' + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
-    return res.json;
+    return res.json as unknown as Paginated<DeltaItem>;
   }
 
   async acquireLock(type: LockType, clientType: string, clientId: string): Promise<SyncLock> {
@@ -104,7 +110,7 @@ export class JoplinServerApi {
     });
     if (res.status === 409) throw new LockConflictError(res.text);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
-    return res.json;
+    return res.json as unknown as SyncLock;
   }
 
   async releaseLock(type: LockType, clientType: string, clientId: string): Promise<void> {
@@ -114,11 +120,11 @@ export class JoplinServerApi {
   async listLocks(): Promise<Paginated<SyncLock>> {
     const res = await this.exec('GET', '/api/locks');
     if (res.status !== 200) throw new ApiError(res.status, res.text);
-    return res.json;
+    return res.json as unknown as Paginated<SyncLock>;
   }
 
   private trimSlash(u: string) { return u.replace(/\/+$/, ''); }
-  private sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+  private sleep(ms: number) { return new Promise(r => window.setTimeout(r, ms)); }
 }
 
 export class ApiError extends Error {

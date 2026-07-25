@@ -27,7 +27,7 @@ const TIME_FIELDS = new Set([
   'created_time', 'updated_time', 'user_created_time', 'user_updated_time',
 ]);
 
-const DEFAULTS: Record<string, any> = {
+const DEFAULTS: Record<string, string | number> = {
   is_conflict: 0, latitude: '0.00000000', longitude: '0.00000000', altitude: '0.0000',
   author: '', source_url: '', is_todo: 0, todo_due: 0, todo_completed: 0,
   source: 'obsidian-joplin-sync', source_application: 'net.obsidian.joplin-server-sync',
@@ -50,16 +50,16 @@ export class JoplinSerializer {
     }
 
     for (const key of order) {
-      let value: any = item[key] ?? DEFAULTS[key] ?? '';
-      if (TIME_FIELDS.has(key)) value = this.formatTime(value as number);
-      lines.push(key + ': ' + value);
+      const rawValue = (item as Record<string, unknown>)[key];
+      const value = rawValue ?? DEFAULTS[key] ?? '';
+      lines.push(key + ': ' + (TIME_FIELDS.has(key) ? this.formatTime(Number(value)) : String(value)));
     }
     return lines.join('\n');
   }
 
   unserialize(raw: string): JoplinItem {
     const lines = raw.split('\n');
-    const item: Record<string, any> = {};
+    const item: Record<string, unknown> = {};
     let bodyEndIndex = lines.length;
 
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -74,7 +74,7 @@ export class JoplinSerializer {
 
     const headerBody = lines.slice(0, bodyEndIndex);
     item.title = headerBody[0] ?? '';
-    if (Number(item.type_) === ModelType.Note) {
+    if (item.type_ === ModelType.Note) {
       item.body = headerBody.slice(2).join('\n');
     }
     item.type_ = Number(item.type_);

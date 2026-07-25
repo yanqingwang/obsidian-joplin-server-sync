@@ -220,10 +220,9 @@ export class SyncEngine {
         try {
           await this.plugin.api.deleteItem(stat.name);
           deleted++;
-        } catch {  }
+        } catch { }
       }
       console.log('[joplin-sync] force push: deleted ' + deleted + ' remote items');
-      this.plugin.mapping.setDeltaCursor('');
 
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();

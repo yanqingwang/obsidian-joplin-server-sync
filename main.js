@@ -1723,7 +1723,6 @@ var SyncEngine = class {
         }
       }
       console.log("[joplin-sync] force push: deleted " + deleted + " remote items");
-      this.plugin.mapping.setDeltaCursor("");
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0;

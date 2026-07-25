@@ -1720,71 +1720,60 @@ var SyncEngine = class {
     }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing("force push: clearing server...");
+      this.plugin.statusBar.setSyncing("force push: rebuilding server...");
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
-      let deleted = 0;
-      const allRemote = await this.listAllRemoteItems();
-      for (const stat of allRemote) {
-        if (stat.name === "info.json")
-          continue;
-        try {
-          await this.plugin.api.deleteItem(stat.name);
-          deleted++;
-        } catch {
-        }
-      }
-      console.debug("[joplin-sync] force push: deleted " + deleted);
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       const folderMap = /* @__PURE__ */ new Map();
       folderMap.set("", rootFolderId);
       const dirs = /* @__PURE__ */ new Set();
       for (const f of files) {
-        const d = f.path.substring(0, f.path.lastIndexOf("/"));
-        if (d)
+        const d = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+        if (d && !folderMap.has(d)) {
+          const existing = this.plugin.mapping.getByPath(d + "/");
+          if (existing) {
+            folderMap.set(d, existing.joplinId);
+            continue;
+          }
           dirs.add(d);
+        }
       }
       for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
-        const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) : rootFolderId;
-        if (!parent)
-          continue;
+        const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) || rootFolderId : rootFolderId;
         const fid = createJoplinId();
         const title = dp.split("/").pop() || dp;
-        const now = Date.now();
         const item = {
           id: fid,
           parent_id: parent,
           title,
-          created_time: now,
-          updated_time: now,
-          user_created_time: now,
-          user_updated_time: now,
           type_: 2 /* Folder */,
+          created_time: Date.now(),
+          updated_time: Date.now(),
+          user_created_time: Date.now(),
+          user_updated_time: Date.now(),
           encryption_applied: 0,
           encryption_cipher_text: ""
         };
-        const payload = this.serializer.serialize(item);
-        const st = await this.plugin.api.putItem(fid + ".md", payload);
-        if (st && st.id) {
-          this.plugin.mapping.upsert({
-            joplinId: fid,
-            path: dp + "/",
-            type: 2 /* Folder */,
-            localHash: "",
-            remoteUpdatedTime: st.updated_time || now,
-            syncedAt: now
-          });
-          folderMap.set(dp, fid);
+        try {
+          const st = await this.plugin.api.putItem(fid + ".md", this.serializer.serialize(item));
+          if (st && st.id) {
+            this.plugin.mapping.upsert({
+              joplinId: fid,
+              path: dp + "/",
+              type: 2 /* Folder */,
+              localHash: "",
+              remoteUpdatedTime: st.updated_time || Date.now(),
+              syncedAt: Date.now()
+            });
+            folderMap.set(dp, fid);
+          }
+        } catch (e) {
         }
       }
       let done = 0;
       let fail = 0;
-      try {
-        await this.plugin.api.login();
-      } catch {
-      }
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
@@ -1795,14 +1784,13 @@ var SyncEngine = class {
           } catch (e) {
             fail++;
             if (fail <= 3)
-              console.error("[joplin-sync] upload failed:", file.path, e?.message || e);
+              console.error("[joplin-sync] upload fail:", file.path, e?.message || e);
           }
-          this.plugin.statusBar.setProgress(done + fail, files.length, "push");
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian8.Notice("Force push: cleared " + deleted + ", uploaded " + done + " notes" + (fail ? ", " + fail + " failed" : ""));
-      this.plugin.logSync("push", done, 0);
+      new import_obsidian8.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
+      this.plugin.logSync("push", done, fail);
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;

@@ -208,56 +208,50 @@ export class SyncEngine {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing('force push: clearing server...');
+      this.plugin.statusBar.setSyncing('force push: rebuilding server...');
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
 
-      let deleted = 0;
-      const allRemote = await this.listAllRemoteItems();
-      for (const stat of allRemote) {
-        if (stat.name === 'info.json') continue;
-        try { await this.plugin.api.deleteItem(stat.name); deleted++; } catch { void 0; }
-      }
-      console.debug('[joplin-sync] force push: deleted ' + deleted);
-
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
 
-      // Build folder hierarchy on server
-      const folderMap = new Map<string, string>(); // dirpath -> joplinId
+      // Create sub-folders on server (if not already existing)
+      const folderMap = new Map<string, string>();
       folderMap.set('', rootFolderId);
       const dirs = new Set<string>();
       for (const f of files) {
-        const d = f.path.substring(0, f.path.lastIndexOf('/'));
-        if (d) dirs.add(d);
+        const d = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+        if (d && !folderMap.has(d)) {
+          // Check if already mapped
+          const existing = this.plugin.mapping.getByPath(d + '/');
+          if (existing) { folderMap.set(d, existing.joplinId); continue; }
+          dirs.add(d);
+        }
       }
       for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
-        const parent = dp.includes('/') ? folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) : rootFolderId;
-        if (!parent) continue;
+        const parent = dp.includes('/') ? (folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) || rootFolderId) : rootFolderId;
         const fid = createJoplinId();
         const title = dp.split('/').pop() || dp;
-        const now = Date.now();
         const item: JoplinItem = {
-          id: fid, parent_id: parent, title,
-          created_time: now, updated_time: now,
-          user_created_time: now, user_updated_time: now,
-          type_: ModelType.Folder, encryption_applied: 0, encryption_cipher_text: '',
+          id: fid, parent_id: parent, title, type_: ModelType.Folder,
+          created_time: Date.now(), updated_time: Date.now(),
+          user_created_time: Date.now(), user_updated_time: Date.now(),
+          encryption_applied: 0, encryption_cipher_text: '',
         };
-        const payload = this.serializer.serialize(item);
-        const st = await this.plugin.api.putItem(fid + '.md', payload);
-        if (st && st.id) {
-          this.plugin.mapping.upsert({
-            joplinId: fid, path: dp + '/', type: ModelType.Folder,
-            localHash: '', remoteUpdatedTime: (st as any).updated_time || now, syncedAt: now,
-          });
-          folderMap.set(dp, fid);
-        }
+        try {
+          const st = await this.plugin.api.putItem(fid + '.md', this.serializer.serialize(item));
+          if (st && st.id) {
+            this.plugin.mapping.upsert({
+              joplinId: fid, path: dp + '/', type: ModelType.Folder,
+              localHash: '', remoteUpdatedTime: (st as any).updated_time || Date.now(), syncedAt: Date.now(),
+            });
+            folderMap.set(dp, fid);
+          }
+        } catch (e) { /* folder may already exist */ }
       }
 
       let done = 0; let fail = 0;
-      // Refresh login before uploading notes (session may expire during folder creation)
-      try { await this.plugin.api.login(); } catch { void 0; }
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
@@ -267,14 +261,13 @@ export class SyncEngine {
             done++;
           } catch (e: any) {
             fail++;
-            if (fail <= 3) console.error('[joplin-sync] upload failed:', file.path, e?.message || e);
+            if (fail <= 3) console.error('[joplin-sync] upload fail:', file.path, e?.message || e);
           }
-          this.plugin.statusBar.setProgress(done + fail, files.length, 'push');
         }));
         await this.plugin.mapping.flush();
       }
-      new Notice('Force push: cleared ' + deleted + ', uploaded ' + done + ' notes' + (fail ? ', ' + fail + ' failed' : ''));
-      this.plugin.logSync('push', done, 0);
+      new Notice('Force push: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
+      this.plugin.logSync('push', done, fail);
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;

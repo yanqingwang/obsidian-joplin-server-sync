@@ -1158,15 +1158,23 @@ var DeltaPuller = class {
     this.conflicts = new ConflictResolver(plugin, watcher);
     this.resources = new ResourceManager(plugin);
   }
-  /** Check if an item belongs to our root folder hierarchy */
   belongsToRoot(item) {
     if (this.acceptAll)
       return true;
     const rootId = this.plugin.mapping.rootFolderId;
-    if (!rootId)
-      return true;
-    if (this.plugin.mapping.getById(item.id))
-      return true;
+    if (rootId) {
+      if (this.plugin.mapping.getById(item.id))
+        return true;
+    } else {
+      if (!item.parent_id)
+        return true;
+      if (this.plugin.mapping.getById(item.parent_id))
+        return true;
+      const hasFolders2 = this.plugin.mapping.all().some((e) => e.type === 2);
+      if (!hasFolders2)
+        return true;
+      return false;
+    }
     const hasFolders = this.plugin.mapping.all().some((e) => e.type === 2);
     if (!hasFolders)
       return true;
@@ -1789,6 +1797,14 @@ var SyncEngine = class {
       }
       new import_obsidian8.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
       this.plugin.logSync("push", done, fail);
+      let cursor;
+      while (true) {
+        const page = await this.plugin.api.delta(cursor);
+        cursor = page.cursor;
+        if (!page.has_more)
+          break;
+      }
+      this.plugin.mapping.setDeltaCursor(cursor ?? "");
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;

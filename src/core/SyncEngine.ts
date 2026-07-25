@@ -266,6 +266,16 @@ export class SyncEngine {
       }
       new Notice('Force push: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
       this.plugin.logSync('push', done, fail);
+
+      // Reset delta cursor so next sync cycle pulls from this point
+      let cursor: string | undefined;
+      while (true) {
+        const page = await this.plugin.api.delta(cursor);
+        cursor = page.cursor;
+        if (!page.has_more) break;
+      }
+      this.plugin.mapping.setDeltaCursor(cursor ?? '');
+
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;

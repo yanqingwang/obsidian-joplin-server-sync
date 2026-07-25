@@ -19,12 +19,18 @@ export class DeltaPuller {
     this.resources = new ResourceManager(plugin);
   }
 
-  /** Check if an item belongs to our root folder hierarchy */
   private belongsToRoot(item: JoplinItem): boolean {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
-    if (!rootId) return true;
-    if (this.plugin.mapping.getById(item.id)) return true;
+    if (rootId) {
+      if (this.plugin.mapping.getById(item.id)) return true;
+    } else {
+      if (!item.parent_id) return true;
+      if (this.plugin.mapping.getById(item.parent_id)) return true;
+      const hasFolders = this.plugin.mapping.all().some(e => e.type === 2);
+      if (!hasFolders) return true;
+      return false;
+    }
     // No folders mapped = fresh pull, accept everything
     const hasFolders = this.plugin.mapping.all().some(e => e.type === 2);
     if (!hasFolders) return true;

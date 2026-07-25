@@ -1766,31 +1766,9 @@ var SyncEngine = class {
       const rootFolderId = await this.ensureRootFolder();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
-      for (const stat of remoteStats) {
-        if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
-          continue;
-        if (stat.name.startsWith(".resource/"))
-          continue;
-        try {
-          const raw = await this.plugin.api.getItem(stat.name);
-          if (!raw)
-            continue;
-          const probe = this.serializer.unserialize(raw);
-          if (probe.type_ === 9) {
-            e2ee.feedMasterKey(probe);
-          }
-        } catch {
-        }
-      }
-      console.log("[joplin-sync] master keys loaded: " + e2ee.availableMasterKeys.length);
-      if (this.plugin.settings.e2eePassword && e2ee.availableMasterKeys.length > 0 && !e2ee.hasLoadedKeys) {
-        for (const mkId of e2ee.availableMasterKeys) {
-          try {
-            await e2ee.loadMasterKey(mkId, this.plugin.settings.e2eePassword);
-          } catch (e) {
-            console.warn("[joplin-sync] master key load failed: " + mkId + " - " + e.message);
-          }
-        }
+      try {
+        await this.plugin.api.login();
+      } catch {
       }
       let done = 0;
       let failed = 0;
@@ -1805,6 +1783,10 @@ var SyncEngine = class {
           if (!raw)
             continue;
           const item = this.serializer.unserialize(raw);
+          if (item.type_ === 9) {
+            e2ee.feedMasterKey(item);
+            continue;
+          }
           if (item.type_ !== 1 /* Note */) {
             skipped++;
             continue;

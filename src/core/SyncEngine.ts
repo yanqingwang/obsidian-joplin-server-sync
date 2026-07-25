@@ -269,33 +269,10 @@ export class SyncEngine {
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
 
-      // Pass 1: feed master key items to E2EE service
-      for (const stat of remoteStats) {
-        if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
-        if (stat.name.startsWith('.resource/')) continue;
-        try {
-          const raw = await this.plugin.api.getItem(stat.name);
-          if (!raw) continue;
-          const probe = this.serializer.unserialize(raw);
-          if (probe.type_ === 9) {
-            e2ee.feedMasterKey(probe);
-          }
-        } catch { /* skip probe failures */ }
-      }
-      console.log('[joplin-sync] master keys loaded: ' + e2ee.availableMasterKeys.length);
+      // Refresh login before processing (session may have expired during pagination)
+      try { await this.plugin.api.login(); } catch { }
 
-      // Pass 2: try to load master keys if password is set
-      if (this.plugin.settings.e2eePassword && e2ee.availableMasterKeys.length > 0 && !e2ee.hasLoadedKeys) {
-        for (const mkId of e2ee.availableMasterKeys) {
-          try {
-            await e2ee.loadMasterKey(mkId, this.plugin.settings.e2eePassword);
-          } catch (e: any) {
-            console.warn('[joplin-sync] master key load failed: ' + mkId + ' - ' + e.message);
-          }
-        }
-      }
-
-      // Pass 3: download notes
+      // Pass 1: download notes + feed master keys (single pass to avoid session expiry)
       let done = 0; let failed = 0; let skipped = 0;
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
@@ -304,6 +281,9 @@ export class SyncEngine {
           const raw = await this.plugin.api.getItem(stat.name);
           if (!raw) continue;
           const item = this.serializer.unserialize(raw);
+
+          // Feed master keys during the same pass
+          if (item.type_ === 9) { e2ee.feedMasterKey(item); continue; }
 
           if (item.type_ !== ModelType.Note) { skipped++; continue; }
 

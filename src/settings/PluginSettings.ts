@@ -30,7 +30,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncIntervalSec: 300,
   syncOnStartup: false,
   conflictStrategy: 'duplicate',
-  excludePatterns: ['.obsidian/', '_conflicts/', 'templates/'],
+  excludePatterns: ['.obsidian/', '_conflicts/', 'templates/', '.directory', '.noteforge/'],
   attachmentFolder: 'attachments',
   maxAttachmentMB: 100,
   clientId: '',

@@ -85,6 +85,7 @@ export class SyncEngine {
     const ROOT_KEY = '__root__/';
     const existing = this.plugin.mapping.getByPath(ROOT_KEY);
     if (existing) return existing.joplinId;
+
     const id = createJoplinId();
     const item: JoplinItem = {
       id, parent_id: '', title: 'Obsidian',
@@ -97,6 +98,7 @@ export class SyncEngine {
       joplinId: id, path: ROOT_KEY, type: ModelType.Folder,
       localHash: '', remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
     });
+    this.plugin.mapping.setRootFolderId(id);
     return id;
   }
 

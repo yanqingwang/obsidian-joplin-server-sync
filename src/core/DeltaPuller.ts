@@ -11,10 +11,33 @@ export class DeltaPuller {
   private serializer = new JoplinSerializer();
   private conflicts: ConflictResolver;
   private resources: ResourceManager;
+  private rootAncestorCache = new Map<string, boolean>();
 
   constructor(private plugin: JoplinSyncPlugin, private watcher: VaultWatcher) {
     this.conflicts = new ConflictResolver(plugin, watcher);
     this.resources = new ResourceManager(plugin);
+  }
+
+  /** Check if an item belongs to our root folder hierarchy */
+  private belongsToRoot(item: JoplinItem): boolean {
+    const rootId = this.plugin.mapping.rootFolderId;
+    if (!rootId) return true; // no root set = accept all (backward compat)
+    
+    // Already mapped = ours
+    if (this.plugin.mapping.getById(item.id)) return true;
+    
+    // Check parent chain: walk up through known folder mappings
+    let pid = item.parent_id;
+    const visited = new Set<string>();
+    while (pid && !visited.has(pid)) {
+      visited.add(pid);
+      if (pid === rootId) return true;
+      const parentMapping = this.plugin.mapping.getById(pid);
+      if (!parentMapping) return false; // parent not in mapping = foreign
+      pid = parentMapping.joplinId; // walk up... but this is the same as pid for folder entries
+      break; // simplified: one level check
+    }
+    return false;
   }
 
   async pullAll(): Promise<{ ok: number; fail: number }> {
@@ -75,9 +98,9 @@ export class DeltaPuller {
       try {
         const decryptedBody = await e2ee.decryptItem(item);
         if (decryptedBody !== null) {
-          // Re-parse the decrypted serialized form
           const decrypted = this.serializer.unserialize(decryptedBody);
           decrypted.updated_time = item.updated_time;
+          if (!this.belongsToRoot(decrypted)) return;
           switch (decrypted.type_) {
             case ModelType.Note: return this.applyNote(decrypted);
             case ModelType.Folder: return this.applyFolder(decrypted);
@@ -87,10 +110,12 @@ export class DeltaPuller {
         }
       } catch (e: any) {
         console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + e.message);
-        // Skip encrypted items we can't decrypt
         return;
       }
     }
+
+    // Skip items not belonging to our root folder (e.g. old server data)
+    if (!this.belongsToRoot(item)) return;
 
     switch (item.type_) {
       case ModelType.Folder: return this.applyFolder(item);

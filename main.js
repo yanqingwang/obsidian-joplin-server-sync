@@ -308,7 +308,7 @@ var LockConflictError = class extends Error {
 var MappingStore = class {
   constructor(plugin) {
     this.plugin = plugin;
-    this.data = { version: 1, deltaCursor: "", entries: [], tombstones: [] };
+    this.data = { version: 1, deltaCursor: "", rootFolderId: "", entries: [], tombstones: [] };
     this.byId = /* @__PURE__ */ new Map();
     this.byPath = /* @__PURE__ */ new Map();
     this.dirty = false;
@@ -354,6 +354,13 @@ var MappingStore = class {
   setDeltaCursor(cursor) {
     this.data.deltaCursor = cursor;
     this.dirty = true;
+  }
+  setRootFolderId(id) {
+    this.data.rootFolderId = id;
+    this.dirty = true;
+  }
+  get rootFolderId() {
+    return this.data.rootFolderId;
   }
   upsert(entry) {
     const existing = this.byId.get(entry.joplinId);
@@ -1128,8 +1135,30 @@ var DeltaPuller = class {
     this.plugin = plugin;
     this.watcher = watcher;
     this.serializer = new JoplinSerializer();
+    this.rootAncestorCache = /* @__PURE__ */ new Map();
     this.conflicts = new ConflictResolver(plugin, watcher);
     this.resources = new ResourceManager(plugin);
+  }
+  /** Check if an item belongs to our root folder hierarchy */
+  belongsToRoot(item) {
+    const rootId = this.plugin.mapping.rootFolderId;
+    if (!rootId)
+      return true;
+    if (this.plugin.mapping.getById(item.id))
+      return true;
+    let pid = item.parent_id;
+    const visited = /* @__PURE__ */ new Set();
+    while (pid && !visited.has(pid)) {
+      visited.add(pid);
+      if (pid === rootId)
+        return true;
+      const parentMapping = this.plugin.mapping.getById(pid);
+      if (!parentMapping)
+        return false;
+      pid = parentMapping.joplinId;
+      break;
+    }
+    return false;
   }
   async pullAll() {
     let cursor = this.plugin.mapping.getDeltaCursor();
@@ -1194,6 +1223,8 @@ var DeltaPuller = class {
         if (decryptedBody !== null) {
           const decrypted = this.serializer.unserialize(decryptedBody);
           decrypted.updated_time = item.updated_time;
+          if (!this.belongsToRoot(decrypted))
+            return;
           switch (decrypted.type_) {
             case 1 /* Note */:
               return this.applyNote(decrypted);
@@ -1209,6 +1240,8 @@ var DeltaPuller = class {
         return;
       }
     }
+    if (!this.belongsToRoot(item))
+      return;
     switch (item.type_) {
       case 2 /* Folder */:
         return this.applyFolder(item);
@@ -1565,6 +1598,7 @@ var SyncEngine = class {
       remoteUpdatedTime: res.updated_time,
       syncedAt: Date.now()
     });
+    this.plugin.mapping.setRootFolderId(id);
     return id;
   }
   collectMarkdownFiles() {

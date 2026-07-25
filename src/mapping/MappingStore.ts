@@ -13,12 +13,13 @@ export interface MappingEntry {
 interface MappingData {
   version: number;
   deltaCursor: string;
+  rootFolderId: string;
   entries: MappingEntry[];
   tombstones: { joplinId: string; type: ModelType; deletedAt: number }[];
 }
 
 export class MappingStore {
-  private data: MappingData = { version: 1, deltaCursor: '', entries: [], tombstones: [] };
+  private data: MappingData = { version: 1, deltaCursor: '', rootFolderId: '', entries: [], tombstones: [] };
   private byId = new Map<string, MappingEntry>();
   private byPath = new Map<string, MappingEntry>();
   private dirty = false;
@@ -56,6 +57,8 @@ export class MappingStore {
   all(): MappingEntry[] { return this.data.entries; }
   getDeltaCursor(): string { return this.data.deltaCursor; }
   setDeltaCursor(cursor: string) { this.data.deltaCursor = cursor; this.dirty = true; }
+  setRootFolderId(id: string) { this.data.rootFolderId = id; this.dirty = true; }
+  get rootFolderId(): string { return this.data.rootFolderId; }
 
   upsert(entry: MappingEntry): void {
     const existing = this.byId.get(entry.joplinId);

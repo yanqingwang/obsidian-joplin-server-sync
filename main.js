@@ -1707,10 +1707,23 @@ var SyncEngine = class {
     }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing("force push...");
+      this.plugin.statusBar.setSyncing("force push: clearing server...");
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      let deleted = 0;
+      const allRemote = await this.listAllRemoteItems();
+      for (const stat of allRemote) {
+        if (stat.name === "info.json")
+          continue;
+        try {
+          await this.plugin.api.deleteItem(stat.name);
+          deleted++;
+        } catch {
+        }
+      }
+      console.log("[joplin-sync] force push: deleted " + deleted + " remote items");
+      this.plugin.mapping.setDeltaCursor("");
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0;
@@ -1718,11 +1731,11 @@ var SyncEngine = class {
         await Promise.all(batch.map(async (file) => {
           await this.uploadNote(file, rootFolderId);
           done++;
-          this.plugin.statusBar.setProgress(done, files.length);
+          this.plugin.statusBar.setProgress(done, files.length, "push");
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian7.Notice("Force push: " + done + " notes uploaded");
+      new import_obsidian7.Notice("Force push: cleared " + deleted + ", uploaded " + done + " notes");
       this.plugin.logSync("push", done, 0);
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {

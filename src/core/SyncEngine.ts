@@ -36,14 +36,13 @@ export class SyncEngine {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
-      const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
       const failed: string[] = [];
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
-            const changed = await this.uploadNote(file, rootFolderId);
+            const changed = await this.uploadNote(file, '');
             changed ? done++ : skipped++;
           } catch (e: any) {
             failed.push(file.path + ': ' + e.message);
@@ -97,25 +96,8 @@ export class SyncEngine {
     return true;
   }
 
-  private async ensureRootFolder(): Promise<string> {
-    const ROOT_KEY = '__root__/';
-    const existing = this.plugin.mapping.getByPath(ROOT_KEY);
-    if (existing) return existing.joplinId;
-
-    const id = createJoplinId();
-    const item: JoplinItem = {
-      id, parent_id: '', title: 'Obsidian',
-      created_time: Date.now(), updated_time: Date.now(),
-      user_created_time: Date.now(), user_updated_time: Date.now(),
-      type_: ModelType.Folder, encryption_applied: 0, encryption_cipher_text: '',
-    };
-    const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(item));
-    this.plugin.mapping.upsert({
-      joplinId: id, path: ROOT_KEY, type: ModelType.Folder,
-      localHash: '', remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
-    });
-    this.plugin.mapping.setRootFolderId(id);
-    return id;
+  private ensureRootFolder(): string {
+    return '';
   }
 
   private collectMarkdownFiles(): TFile[] {
@@ -229,7 +211,7 @@ export class SyncEngine {
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
 
-      const rootFolderId = await this.ensureRootFolder();
+      const rootFolderId = '';
       const files = this.collectMarkdownFiles();
 
       // Create sub-folders on server (if not already existing)

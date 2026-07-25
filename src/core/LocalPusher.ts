@@ -151,21 +151,6 @@ export class LocalPusher {
   }
 
   private async ensureRootFolderId(): Promise<string> {
-    const ROOT_KEY = '__root__/';
-    const existing = this.plugin.mapping.getByPath(ROOT_KEY);
-    if (existing) return existing.joplinId;
-    const id = createJoplinId();
-    const item: JoplinItem = {
-      id, parent_id: '', title: 'Obsidian',
-      created_time: Date.now(), updated_time: Date.now(),
-      user_created_time: Date.now(), user_updated_time: Date.now(),
-      type_: ModelType.Folder, encryption_applied: 0, encryption_cipher_text: '',
-    };
-    const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(item));
-    this.plugin.mapping.upsert({
-      joplinId: id, path: ROOT_KEY, type: ModelType.Folder,
-      localHash: '', remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
-    });
-    return id;
+    return '';
   }
 }

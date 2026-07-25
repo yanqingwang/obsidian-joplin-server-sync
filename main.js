@@ -1088,33 +1088,7 @@ var LocalPusher = class {
     return id;
   }
   async ensureRootFolderId() {
-    const ROOT_KEY = "__root__/";
-    const existing = this.plugin.mapping.getByPath(ROOT_KEY);
-    if (existing)
-      return existing.joplinId;
-    const id = createJoplinId();
-    const item = {
-      id,
-      parent_id: "",
-      title: "Obsidian",
-      created_time: Date.now(),
-      updated_time: Date.now(),
-      user_created_time: Date.now(),
-      user_updated_time: Date.now(),
-      type_: 2 /* Folder */,
-      encryption_applied: 0,
-      encryption_cipher_text: ""
-    };
-    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
-    this.plugin.mapping.upsert({
-      joplinId: id,
-      path: ROOT_KEY,
-      type: 2 /* Folder */,
-      localHash: "",
-      remoteUpdatedTime: res.updated_time,
-      syncedAt: Date.now()
-    });
-    return id;
+    return "";
   }
 };
 
@@ -1567,14 +1541,13 @@ var SyncEngine = class {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
-      const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
       const failed = [];
       for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
-            const changed = await this.uploadNote(file, rootFolderId);
+            const changed = await this.uploadNote(file, "");
             changed ? done++ : skipped++;
           } catch (e) {
             failed.push(file.path + ": " + e.message);
@@ -1637,35 +1610,8 @@ var SyncEngine = class {
     });
     return true;
   }
-  async ensureRootFolder() {
-    const ROOT_KEY = "__root__/";
-    const existing = this.plugin.mapping.getByPath(ROOT_KEY);
-    if (existing)
-      return existing.joplinId;
-    const id = createJoplinId();
-    const item = {
-      id,
-      parent_id: "",
-      title: "Obsidian",
-      created_time: Date.now(),
-      updated_time: Date.now(),
-      user_created_time: Date.now(),
-      user_updated_time: Date.now(),
-      type_: 2 /* Folder */,
-      encryption_applied: 0,
-      encryption_cipher_text: ""
-    };
-    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
-    this.plugin.mapping.upsert({
-      joplinId: id,
-      path: ROOT_KEY,
-      type: 2 /* Folder */,
-      localHash: "",
-      remoteUpdatedTime: res.updated_time,
-      syncedAt: Date.now()
-    });
-    this.plugin.mapping.setRootFolderId(id);
-    return id;
+  ensureRootFolder() {
+    return "";
   }
   collectMarkdownFiles() {
     const excludes = this.plugin.settings.excludePatterns;
@@ -1777,7 +1723,7 @@ var SyncEngine = class {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
-      const rootFolderId = await this.ensureRootFolder();
+      const rootFolderId = "";
       const files = this.collectMarkdownFiles();
       const folderMap = /* @__PURE__ */ new Map();
       folderMap.set("", rootFolderId);

@@ -1146,6 +1146,9 @@ var DeltaPuller = class {
       return true;
     if (this.plugin.mapping.getById(item.id))
       return true;
+    const hasFolders = this.plugin.mapping.all().some((e) => e.type === 2);
+    if (!hasFolders)
+      return true;
     let pid = item.parent_id;
     const visited = /* @__PURE__ */ new Set();
     while (pid && !visited.has(pid)) {
@@ -1763,99 +1766,22 @@ var SyncEngine = class {
       }
       this.plugin.mapping.setDeltaCursor("");
       console.log("[joplin-sync] force pull: deleted " + delCount + " local files");
-      const rootFolderId = await this.ensureRootFolder();
-      const remoteStats = await this.listAllRemoteItems();
-      const e2ee = this.plugin.e2ee;
-      try {
-        await this.plugin.api.login();
-      } catch {
-      }
-      let done = 0;
-      let failed = 0;
-      let skipped = 0;
-      for (const stat of remoteStats) {
-        if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
-          continue;
-        if (stat.name.startsWith(".resource/"))
-          continue;
-        try {
-          const raw = await this.plugin.api.getItem(stat.name);
-          if (!raw)
-            continue;
-          const item = this.serializer.unserialize(raw);
-          if (item.type_ === 9) {
-            e2ee.feedMasterKey(item);
-            continue;
-          }
-          if (item.type_ !== 1 /* Note */ || !item.title) {
-            skipped++;
-            continue;
-          }
-          let body = item.body ?? "";
-          if (e2ee.isEncrypted(item)) {
-            try {
-              const decryptedSerialized = await e2ee.decryptItem(item);
-              if (decryptedSerialized !== null && decryptedSerialized !== void 0) {
-                const decrypted = this.serializer.unserialize(decryptedSerialized);
-                body = decrypted.body ?? "";
-              } else {
-                failed++;
-                console.warn("[joplin-sync] decrypt returned null for: " + stat.name);
-                continue;
-              }
-            } catch (e) {
-              console.warn("[joplin-sync] decrypt failed: " + stat.name + " - " + (e.message || e));
-              failed++;
-              continue;
-            }
-          }
-          const title = item.title || "Untitled";
-          const sanitized = title.replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "Untitled";
-          let path = sanitized + ".md";
-          const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-          if (existing) {
-            await this.plugin.app.vault.modify(existing, body || "");
-          } else {
-            await this.plugin.app.vault.create(path, body || "");
-          }
-          const hash = await sha256(body);
-          this.plugin.mapping.upsert({
-            joplinId: item.id,
-            path,
-            type: 1 /* Note */,
-            localHash: hash,
-            remoteUpdatedTime: item.updated_time,
-            syncedAt: Date.now()
-          });
-          done++;
-        } catch (e) {
-          failed++;
-          const errMsg = e?.message || e?.toString() || "unknown error";
-          if (errMsg.includes("401") || errMsg.includes("session")) {
-            try {
-              await this.plugin.api.login();
-            } catch {
-            }
-          }
-          if (failed <= 5)
-            console.error("[joplin-sync] force-pull:", stat.name, errMsg);
-        }
-        this.plugin.statusBar.setProgress(done + failed, remoteStats.length);
-      }
-      let cursor;
-      while (true) {
-        const page = await this.plugin.api.delta(cursor);
-        cursor = page.cursor;
-        if (!page.has_more)
-          break;
-      }
-      this.plugin.mapping.setDeltaCursor(cursor ?? "");
-      await this.plugin.mapping.flush();
-      new import_obsidian7.Notice("Force pull: " + done + " notes, " + failed + " failed, " + skipped + " skipped");
-      this.plugin.logSync("pull", done, failed);
-      this.plugin.statusBar.setOk(Date.now(), done);
+      await this.ensureRootFolder();
+      this.ensureReady();
+      this.plugin.statusBar.setSyncing("force pull: downloading...");
+      await this.deltaPuller.pullAll();
+      const total = this.plugin.mapping.all().length;
+      this.plugin.statusBar.setOk(Date.now(), total);
+      this.plugin.logSync("pull", total, 0);
+      new import_obsidian7.Notice("Force pull: " + total + " items");
+    } catch (e) {
+      const msg = e?.message || e?.toString() || "Unknown error";
+      console.error("[joplin-sync] force pull failed:", msg);
+      this.plugin.statusBar.setError(msg);
+      new import_obsidian7.Notice("Force pull failed: " + msg, 8e3);
     } finally {
       this.running = false;
+      await this.plugin.mapping.flush();
       this.plugin.statusBar.setIdle();
     }
   }

@@ -21,12 +21,12 @@ export class DeltaPuller {
   /** Check if an item belongs to our root folder hierarchy */
   private belongsToRoot(item: JoplinItem): boolean {
     const rootId = this.plugin.mapping.rootFolderId;
-    if (!rootId) return true; // no root set = accept all (backward compat)
-    
-    // Already mapped = ours
+    if (!rootId) return true;
     if (this.plugin.mapping.getById(item.id)) return true;
-    
-    // Check parent chain: walk up through known folder mappings
+    // No folders mapped = fresh pull, accept everything
+    const hasFolders = this.plugin.mapping.all().some(e => e.type === 2);
+    if (!hasFolders) return true;
+
     let pid = item.parent_id;
     const visited = new Set<string>();
     while (pid && !visited.has(pid)) {

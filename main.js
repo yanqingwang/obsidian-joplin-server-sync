@@ -1158,13 +1158,14 @@ var ConflictResolver = class {
 
 // src/core/DeltaPuller.ts
 var DeltaPuller = class {
-  // set to true by forcePull to skip root folder filtering
+  // item_id → full path
   constructor(plugin, watcher) {
     this.plugin = plugin;
     this.watcher = watcher;
     this.serializer = new JoplinSerializer();
     this.rootAncestorCache = /* @__PURE__ */ new Map();
     this.acceptAll = false;
+    this.folderPathCache = /* @__PURE__ */ new Map();
     this.conflicts = new ConflictResolver(plugin, watcher);
     this.resources = new ResourceManager(plugin);
   }
@@ -1213,9 +1214,10 @@ var DeltaPuller = class {
       if (!page.has_more)
         break;
     }
-    const folders = allItems.filter((i) => i.type_ === 2 /* Folder */).sort((a, b) => (a.parent_id ? 1 : 0) - (b.parent_id ? 1 : 0) || (a.title || "").localeCompare(b.title || ""));
+    const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
     const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
     const resources = allItems.filter((i) => i.type_ === 4 /* Resource */);
+    this.buildFolderPaths(folders);
     for (const f of folders) {
       try {
         await this.applyFolder(f);
@@ -1411,8 +1413,37 @@ var DeltaPuller = class {
   resolveFolderPath(parentId) {
     if (!parentId)
       return "";
+    const cached = this.folderPathCache.get(parentId);
+    if (cached !== void 0)
+      return cached;
     const m = this.plugin.mapping.getById(parentId);
     return m ? m.path : "";
+  }
+  /** Pre-compute folder paths from delta items (no mapping dependency) */
+  buildFolderPaths(folders) {
+    this.folderPathCache.clear();
+    const sanitize = (t) => t.replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "Untitled";
+    const known = /* @__PURE__ */ new Map();
+    for (const f of folders)
+      known.set(f.id, sanitize(f.title || ""));
+    const paths = /* @__PURE__ */ new Map();
+    let remaining = [...folders];
+    while (remaining.length > 0) {
+      const next = [];
+      for (const f of remaining) {
+        const parentPath = f.parent_id ? paths.get(f.parent_id) : "";
+        if (f.parent_id && parentPath === void 0) {
+          next.push(f);
+          continue;
+        }
+        paths.set(f.id, (parentPath || "") + sanitize(f.title || "") + "/");
+      }
+      if (next.length === remaining.length)
+        break;
+      remaining = next;
+    }
+    for (const [id, p] of paths)
+      this.folderPathCache.set(id, p);
   }
   sanitize(title) {
     return title.replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "Untitled";

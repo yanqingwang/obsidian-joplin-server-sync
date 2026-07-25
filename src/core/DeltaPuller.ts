@@ -12,7 +12,8 @@ export class DeltaPuller {
   private conflicts: ConflictResolver;
   private resources: ResourceManager;
   private rootAncestorCache = new Map<string, boolean>();
-  acceptAll = false; // set to true by forcePull to skip root folder filtering
+  acceptAll = false;
+  private folderPathCache = new Map<string, string>(); // item_id → full path
 
   constructor(private plugin: JoplinSyncPlugin, private watcher: VaultWatcher) {
     this.conflicts = new ConflictResolver(plugin, watcher);
@@ -61,11 +62,13 @@ export class DeltaPuller {
       if (!page.has_more) break;
     }
 
-    // Second pass: process folders first (sorted by depth), then notes
-    const folders = allItems.filter(i => i.type_ === ModelType.Folder)
-      .sort((a, b) => (a.parent_id ? 1 : 0) - (b.parent_id ? 1 : 0) || (a.title || '').localeCompare(b.title || ''));
+    // Second pass: build folder path cache, then process folders then notes
+    const folders = allItems.filter(i => i.type_ === ModelType.Folder);
     const notes = allItems.filter(i => i.type_ === ModelType.Note);
     const resources = allItems.filter(i => i.type_ === ModelType.Resource);
+
+    // Pre-compute all folder paths from the collected items (no mapping dependency)
+    this.buildFolderPaths(folders);
 
     for (const f of folders) { try { await this.applyFolder(f); } catch (e) { fail++; console.error('[joplin-sync] folder apply failed', f.title, e); } }
     for (const n of notes) { try { await this.applyNote(n); } catch (e) { fail++; console.error('[joplin-sync] note apply failed', n.title, e); } }
@@ -226,8 +229,37 @@ export class DeltaPuller {
 
   private resolveFolderPath(parentId: string): string {
     if (!parentId) return '';
+    // Check folder path cache first (built from current delta batch)
+    const cached = this.folderPathCache.get(parentId);
+    if (cached !== undefined) return cached;
+    // Fall back to mapping
     const m = this.plugin.mapping.getById(parentId);
     return m ? m.path : '';
+  }
+
+  /** Pre-compute folder paths from delta items (no mapping dependency) */
+  private buildFolderPaths(folders: JoplinItem[]): void {
+    this.folderPathCache.clear();
+    // Build path for root-level folders first, then recursively for children
+    const sanitize = (t: string) => t.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+    const known = new Map<string, string>(); // id → sanitized title
+    for (const f of folders) known.set(f.id, sanitize(f.title || ''));
+
+    // Iterative: resolve paths in multiple passes until stable
+    const paths = new Map<string, string>();
+    let remaining = [...folders];
+    while (remaining.length > 0) {
+      const next: JoplinItem[] = [];
+      for (const f of remaining) {
+        const parentPath = f.parent_id ? paths.get(f.parent_id) : '';
+        if (f.parent_id && parentPath === undefined) { next.push(f); continue; }
+        paths.set(f.id, (parentPath || '') + sanitize(f.title || '') + '/');
+      }
+      if (next.length === remaining.length) break; // can't resolve orphans
+      remaining = next;
+    }
+    // Store in cache
+    for (const [id, p] of paths) this.folderPathCache.set(id, p);
   }
 
   private sanitize(title: string): string {

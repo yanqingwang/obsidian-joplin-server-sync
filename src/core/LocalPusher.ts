@@ -5,11 +5,15 @@ import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { createJoplinId } from '../mapping/IdGenerator';
 import { ModelType, JoplinItem } from '../api/models';
 import { sha256 } from './SyncEngine';
+import { ResourceManager } from '../resource/ResourceManager';
 
 export class LocalPusher {
   private serializer = new JoplinSerializer();
+  private resources: ResourceManager;
 
-  constructor(private plugin: JoplinSyncPlugin, private queue: ChangeQueue) {}
+  constructor(private plugin: JoplinSyncPlugin, private queue: ChangeQueue) {
+    this.resources = new ResourceManager(plugin);
+  }
 
   async pushAll(): Promise<void> {
     const changes = this.queue.drain();
@@ -38,7 +42,12 @@ export class LocalPusher {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
     if (!af) return;
     if (af instanceof TFolder) { await this.ensureFolderChain(path + '/'); return; }
-    if (!(af instanceof TFile) || af.extension !== 'md') return;
+    if (!(af instanceof TFile)) return;
+    // Non-md file: upload as resource
+    if (af.extension !== 'md') {
+      await this.resources.uploadResource(af);
+      return;
+    }
 
     const parentPath = af.parent?.path === '/' ? '' : af.parent!.path + '/';
     const parentId = await this.ensureFolderChain(parentPath || '');

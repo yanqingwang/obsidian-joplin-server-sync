@@ -28,7 +28,7 @@ __export(main_exports, {
   default: () => JoplinSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian7 = require("obsidian");
+var import_obsidian8 = require("obsidian");
 
 // src/settings/PluginSettings.ts
 var DEFAULT_SETTINGS = {
@@ -349,7 +349,7 @@ var MappingStore = class {
 };
 
 // src/core/SyncEngine.ts
-var import_obsidian6 = require("obsidian");
+var import_obsidian7 = require("obsidian");
 
 // src/convert/JoplinSerializer.ts
 var NOTE_FIELD_ORDER = [
@@ -686,19 +686,129 @@ var VaultWatcher = class {
     if (s.excludePatterns.some((p) => f.path.startsWith(p)))
       return false;
     if (f instanceof import_obsidian3.TFile && f.extension !== "md") {
-      return false;
+      return true;
     }
     return true;
   }
 };
 
 // src/core/LocalPusher.ts
+var import_obsidian5 = require("obsidian");
+
+// src/resource/ResourceManager.ts
 var import_obsidian4 = require("obsidian");
+var MIME_MAP = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  pdf: "application/pdf",
+  mp3: "audio/mpeg",
+  mp4: "video/mp4",
+  zip: "application/zip"
+};
+var ResourceManager = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.serializer = new JoplinSerializer();
+    this.hashToId = /* @__PURE__ */ new Map();
+  }
+  async uploadResource(file) {
+    const data = await this.plugin.app.vault.readBinary(file);
+    const hash = await sha256(data);
+    const existing = this.plugin.mapping.getByPath(file.path);
+    if (existing && existing.localHash === hash)
+      return existing.joplinId;
+    const dedup = this.hashToId.get(hash);
+    if (dedup)
+      return dedup;
+    const maxSize = this.plugin.settings.maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
+    if (data.byteLength > maxSize)
+      throw new Error("Attachment too large: " + file.path);
+    const id = existing?.joplinId ?? createJoplinId();
+    const now = Date.now();
+    await this.plugin.api.putItem(".resource/" + id, data);
+    const meta = {
+      id,
+      parent_id: "",
+      title: file.name,
+      mime: MIME_MAP[file.extension.toLowerCase()] ?? "application/octet-stream",
+      filename: file.name,
+      file_extension: file.extension,
+      size: data.byteLength,
+      blob_updated_time: now,
+      created_time: file.stat.ctime,
+      updated_time: now,
+      user_created_time: file.stat.ctime,
+      user_updated_time: file.stat.mtime,
+      type_: 4 /* Resource */,
+      encryption_applied: 0,
+      encryption_cipher_text: ""
+    };
+    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(meta));
+    this.plugin.mapping.upsert({
+      joplinId: id,
+      path: file.path,
+      type: 4 /* Resource */,
+      localHash: hash,
+      remoteUpdatedTime: res.updated_time,
+      syncedAt: now
+    });
+    this.hashToId.set(hash, id);
+    return id;
+  }
+  async downloadResource(meta) {
+    const existing = this.plugin.mapping.getById(meta.id);
+    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime)
+      return existing.path;
+    const blob = await this.plugin.api.getItemBinary(".resource/" + meta.id);
+    if (!blob)
+      throw new Error("Resource blob missing: " + meta.id);
+    const dir = this.plugin.settings.attachmentFolder || "attachments";
+    if (!this.plugin.app.vault.getAbstractFileByPath(dir)) {
+      await this.plugin.app.vault.createFolder(dir).catch(() => {
+      });
+    }
+    let filename = meta.filename || meta.id + "." + (meta.file_extension || "bin");
+    let path = (0, import_obsidian4.normalizePath)(dir + "/" + filename);
+    const clash = this.plugin.mapping.getByPath(path);
+    if (clash && clash.joplinId !== meta.id) {
+      path = (0, import_obsidian4.normalizePath)(dir + "/" + meta.id.slice(0, 7) + "_" + filename);
+    }
+    const watcher = this.plugin.engine.watcher;
+    if (watcher?.suppress) {
+      watcher.suppress(path);
+      try {
+        const f = this.plugin.app.vault.getAbstractFileByPath(path);
+        if (f)
+          await this.plugin.app.vault.modifyBinary(f, blob);
+        else
+          await this.plugin.app.vault.createBinary(path, blob);
+      } finally {
+        watcher.release(path);
+      }
+    }
+    this.plugin.mapping.upsert({
+      joplinId: meta.id,
+      path,
+      type: 4 /* Resource */,
+      localHash: await sha256(blob),
+      remoteUpdatedTime: meta.blob_updated_time ?? meta.updated_time,
+      syncedAt: Date.now()
+    });
+    return path;
+  }
+};
+
+// src/core/LocalPusher.ts
 var LocalPusher = class {
   constructor(plugin, queue) {
     this.plugin = plugin;
     this.queue = queue;
     this.serializer = new JoplinSerializer();
+    this.resources = new ResourceManager(plugin);
   }
   async pushAll() {
     const changes = this.queue.drain();
@@ -729,12 +839,16 @@ var LocalPusher = class {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
     if (!af)
       return;
-    if (af instanceof import_obsidian4.TFolder) {
+    if (af instanceof import_obsidian5.TFolder) {
       await this.ensureFolderChain(path + "/");
       return;
     }
-    if (!(af instanceof import_obsidian4.TFile) || af.extension !== "md")
+    if (!(af instanceof import_obsidian5.TFile))
       return;
+    if (af.extension !== "md") {
+      await this.resources.uploadResource(af);
+      return;
+    }
     const parentPath = af.parent?.path === "/" ? "" : af.parent.path + "/";
     const parentId = await this.ensureFolderChain(parentPath || "");
     const content = await this.plugin.app.vault.read(af);
@@ -859,7 +973,7 @@ var LocalPusher = class {
 };
 
 // src/core/ConflictResolver.ts
-var import_obsidian5 = require("obsidian");
+var import_obsidian6 = require("obsidian");
 var ConflictResolver = class {
   constructor(plugin, watcher) {
     this.plugin = plugin;
@@ -876,7 +990,7 @@ var ConflictResolver = class {
       default: {
         const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "");
         const base = mapping.path.replace(/\.md$/, "").split("/").pop();
-        const conflictPath = (0, import_obsidian5.normalizePath)("_conflicts/" + base + " (conflict " + ts + ").md");
+        const conflictPath = (0, import_obsidian6.normalizePath)("_conflicts/" + base + " (conflict " + ts + ").md");
         if (!this.plugin.app.vault.getAbstractFileByPath("_conflicts")) {
           await this.plugin.app.vault.createFolder("_conflicts").catch(() => {
           });
@@ -885,7 +999,7 @@ var ConflictResolver = class {
         await this.plugin.app.vault.create(conflictPath, localContent);
         this.watcher.release(conflictPath);
         await this.applyRemote(mapping, remote);
-        new import_obsidian5.Notice("Sync conflict: local copy saved to " + conflictPath);
+        new import_obsidian6.Notice("Sync conflict: local copy saved to " + conflictPath);
       }
     }
   }
@@ -916,6 +1030,7 @@ var DeltaPuller = class {
     this.watcher = watcher;
     this.serializer = new JoplinSerializer();
     this.conflicts = new ConflictResolver(plugin, watcher);
+    this.resources = new ResourceManager(plugin);
   }
   async pullAll() {
     let cursor = this.plugin.mapping.getDeltaCursor();
@@ -939,8 +1054,12 @@ var DeltaPuller = class {
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
   }
   async applyChange(d, pendingNotes) {
-    if (d.name.startsWith(".resource/"))
+    if (d.name.startsWith(".resource/")) {
+      const id2 = d.name.replace(".resource/", "");
+      if (d.type === 3 /* Delete */)
+        return this.applyDelete(id2);
       return;
+    }
     if (!/^[0-9a-f]{32}\.md$/.test(d.name))
       return;
     const id = d.name.slice(0, 32);
@@ -962,7 +1081,7 @@ var DeltaPuller = class {
         return this.applyNote(item);
       }
       case 4 /* Resource */:
-        return;
+        return this.applyResource(item);
       case 5 /* Tag */:
       case 6 /* NoteTag */:
         return;
@@ -1061,6 +1180,13 @@ var DeltaPuller = class {
       remoteUpdatedTime: item.updated_time,
       syncedAt: Date.now()
     });
+  }
+  async applyResource(item) {
+    try {
+      await this.resources.downloadResource(item);
+    } catch (e) {
+      console.error("[joplin-sync] download resource failed: " + item.id, e);
+    }
   }
   resolveFolderPath(parentId) {
     if (!parentId)
@@ -1207,7 +1333,7 @@ var SyncEngine = class {
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
     if (this.running) {
-      new import_obsidian6.Notice("Sync already in progress");
+      new import_obsidian7.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1230,7 +1356,7 @@ var SyncEngine = class {
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian6.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
+      new import_obsidian7.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
       if (failed.length)
         console.error("[joplin-sync] failures:", failed);
     } finally {
@@ -1414,7 +1540,7 @@ var StatusBar = class {
 };
 
 // src/main.ts
-var JoplinSyncPlugin = class extends import_obsidian7.Plugin {
+var JoplinSyncPlugin = class extends import_obsidian8.Plugin {
   constructor() {
     super(...arguments);
     this.initialized = false;
@@ -1447,9 +1573,9 @@ var JoplinSyncPlugin = class extends import_obsidian7.Plugin {
       callback: async () => {
         try {
           await this.api.login();
-          new import_obsidian7.Notice("Joplin Server: connection OK");
+          new import_obsidian8.Notice("Joplin Server: connection OK");
         } catch (e) {
-          new import_obsidian7.Notice("Connection failed: " + e.message);
+          new import_obsidian8.Notice("Connection failed: " + e.message);
         }
       }
     });
@@ -1458,7 +1584,7 @@ var JoplinSyncPlugin = class extends import_obsidian7.Plugin {
       name: "About / Status",
       callback: () => {
         const total = this.mapping.all().length;
-        new import_obsidian7.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
+        new import_obsidian8.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
       }
     });
     if (this.settings.serverUrl) {

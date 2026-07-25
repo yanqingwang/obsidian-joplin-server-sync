@@ -1,17 +1,20 @@
 import type JoplinSyncPlugin from '../main';
-import { TFile } from 'obsidian';
+import { TFile, Notice } from 'obsidian';
 import { VaultWatcher } from '../vault/VaultWatcher';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { ConflictResolver } from './ConflictResolver';
 import { DeltaChangeType, DeltaItem, ModelType, JoplinItem } from '../api/models';
 import { sha256 } from './SyncEngine';
+import { ResourceManager } from '../resource/ResourceManager';
 
 export class DeltaPuller {
   private serializer = new JoplinSerializer();
   private conflicts: ConflictResolver;
+  private resources: ResourceManager;
 
   constructor(private plugin: JoplinSyncPlugin, private watcher: VaultWatcher) {
     this.conflicts = new ConflictResolver(plugin, watcher);
+    this.resources = new ResourceManager(plugin);
   }
 
   async pullAll(): Promise<void> {
@@ -36,7 +39,13 @@ export class DeltaPuller {
   }
 
   private async applyChange(d: DeltaItem, pendingNotes: JoplinItem[]): Promise<void> {
-    if (d.name.startsWith('.resource/')) return;
+    // Handle resource blob items
+    if (d.name.startsWith('.resource/')) {
+      const id = d.name.replace('.resource/', '');
+      if (d.type === DeltaChangeType.Delete) return this.applyDelete(id);
+      // Blob will be downloaded when the metadata item is processed
+      return;
+    }
     if (!/^[0-9a-f]{32}\.md$/.test(d.name)) return;
     const id = d.name.slice(0, 32);
     if (d.type === DeltaChangeType.Delete) return this.applyDelete(id);
@@ -55,7 +64,7 @@ export class DeltaPuller {
         }
         return this.applyNote(item);
       }
-      case ModelType.Resource: return;
+      case ModelType.Resource: return this.applyResource(item);
       case ModelType.Tag:
       case ModelType.NoteTag: return;
     }
@@ -146,6 +155,14 @@ export class DeltaPuller {
       localHash: await sha256(item.body ?? ''),
       remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
     });
+  }
+
+  private async applyResource(item: JoplinItem): Promise<void> {
+    try {
+      await this.resources.downloadResource(item);
+    } catch (e) {
+      console.error('[joplin-sync] download resource failed: ' + item.id, e);
+    }
   }
 
   private resolveFolderPath(parentId: string): string {

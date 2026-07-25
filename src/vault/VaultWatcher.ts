@@ -35,8 +35,9 @@ export class VaultWatcher {
     if (f.path.startsWith(this.plugin.app.vault.configDir + '/')) return false;
     if (f.path.startsWith('_conflicts/')) return false;
     if (s.excludePatterns.some(p => f.path.startsWith(p))) return false;
+    // Track .md files and potential attachment files
     if (f instanceof TFile && f.extension !== 'md') {
-      return false; // Phase 3: track attachments
+      return true; // Phase 3: track attachments
     }
     return true;
   }

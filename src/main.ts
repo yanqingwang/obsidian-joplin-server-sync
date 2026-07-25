@@ -44,6 +44,18 @@ export default class JoplinSyncPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'joplin-force-push',
+      name: 'Force push to server (overwrite remote)',
+      callback: () => this.engine.forcePush(),
+    });
+
+    this.addCommand({
+      id: 'joplin-force-pull',
+      name: 'Force pull from server (overwrite local)',
+      callback: () => this.engine.forcePull(),
+    });
+
+    this.addCommand({
       id: 'joplin-test-connection',
       name: 'Test Joplin Server connection',
       callback: async () => {

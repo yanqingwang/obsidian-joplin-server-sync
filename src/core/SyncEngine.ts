@@ -173,6 +173,96 @@ export class SyncEngine {
     });
     return id;
   }
+
+  // ============ Force Push: overwrite server with local ============
+  async forcePush(): Promise<void> {
+    if (this.running) { new Notice('Sync already in progress'); return; }
+    this.running = true;
+    try {
+      await this.plugin.api.login();
+      await this.syncInfo.checkOrInit();
+      const rootFolderId = await this.ensureRootFolder();
+      const files = this.collectMarkdownFiles();
+      let done = 0;
+      for (const batch of chunk(files, 5)) {
+        await Promise.all(batch.map(async (file) => {
+          await this.uploadNote(file, rootFolderId);
+          done++;
+          this.plugin.statusBar.setProgress(done, files.length);
+        }));
+        await this.plugin.mapping.flush();
+      }
+      new Notice('Force push: ' + done + ' notes uploaded');
+    } finally {
+      this.running = false;
+      await this.plugin.mapping.flush();
+      this.plugin.statusBar.setIdle();
+    }
+  }
+
+  // ============ Force Pull: overwrite local with server ============
+  async forcePull(): Promise<void> {
+    if (this.running) { new Notice('Sync already in progress'); return; }
+    this.running = true;
+    try {
+      await this.plugin.api.login();
+      const remoteStats = await this.listAllRemoteItems();
+      let done = 0; let failed = 0;
+      for (const stat of remoteStats) {
+        if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
+        try {
+          const raw = await this.plugin.api.getItem(stat.name);
+          if (!raw) continue;
+          const item = this.serializer.unserialize(raw);
+          if (item.type_ === ModelType.Folder) continue;
+
+          const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+          let path = sanitized + '.md';
+          const existing = this.plugin.app.vault.getAbstractFileByPath(path);
+          if (existing) {
+            await this.plugin.app.vault.modify(existing as TFile, item.body ?? '');
+          } else {
+            await this.plugin.app.vault.create(path, item.body ?? '');
+          }
+          const hash = await sha256(item.body ?? '');
+          this.plugin.mapping.upsert({
+            joplinId: item.id, path, type: ModelType.Note,
+            localHash: hash, remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
+          });
+          done++;
+        } catch (e: any) {
+          failed++;
+          console.error('[joplin-sync] force-pull failed: ' + stat.name, e);
+        }
+        this.plugin.statusBar.setProgress(done + failed, remoteStats.length);
+      }
+      // Get initial delta cursor
+      let cursor: string | undefined;
+      while (true) {
+        const page = await this.plugin.api.delta(cursor);
+        cursor = page.cursor;
+        if (!page.has_more) break;
+      }
+      this.plugin.mapping.setDeltaCursor(cursor ?? '');
+      await this.plugin.mapping.flush();
+      new Notice('Force pull: ' + done + ' notes, ' + failed + ' failed');
+    } finally {
+      this.running = false;
+      this.plugin.statusBar.setIdle();
+    }
+  }
+
+  private async listAllRemoteItems(): Promise<import('../api/models').RemoteItemStat[]> {
+    const out: import('../api/models').RemoteItemStat[] = [];
+    let cursor: string | undefined;
+    while (true) {
+      const page = await this.plugin.api.listChildren(cursor);
+      out.push(...page.items);
+      cursor = page.cursor;
+      if (!page.has_more) break;
+    }
+    return out;
+  }
 }
 
 export async function sha256(text: string | ArrayBuffer): Promise<string> {

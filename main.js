@@ -1563,11 +1563,11 @@ var SyncEngine = class {
       this.plugin.statusBar.setIdle();
     }
   }
-  async uploadNote(file, parentId) {
+  async uploadNote(file, parentId, force = false) {
     const content = await this.plugin.app.vault.read(file);
     const hash = await sha256(content);
     const existing = this.plugin.mapping.getByPath(file.path);
-    if (existing && existing.localHash === hash)
+    if (!force && existing && existing.localHash === hash)
       return false;
     const id = existing?.joplinId ?? createJoplinId();
     const item = {
@@ -1790,7 +1790,7 @@ var SyncEngine = class {
           try {
             const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
             const parentId = folderMap.get(dir) || rootFolderId;
-            await this.uploadNote(file, parentId);
+            await this.uploadNote(file, parentId, true);
             done++;
           } catch (e) {
             fail++;

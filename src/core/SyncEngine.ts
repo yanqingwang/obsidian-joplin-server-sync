@@ -61,11 +61,11 @@ export class SyncEngine {
     }
   }
 
-  private async uploadNote(file: TFile, parentId: string): Promise<boolean> {
+  private async uploadNote(file: TFile, parentId: string, force = false): Promise<boolean> {
     const content = await this.plugin.app.vault.read(file);
     const hash = await sha256(content);
     const existing = this.plugin.mapping.getByPath(file.path);
-    if (existing && existing.localHash === hash) return false;
+    if (!force && existing && existing.localHash === hash) return false;
     const id = existing?.joplinId ?? createJoplinId();
     const item: JoplinItem = {
       id, parent_id: parentId, title: file.basename, body: content,
@@ -257,7 +257,7 @@ export class SyncEngine {
           try {
             const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
             const parentId = folderMap.get(dir) || rootFolderId;
-            await this.uploadNote(file, parentId);
+            await this.uploadNote(file, parentId, true);
             done++;
           } catch (e: any) {
             fail++;

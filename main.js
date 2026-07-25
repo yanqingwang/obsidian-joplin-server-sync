@@ -1090,15 +1090,30 @@ var InitialSync = class {
   }
   async run() {
     const remoteStats = await this.listAllRemote();
-    const remoteIds = new Set(
-      remoteStats.filter((s) => /^[0-9a-f]{32}\.md$/.test(s.name)).map((s) => s.name.slice(0, 32))
-    );
-    for (const file of this.plugin.app.vault.getMarkdownFiles()) {
-      const m = this.plugin.mapping.getByPath(file.path);
-      if (!m)
-        this.enqueueCreate(file.path);
-      else if (!remoteIds.has(m.joplinId)) {
+    const remoteIds = /* @__PURE__ */ new Map();
+    for (const s of remoteStats) {
+      if (/^[0-9a-f]{32}\.md$/.test(s.name)) {
+        remoteIds.set(s.name.slice(0, 32), s);
       }
+    }
+    for (const file of this.plugin.app.vault.getMarkdownFiles()) {
+      const mapping = this.plugin.mapping.getByPath(file.path);
+      const remote = mapping ? remoteIds.get(mapping.joplinId) : void 0;
+      if (!mapping && !remote) {
+        await this.uploadNewFile(file);
+      } else if (mapping && remote) {
+        const localContent = await this.plugin.app.vault.read(file);
+        const localHash = await sha256(localContent);
+        if (localHash !== mapping.localHash) {
+          await this.uploadNewFile(file);
+        }
+        remoteIds.delete(mapping.joplinId);
+      } else if (mapping && !remote) {
+        this.plugin.mapping.remove(mapping.joplinId);
+      }
+    }
+    for (const [id, _stat] of remoteIds) {
+      await this.downloadNewItem(id);
     }
     let cursor;
     while (true) {
@@ -1108,6 +1123,62 @@ var InitialSync = class {
         break;
     }
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
+    await this.plugin.mapping.flush();
+  }
+  async uploadNewFile(file) {
+    const content = await this.plugin.app.vault.read(file);
+    const hash = await sha256(content);
+    const id = createJoplinId();
+    const now = Date.now();
+    const item = {
+      id,
+      parent_id: "",
+      title: file.basename,
+      body: content,
+      created_time: file.stat.ctime,
+      updated_time: now,
+      user_created_time: file.stat.ctime,
+      user_updated_time: file.stat.mtime,
+      type_: 1 /* Note */,
+      encryption_applied: 0,
+      encryption_cipher_text: "",
+      markup_language: 1
+    };
+    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
+    this.plugin.mapping.upsert({
+      joplinId: id,
+      path: file.path,
+      type: 1 /* Note */,
+      localHash: hash,
+      remoteUpdatedTime: res.updated_time,
+      syncedAt: now
+    });
+  }
+  async downloadNewItem(id) {
+    try {
+      const raw = await this.plugin.api.getItem(id + ".md");
+      if (!raw)
+        return;
+      const item = this.serializer.unserialize(raw);
+      if (item.type_ !== 1 /* Note */)
+        return;
+      const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "Untitled";
+      let path = sanitized + ".md";
+      if (this.plugin.app.vault.getAbstractFileByPath(path)) {
+        path = sanitized + " (" + id.slice(0, 7) + ").md";
+      }
+      await this.plugin.app.vault.create(path, item.body ?? "");
+      this.plugin.mapping.upsert({
+        joplinId: id,
+        path,
+        type: 1 /* Note */,
+        localHash: await sha256(item.body ?? ""),
+        remoteUpdatedTime: item.updated_time,
+        syncedAt: Date.now()
+      });
+    } catch (e) {
+      console.error("[joplin-sync] download failed: " + id, e);
+    }
   }
   async listAllRemote() {
     const out = [];
@@ -1120,9 +1191,6 @@ var InitialSync = class {
         break;
     }
     return out;
-  }
-  enqueueCreate(path) {
-    console.debug("[joplin-sync] enqueue create: " + path);
   }
 };
 
@@ -1258,8 +1326,8 @@ var SyncEngine = class {
   async syncCycle() {
     if (this.state !== 0 /* Idle */)
       return;
-    this.state = 1 /* Pushing */;
     try {
+      this.state = 1 /* Pushing */;
       this.plugin.statusBar.setSyncing();
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
@@ -1347,6 +1415,10 @@ var StatusBar = class {
 
 // src/main.ts
 var JoplinSyncPlugin = class extends import_obsidian7.Plugin {
+  constructor() {
+    super(...arguments);
+    this.initialized = false;
+  }
   async onload() {
     await this.loadSettings();
     this.api = new JoplinServerApi(() => ({
@@ -1365,6 +1437,11 @@ var JoplinSyncPlugin = class extends import_obsidian7.Plugin {
       callback: () => this.engine.runFullUpload()
     });
     this.addCommand({
+      id: "joplin-sync-now",
+      name: "Sync now",
+      callback: () => this.engine.syncCycle()
+    });
+    this.addCommand({
       id: "joplin-test-connection",
       name: "Test Joplin Server connection",
       callback: async () => {
@@ -1381,9 +1458,13 @@ var JoplinSyncPlugin = class extends import_obsidian7.Plugin {
       name: "About / Status",
       callback: () => {
         const total = this.mapping.all().length;
-        new import_obsidian7.Notice("v0.1.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
+        new import_obsidian7.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
       }
     });
+    if (this.settings.serverUrl) {
+      this.engine.startWatching();
+      this.engine.startScheduler();
+    }
   }
   onunload() {
     void this.engine?.shutdown();

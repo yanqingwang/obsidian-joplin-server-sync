@@ -12,6 +12,7 @@ export default class JoplinSyncPlugin extends Plugin {
   mapping!: MappingStore;
   engine!: SyncEngine;
   statusBar!: StatusBar;
+  private initialized = false;
 
   async onload() {
     await this.loadSettings();
@@ -37,6 +38,12 @@ export default class JoplinSyncPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'joplin-sync-now',
+      name: 'Sync now',
+      callback: () => this.engine.syncCycle(),
+    });
+
+    this.addCommand({
       id: 'joplin-test-connection',
       name: 'Test Joplin Server connection',
       callback: async () => {
@@ -54,9 +61,15 @@ export default class JoplinSyncPlugin extends Plugin {
       name: 'About / Status',
       callback: () => {
         const total = this.mapping.all().length;
-        new Notice('v0.1.1\nMapped items: ' + total + '\nDelta cursor: ' + (this.mapping.getDeltaCursor() ? 'yes' : 'no'));
+        new Notice('v0.2.1\nMapped items: ' + total + '\nDelta cursor: ' + (this.mapping.getDeltaCursor() ? 'yes' : 'no'));
       },
     });
+
+    // Phase 2: start watcher + scheduler after init
+    if (this.settings.serverUrl) {
+      this.engine.startWatching();
+      this.engine.startScheduler();
+    }
   }
 
   onunload(): void {

@@ -127,8 +127,8 @@ export class SyncEngine {
   // ============ Phase 2: Sync Cycle ============
   async syncCycle(): Promise<void> {
     if (this.state !== SyncState.Idle) return;
-    this.state = SyncState.Pushing;
     try {
+      this.state = SyncState.Pushing;
       this.plugin.statusBar.setSyncing();
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();

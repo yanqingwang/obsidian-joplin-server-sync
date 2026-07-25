@@ -1646,17 +1646,19 @@ var SyncEngine = class {
     this.ensureReady();
     try {
       this.state = 1 /* Pushing */;
-      this.plugin.statusBar.setSyncing();
+      this.plugin.statusBar.setSyncing("pushing...");
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
       if (!this.plugin.mapping.getDeltaCursor()) {
+        this.plugin.statusBar.setSyncing("initial sync...");
         await new InitialSync(this.plugin).run();
       }
       this.state = 1 /* Pushing */;
       const pushResult = await this.pusher.pushAll();
       this.plugin.statusBar.setProgress(pushResult.ok, Math.max(pushResult.ok, 1), "push");
       this.state = 2 /* Pulling */;
+      this.plugin.statusBar.setSyncing("pulling...");
       const pullResult = await this.deltaPuller.pullAll();
       this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), "pull");
       this.state = 3 /* Resolving */;
@@ -1705,7 +1707,7 @@ var SyncEngine = class {
     }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing();
+      this.plugin.statusBar.setSyncing("force push...");
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
@@ -1737,7 +1739,7 @@ var SyncEngine = class {
     }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing();
+      this.plugin.statusBar.setSyncing("force pull...");
       await this.plugin.api.login();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
@@ -1880,8 +1882,9 @@ var StatusBar = class {
     this.el.setText("");
     this.el.className = "joplin-sync-status";
   }
-  setSyncing() {
-    this.el.setText("Joplin: syncing\u2026");
+  setSyncing(phase) {
+    const label = phase ? "Joplin: " + phase : "Joplin: syncing\u2026";
+    this.el.setText(label);
     this.el.className = "joplin-sync-status syncing";
   }
   setOk(time, count) {

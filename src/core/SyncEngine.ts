@@ -147,12 +147,13 @@ export class SyncEngine {
     this.ensureReady();
     try {
       this.state = SyncState.Pushing;
-      this.plugin.statusBar.setSyncing();
+      this.plugin.statusBar.setSyncing('pushing...');
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
 
       if (!this.plugin.mapping.getDeltaCursor()) {
+        this.plugin.statusBar.setSyncing('initial sync...');
         await new InitialSync(this.plugin).run();
       }
 
@@ -161,6 +162,7 @@ export class SyncEngine {
       this.plugin.statusBar.setProgress(pushResult.ok, Math.max(pushResult.ok, 1), 'push');
 
       this.state = SyncState.Pulling;
+      this.plugin.statusBar.setSyncing('pulling...');
       const pullResult = await this.deltaPuller.pullAll();
       this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), 'pull');
 
@@ -206,7 +208,7 @@ export class SyncEngine {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing();
+      this.plugin.statusBar.setSyncing('force push...');
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
@@ -236,7 +238,7 @@ export class SyncEngine {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
     try {
-      this.plugin.statusBar.setSyncing();
+      this.plugin.statusBar.setSyncing('force pull...');
       await this.plugin.api.login();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;

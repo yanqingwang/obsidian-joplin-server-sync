@@ -12,8 +12,9 @@ export class StatusBar {
     this.el.className = 'joplin-sync-status';
   }
 
-  setSyncing(): void {
-    this.el.setText('Joplin: syncing\u2026');
+  setSyncing(phase?: string): void {
+    const label = phase ? 'Joplin: ' + phase : 'Joplin: syncing\u2026';
+    this.el.setText(label);
     this.el.className = 'joplin-sync-status syncing';
   }
 

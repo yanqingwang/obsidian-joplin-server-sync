@@ -1630,27 +1630,76 @@ var SyncEngine = class {
     try {
       await this.plugin.api.login();
       const remoteStats = await this.listAllRemoteItems();
-      let done = 0;
-      let failed = 0;
+      const e2ee = this.plugin.e2ee;
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
+          continue;
+        if (stat.name.startsWith(".resource/"))
+          continue;
+        try {
+          const raw = await this.plugin.api.getItem(stat.name);
+          if (!raw)
+            continue;
+          const probe = this.serializer.unserialize(raw);
+          if (probe.type_ === 9) {
+            e2ee.feedMasterKey(probe);
+          }
+        } catch {
+        }
+      }
+      console.log("[joplin-sync] master keys loaded: " + e2ee.availableMasterKeys.length);
+      if (this.plugin.settings.e2eePassword && e2ee.availableMasterKeys.length > 0 && !e2ee.hasLoadedKeys) {
+        for (const mkId of e2ee.availableMasterKeys) {
+          try {
+            await e2ee.loadMasterKey(mkId, this.plugin.settings.e2eePassword);
+          } catch (e) {
+            console.warn("[joplin-sync] master key load failed: " + mkId + " - " + e.message);
+          }
+        }
+      }
+      let done = 0;
+      let failed = 0;
+      let skipped = 0;
+      for (const stat of remoteStats) {
+        if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
+          continue;
+        if (stat.name.startsWith(".resource/"))
           continue;
         try {
           const raw = await this.plugin.api.getItem(stat.name);
           if (!raw)
             continue;
           const item = this.serializer.unserialize(raw);
-          if (item.type_ === 2 /* Folder */)
+          if (item.type_ !== 1 /* Note */) {
+            skipped++;
             continue;
+          }
+          let body = item.body ?? "";
+          if (e2ee.isEncrypted(item)) {
+            try {
+              const decryptedSerialized = await e2ee.decryptItem(item);
+              if (decryptedSerialized) {
+                const decrypted = this.serializer.unserialize(decryptedSerialized);
+                body = decrypted.body ?? "";
+              } else {
+                failed++;
+                continue;
+              }
+            } catch (e) {
+              console.warn("[joplin-sync] decrypt failed: " + stat.name + " - " + e.message);
+              failed++;
+              continue;
+            }
+          }
           const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "Untitled";
           let path = sanitized + ".md";
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
           if (existing) {
-            await this.plugin.app.vault.modify(existing, item.body ?? "");
+            await this.plugin.app.vault.modify(existing, body);
           } else {
-            await this.plugin.app.vault.create(path, item.body ?? "");
+            await this.plugin.app.vault.create(path, body);
           }
-          const hash = await sha256(item.body ?? "");
+          const hash = await sha256(body);
           this.plugin.mapping.upsert({
             joplinId: item.id,
             path,
@@ -1675,7 +1724,7 @@ var SyncEngine = class {
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? "");
       await this.plugin.mapping.flush();
-      new import_obsidian7.Notice("Force pull: " + done + " notes, " + failed + " failed");
+      new import_obsidian7.Notice("Force pull: " + done + " notes, " + failed + " failed, " + skipped + " skipped");
       this.plugin.logSync("pull", done, failed);
     } finally {
       this.running = false;

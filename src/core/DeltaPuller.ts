@@ -22,16 +22,7 @@ export class DeltaPuller {
   private belongsToRoot(item: JoplinItem): boolean {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
-    if (rootId) {
-      if (this.plugin.mapping.getById(item.id)) return true;
-    } else {
-      if (!item.parent_id) return true;
-      if (this.plugin.mapping.getById(item.parent_id)) return true;
-      const hasFolders = this.plugin.mapping.all().some(e => e.type === 2);
-      if (!hasFolders) return true;
-      return false;
-    }
-    // No folders mapped = fresh pull, accept everything
+    if (!rootId) return true; // no root folder → accept everything (cursor filters stale data)
     const hasFolders = this.plugin.mapping.all().some(e => e.type === 2);
     if (!hasFolders) return true;
 

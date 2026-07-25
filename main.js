@@ -28,7 +28,7 @@ __export(main_exports, {
   default: () => JoplinSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian9 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 
 // src/settings/PluginSettings.ts
 var DEFAULT_SETTINGS = {
@@ -466,7 +466,7 @@ var MappingStore = class {
 };
 
 // src/core/SyncEngine.ts
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 
 // src/convert/JoplinSerializer.ts
 var NOTE_FIELD_ORDER = [
@@ -1172,19 +1172,8 @@ var DeltaPuller = class {
     if (this.acceptAll)
       return true;
     const rootId = this.plugin.mapping.rootFolderId;
-    if (rootId) {
-      if (this.plugin.mapping.getById(item.id))
-        return true;
-    } else {
-      if (!item.parent_id)
-        return true;
-      if (this.plugin.mapping.getById(item.parent_id))
-        return true;
-      const hasFolders2 = this.plugin.mapping.all().some((e) => e.type === 2);
-      if (!hasFolders2)
-        return true;
-      return false;
-    }
+    if (!rootId)
+      return true;
     const hasFolders = this.plugin.mapping.all().some((e) => e.type === 2);
     if (!hasFolders)
       return true;
@@ -1426,37 +1415,34 @@ var DeltaPuller = class {
 };
 
 // src/core/InitialSync.ts
+var import_obsidian8 = require("obsidian");
 var InitialSync = class {
   constructor(plugin) {
     this.plugin = plugin;
     this.serializer = new JoplinSerializer();
   }
   async run() {
-    const remoteStats = await this.listAllRemote();
-    const remoteIds = /* @__PURE__ */ new Map();
-    for (const s of remoteStats) {
-      if (/^[0-9a-f]{32}\.md$/.test(s.name)) {
-        remoteIds.set(s.name.slice(0, 32), s);
-      }
+    const files = this.collectMarkdownFiles();
+    if (files.length === 0) {
+      new import_obsidian8.Notice("No markdown files to sync");
+      return;
     }
-    for (const file of this.plugin.app.vault.getMarkdownFiles()) {
-      const mapping = this.plugin.mapping.getByPath(file.path);
-      const remote = mapping ? remoteIds.get(mapping.joplinId) : void 0;
-      if (!mapping && !remote) {
-        await this.uploadNewFile(file);
-      } else if (mapping && remote) {
-        const localContent = await this.plugin.app.vault.read(file);
-        const localHash = await sha256(localContent);
-        if (localHash !== mapping.localHash) {
-          await this.uploadNewFile(file);
+    const folderMap = await this.createFolders(files);
+    let done = 0;
+    let fail = 0;
+    for (const batch of chunk(files, 5)) {
+      await Promise.all(batch.map(async (file) => {
+        try {
+          const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+          const parentId = folderMap.get(dir) || "";
+          await this.uploadNote(file, parentId);
+          done++;
+        } catch (e) {
+          fail++;
+          console.error("[joplin-sync] initial upload fail [" + fail + "]:", file.path, e?.message || e);
         }
-        remoteIds.delete(mapping.joplinId);
-      } else if (mapping && !remote) {
-        this.plugin.mapping.remove(mapping.joplinId);
-      }
-    }
-    for (const [id, _stat] of remoteIds) {
-      await this.downloadNewItem(id);
+      }));
+      await this.plugin.mapping.flush();
     }
     let cursor;
     while (true) {
@@ -1467,15 +1453,66 @@ var InitialSync = class {
     }
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
     await this.plugin.mapping.flush();
+    new import_obsidian8.Notice("Initial sync: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
   }
-  async uploadNewFile(file) {
+  async createFolders(files) {
+    const folderMap = /* @__PURE__ */ new Map();
+    folderMap.set("", "");
+    const dirs = /* @__PURE__ */ new Set();
+    for (const f of files) {
+      const d = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+      if (d && !folderMap.has(d)) {
+        const existing = this.plugin.mapping.getByPath(d + "/");
+        if (existing) {
+          folderMap.set(d, existing.joplinId);
+          continue;
+        }
+        dirs.add(d);
+      }
+    }
+    for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
+      const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) || "" : "";
+      const fid = createJoplinId();
+      const title = dp.split("/").pop() || dp;
+      const item = {
+        id: fid,
+        parent_id: parent,
+        title,
+        type_: 2 /* Folder */,
+        created_time: Date.now(),
+        updated_time: Date.now(),
+        user_created_time: Date.now(),
+        user_updated_time: Date.now(),
+        encryption_applied: 0,
+        encryption_cipher_text: ""
+      };
+      try {
+        const st = await this.plugin.api.putItem(fid + ".md", this.serializer.serialize(item), true);
+        if (st && st.id) {
+          this.plugin.mapping.upsert({
+            joplinId: fid,
+            path: dp + "/",
+            type: 2 /* Folder */,
+            localHash: "",
+            remoteUpdatedTime: st.updated_time || Date.now(),
+            syncedAt: Date.now()
+          });
+          folderMap.set(dp, fid);
+        }
+      } catch (e) {
+        console.warn("[joplin-sync] folder create skipped:", dp, e?.message || e);
+      }
+    }
+    return folderMap;
+  }
+  async uploadNote(file, parentId) {
     const content = await this.plugin.app.vault.read(file);
     const hash = await sha256(content);
     const id = createJoplinId();
     const now = Date.now();
     const item = {
       id,
-      parent_id: "",
+      parent_id: parentId,
       title: file.basename,
       body: content,
       created_time: file.stat.ctime,
@@ -1487,53 +1524,19 @@ var InitialSync = class {
       encryption_cipher_text: "",
       markup_language: 1
     };
-    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
+    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item), true);
     this.plugin.mapping.upsert({
       joplinId: id,
       path: file.path,
       type: 1 /* Note */,
       localHash: hash,
-      remoteUpdatedTime: res.updated_time,
+      remoteUpdatedTime: res.updated_time || now,
       syncedAt: now
     });
   }
-  async downloadNewItem(id) {
-    try {
-      const raw = await this.plugin.api.getItem(id + ".md");
-      if (!raw)
-        return;
-      const item = this.serializer.unserialize(raw);
-      if (item.type_ !== 1 /* Note */)
-        return;
-      const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "Untitled";
-      let path = sanitized + ".md";
-      if (this.plugin.app.vault.getAbstractFileByPath(path)) {
-        path = sanitized + " (" + id.slice(0, 7) + ").md";
-      }
-      await this.plugin.app.vault.create(path, item.body ?? "");
-      this.plugin.mapping.upsert({
-        joplinId: id,
-        path,
-        type: 1 /* Note */,
-        localHash: await sha256(item.body ?? ""),
-        remoteUpdatedTime: item.updated_time,
-        syncedAt: Date.now()
-      });
-    } catch (e) {
-      console.error("[joplin-sync] download failed: " + id, e);
-    }
-  }
-  async listAllRemote() {
-    const out = [];
-    let cursor;
-    while (true) {
-      const page = await this.plugin.api.listChildren(cursor);
-      out.push(...page.items);
-      cursor = page.cursor;
-      if (!page.has_more)
-        break;
-    }
-    return out;
+  collectMarkdownFiles() {
+    const excludes = this.plugin.settings.excludePatterns;
+    return this.plugin.app.vault.getMarkdownFiles().filter((f) => !excludes.some((p) => f.path.startsWith(p)));
   }
 };
 
@@ -1551,7 +1554,7 @@ var SyncEngine = class {
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
     if (this.running) {
-      new import_obsidian8.Notice("Sync already in progress");
+      new import_obsidian9.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1574,7 +1577,7 @@ var SyncEngine = class {
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian8.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
+      new import_obsidian9.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
       if (failed.length)
         console.error("[joplin-sync] failures:", failed);
     } finally {
@@ -1670,7 +1673,7 @@ var SyncEngine = class {
   // ============ Phase 2: Sync Cycle ============
   async syncCycle() {
     if (this.state !== 0 /* Idle */) {
-      new import_obsidian8.Notice("Sync already in progress");
+      new import_obsidian9.Notice("Sync already in progress");
       return;
     }
     this.ensureReady();
@@ -1700,13 +1703,13 @@ var SyncEngine = class {
       this.plugin.statusBar.setOk(Date.now(), totalMapped);
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
       this.plugin.logSync("sync", totalMapped, totalFail);
-      new import_obsidian8.Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
+      new import_obsidian9.Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
     } catch (e) {
       this.state = 4 /* Error */;
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] sync cycle failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian8.Notice("Sync failed: " + msg, 8e3);
+      new import_obsidian9.Notice("Sync failed: " + msg, 8e3);
     } finally {
       await this.plugin.mapping.flush();
       this.state = 0 /* Idle */;
@@ -1732,7 +1735,7 @@ var SyncEngine = class {
   // ============ Force Push: overwrite server with local ============
   async forcePush() {
     if (this.running) {
-      new import_obsidian8.Notice("Sync already in progress");
+      new import_obsidian9.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1805,7 +1808,7 @@ var SyncEngine = class {
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian8.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
+      new import_obsidian9.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
       this.plugin.logSync("push", done, fail);
       let cursor;
       while (true) {
@@ -1825,7 +1828,7 @@ var SyncEngine = class {
   // ============ Force Pull: overwrite local with server ============
   async forcePull() {
     if (this.running) {
-      new import_obsidian8.Notice("Sync already in progress");
+      new import_obsidian9.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1920,14 +1923,14 @@ var SyncEngine = class {
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? "");
       await this.plugin.mapping.flush();
-      new import_obsidian8.Notice("Force pull: " + done + " notes, " + failed + " failed");
+      new import_obsidian9.Notice("Force pull: " + done + " notes, " + failed + " failed");
       this.plugin.logSync("pull", done, failed);
       this.plugin.statusBar.setOk(Date.now(), done);
     } catch (e) {
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian8.Notice("Force pull failed: " + msg, 8e3);
+      new import_obsidian9.Notice("Force pull failed: " + msg, 8e3);
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
@@ -2252,7 +2255,7 @@ var EncryptionService = class {
 };
 
 // src/main.ts
-var JoplinSyncPlugin = class extends import_obsidian9.Plugin {
+var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
   constructor() {
     super(...arguments);
     this.initialized = false;
@@ -2296,9 +2299,9 @@ var JoplinSyncPlugin = class extends import_obsidian9.Plugin {
       callback: async () => {
         try {
           await this.api.login();
-          new import_obsidian9.Notice("Joplin Server: connection OK");
+          new import_obsidian10.Notice("Joplin Server: connection OK");
         } catch (e) {
-          new import_obsidian9.Notice("Connection failed: " + e.message);
+          new import_obsidian10.Notice("Connection failed: " + e.message);
         }
       }
     });
@@ -2307,7 +2310,7 @@ var JoplinSyncPlugin = class extends import_obsidian9.Plugin {
       name: "About / Status",
       callback: () => {
         const total = this.mapping.all().length;
-        new import_obsidian9.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
+        new import_obsidian10.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
       }
     });
     if (this.settings.serverUrl) {

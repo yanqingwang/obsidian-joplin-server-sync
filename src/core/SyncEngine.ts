@@ -299,7 +299,10 @@ export class SyncEngine {
       this.ensureReady();
       this.plugin.statusBar.setSyncing('force pull: downloading...');
 
+      // Accept all items during force pull (don't filter by root folder)
+      this.deltaPuller.acceptAll = true;
       await this.deltaPuller.pullAll();
+      this.deltaPuller.acceptAll = false;
 
       const total = this.plugin.mapping.all().length;
       this.plugin.statusBar.setOk(Date.now(), total);

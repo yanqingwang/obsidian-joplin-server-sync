@@ -1131,16 +1131,20 @@ var ConflictResolver = class {
 
 // src/core/DeltaPuller.ts
 var DeltaPuller = class {
+  // set to true by forcePull to skip root folder filtering
   constructor(plugin, watcher) {
     this.plugin = plugin;
     this.watcher = watcher;
     this.serializer = new JoplinSerializer();
     this.rootAncestorCache = /* @__PURE__ */ new Map();
+    this.acceptAll = false;
     this.conflicts = new ConflictResolver(plugin, watcher);
     this.resources = new ResourceManager(plugin);
   }
   /** Check if an item belongs to our root folder hierarchy */
   belongsToRoot(item) {
+    if (this.acceptAll)
+      return true;
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId)
       return true;
@@ -1812,7 +1816,9 @@ var SyncEngine = class {
       await this.ensureRootFolder();
       this.ensureReady();
       this.plugin.statusBar.setSyncing("force pull: downloading...");
+      this.deltaPuller.acceptAll = true;
       await this.deltaPuller.pullAll();
+      this.deltaPuller.acceptAll = false;
       const total = this.plugin.mapping.all().length;
       this.plugin.statusBar.setOk(Date.now(), total);
       this.plugin.logSync("pull", total, 0);

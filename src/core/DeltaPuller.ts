@@ -12,6 +12,7 @@ export class DeltaPuller {
   private conflicts: ConflictResolver;
   private resources: ResourceManager;
   private rootAncestorCache = new Map<string, boolean>();
+  acceptAll = false; // set to true by forcePull to skip root folder filtering
 
   constructor(private plugin: JoplinSyncPlugin, private watcher: VaultWatcher) {
     this.conflicts = new ConflictResolver(plugin, watcher);
@@ -20,6 +21,7 @@ export class DeltaPuller {
 
   /** Check if an item belongs to our root folder hierarchy */
   private belongsToRoot(item: JoplinItem): boolean {
+    if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId) return true;
     if (this.plugin.mapping.getById(item.id)) return true;

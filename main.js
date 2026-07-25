@@ -174,6 +174,7 @@ var JoplinServerApi = class {
     this.sessionId = null;
     this.callCount = 0;
     this.REFRESH_INTERVAL = 200;
+    this.execJsonLogCount = 0;
     this.getConfig = getConfig;
   }
   async login() {
@@ -190,7 +191,7 @@ var JoplinServerApi = class {
     const body = res.json;
     this.sessionId = body.id;
   }
-  async exec(method, path, opts = {}) {
+  async rawRequest(method, path, opts = {}) {
     if (!this.sessionId)
       await this.login();
     this.callCount++;
@@ -224,13 +225,28 @@ var JoplinServerApi = class {
         await this.sleep(Math.pow(4, attempt) * 1e3);
         continue;
       }
-      return {
-        status: res.status,
-        text: res.text,
-        json: res.json,
-        arrayBuffer: res.arrayBuffer
-      };
+      return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
     }
+  }
+  safeJson(text) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+  async exec(method, path, opts = {}) {
+    const res = await this.rawRequest(method, path, opts);
+    let json = null;
+    try {
+      json = JSON.parse(res.text);
+    } catch {
+      if (this.execJsonLogCount < 5) {
+        this.execJsonLogCount++;
+        console.warn("[joplin-sync] non-json response", method, path, "status=" + res.status, "body=" + res.text.slice(0, 200));
+      }
+    }
+    return { ...res, json };
   }
   itemPath(name, suffix = "") {
     return "/api/items/root:/" + encodeURIComponent(name) + ":" + suffix;
@@ -258,6 +274,8 @@ var JoplinServerApi = class {
     });
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
+    if (!res.json)
+      throw new ApiError(res.status, "PUT response body is not JSON: " + res.text.slice(0, 200));
     return res.json;
   }
   async deleteItem(name) {
@@ -270,6 +288,8 @@ var JoplinServerApi = class {
     const res = await this.exec("GET", "/api/items/root:/:/children" + q);
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
+    if (!res.json)
+      throw new ApiError(res.status, "listChildren body is not JSON: " + res.text.slice(0, 200));
     return res.json;
   }
   async delta(cursor) {
@@ -277,6 +297,8 @@ var JoplinServerApi = class {
     const res = await this.exec("GET", "/api/items/root:/:/delta" + q);
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
+    if (!res.json)
+      throw new ApiError(res.status, "delta body is not JSON: " + res.text.slice(0, 200));
     return res.json;
   }
   async acquireLock(type, clientType, clientId) {
@@ -288,6 +310,8 @@ var JoplinServerApi = class {
       throw new LockConflictError(res.text);
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
+    if (!res.json)
+      throw new ApiError(res.status, "acquireLock body is not JSON: " + res.text.slice(0, 200));
     return res.json;
   }
   async releaseLock(type, clientType, clientId) {
@@ -297,6 +321,8 @@ var JoplinServerApi = class {
     const res = await this.exec("GET", "/api/locks");
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
+    if (!res.json)
+      throw new ApiError(res.status, "listLocks body is not JSON: " + res.text.slice(0, 200));
     return res.json;
   }
   trimSlash(u) {

@@ -27,13 +27,12 @@ export class JoplinServerApi {
     this.sessionId = body.id as string;
   }
 
-  private async exec(method: string, path: string, opts: {
+  private async rawRequest(method: string, path: string, opts: {
     body?: string | ArrayBuffer;
     contentType?: string;
     retries?: number;
-  } = {}): Promise<{ status: number; text: string; json: Record<string, unknown>; arrayBuffer: ArrayBuffer }> {
+  } = {}): Promise<{ status: number; text: string; arrayBuffer: ArrayBuffer }> {
     if (!this.sessionId) await this.login();
-    // Periodic session refresh to avoid expiry during long operations
     this.callCount++;
     if (this.callCount >= this.REFRESH_INTERVAL) {
       this.callCount = 0;
@@ -63,13 +62,28 @@ export class JoplinServerApi {
         await this.sleep(Math.pow(4, attempt) * 1000);
         continue;
       }
-      return {
-        status: res.status,
-        text: res.text,
-        json: res.json as Record<string, unknown>,
-        arrayBuffer: res.arrayBuffer,
-      };
+      return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
     }
+  }
+
+  private safeJson(text: string): Record<string, unknown> | null {
+    try { return JSON.parse(text); } catch { return null; }
+  }
+
+  private execJsonLogCount = 0;
+  private async exec(method: string, path: string, opts: {
+    body?: string | ArrayBuffer;
+    contentType?: string;
+  } = {}): Promise<{ status: number; text: string; json: Record<string, unknown> | null; arrayBuffer: ArrayBuffer }> {
+    const res = await this.rawRequest(method, path, opts);
+    let json: Record<string, unknown> | null = null;
+    try { json = JSON.parse(res.text); } catch {
+      if (this.execJsonLogCount < 5) {
+        this.execJsonLogCount++;
+        console.warn('[joplin-sync] non-json response', method, path, 'status=' + res.status, 'body=' + res.text.slice(0, 200));
+      }
+    }
+    return { ...res, json };
   }
 
   private itemPath(name: string, suffix = ''): string {
@@ -96,6 +110,7 @@ export class JoplinServerApi {
       contentType: 'application/octet-stream',
     });
     if (res.status !== 200) throw new ApiError(res.status, res.text);
+    if (!res.json) throw new ApiError(res.status, 'PUT response body is not JSON: ' + res.text.slice(0, 200));
     return res.json as unknown as { id: string; updated_time: number };
   }
 
@@ -108,6 +123,7 @@ export class JoplinServerApi {
     const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
     const res = await this.exec('GET', '/api/items/root:/:/children' + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
+    if (!res.json) throw new ApiError(res.status, 'listChildren body is not JSON: ' + res.text.slice(0, 200));
     return res.json as unknown as Paginated<RemoteItemStat>;
   }
 
@@ -115,6 +131,7 @@ export class JoplinServerApi {
     const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
     const res = await this.exec('GET', '/api/items/root:/:/delta' + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
+    if (!res.json) throw new ApiError(res.status, 'delta body is not JSON: ' + res.text.slice(0, 200));
     return res.json as unknown as Paginated<DeltaItem>;
   }
 
@@ -125,6 +142,7 @@ export class JoplinServerApi {
     });
     if (res.status === 409) throw new LockConflictError(res.text);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
+    if (!res.json) throw new ApiError(res.status, 'acquireLock body is not JSON: ' + res.text.slice(0, 200));
     return res.json as unknown as SyncLock;
   }
 
@@ -135,6 +153,7 @@ export class JoplinServerApi {
   async listLocks(): Promise<Paginated<SyncLock>> {
     const res = await this.exec('GET', '/api/locks');
     if (res.status !== 200) throw new ApiError(res.status, res.text);
+    if (!res.json) throw new ApiError(res.status, 'listLocks body is not JSON: ' + res.text.slice(0, 200));
     return res.json as unknown as Paginated<SyncLock>;
   }
 

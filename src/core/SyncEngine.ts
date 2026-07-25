@@ -206,6 +206,7 @@ export class SyncEngine {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
     try {
+      this.plugin.statusBar.setSyncing();
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
@@ -235,6 +236,7 @@ export class SyncEngine {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
     try {
+      this.plugin.statusBar.setSyncing();
       await this.plugin.api.login();
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;

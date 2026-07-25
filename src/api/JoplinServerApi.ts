@@ -90,8 +90,8 @@ export class JoplinServerApi {
     return res.arrayBuffer;
   }
 
-  async putItem(name: string, content: string | ArrayBuffer): Promise<{ id: string; updated_time: number }> {
-    const res = await this.exec('PUT', this.itemPath(name, '/content'), {
+  async putItem(name: string, content: string | ArrayBuffer, force = false): Promise<{ id: string; updated_time: number }> {
+    const res = await this.exec('PUT', this.itemPath(name, '/content') + (force ? '?force=1' : ''), {
       body: content,
       contentType: 'application/octet-stream',
     });

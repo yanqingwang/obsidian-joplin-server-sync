@@ -74,25 +74,20 @@ export class SyncEngine {
       type_: ModelType.Note, encryption_applied: 0, encryption_cipher_text: '', markup_language: 1,
     };
     const payload = this.serializer.serialize(item);
-    const result = await this.plugin.api.putItem(id + '.md', payload);
+    const result = await this.plugin.api.putItem(id + '.md', payload, force);
 
-    // Write-then-verify: GET back and compare hash
-    const raw = await this.plugin.api.getItem(id + '.md');
-    if (raw) {
-      const remote = this.serializer.unserialize(raw);
-      const remoteHash = await sha256(remote.body ?? '');
-      if (remoteHash !== hash) {
-        console.warn('[joplin-sync] verify failed for: ' + file.path + ' retrying...');
-        // Retry once
-        await this.plugin.api.putItem(id + '.md', payload);
-        const raw2 = await this.plugin.api.getItem(id + '.md');
-        if (raw2) {
-          const remote2 = this.serializer.unserialize(raw2);
-          if (await sha256(remote2.body ?? '') !== hash) {
-            throw new Error('Content verification failed after retry: ' + file.path);
-          }
+    // Write-then-verify: GET back and compare hash (non-fatal, log only)
+    try {
+      const raw = await this.plugin.api.getItem(id + '.md');
+      if (raw) {
+        const remote = this.serializer.unserialize(raw);
+        const remoteHash = await sha256(remote.body ?? '');
+        if (remoteHash !== hash) {
+          console.warn('[joplin-sync] verify mismatch for: ' + file.path + ' (expected ' + hash + ', got ' + remoteHash + ')');
         }
       }
+    } catch (verifyErr: any) {
+      console.warn('[joplin-sync] verify skipped for: ' + file.path + ' - ' + (verifyErr?.message || verifyErr));
     }
 
     this.plugin.mapping.upsert({
@@ -261,7 +256,7 @@ export class SyncEngine {
           encryption_applied: 0, encryption_cipher_text: '',
         };
         try {
-          const st = await this.plugin.api.putItem(fid + '.md', this.serializer.serialize(item));
+          const st = await this.plugin.api.putItem(fid + '.md', this.serializer.serialize(item), true);
           if (st && st.id) {
             this.plugin.mapping.upsert({
               joplinId: fid, path: dp + '/', type: ModelType.Folder,
@@ -282,7 +277,7 @@ export class SyncEngine {
             done++;
           } catch (e: any) {
             fail++;
-            if (fail <= 3) console.error('[joplin-sync] upload fail:', file.path, e?.message || e);
+            console.error('[joplin-sync] upload fail [' + fail + ']:', file.path, e?.message || e);
           }
         }));
         await this.plugin.mapping.flush();

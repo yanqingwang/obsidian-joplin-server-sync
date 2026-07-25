@@ -41,53 +41,56 @@ export class DeltaPuller {
 
   async pullAll(): Promise<{ ok: number; fail: number }> {
     let cursor = this.plugin.mapping.getDeltaCursor();
-    const pendingNotes: JoplinItem[] = [];
+    const allItems: JoplinItem[] = [];
     let ok = 0; let fail = 0;
 
+    // First pass: collect all items from delta stream
     while (true) {
       const page = await this.plugin.api.delta(cursor || undefined);
       for (const d of page.items) {
         try {
-          await this.applyChange(d, pendingNotes);
+          const items = await this.collectChange(d);
+          allItems.push(...items);
           ok++;
         } catch (e) {
           fail++;
-          console.error('[joplin-sync] apply delta failed', d.name, e);
+          console.error('[joplin-sync] collect delta failed', d.name, e);
         }
       }
       if (page.cursor) cursor = page.cursor;
       if (!page.has_more) break;
     }
 
-    for (const note of pendingNotes) { try { await this.applyNote(note); ok++; } catch { fail++; } }
+    // Second pass: process folders first, then notes — so directories exist before we write files
+    const folders = allItems.filter(i => i.type_ === ModelType.Folder);
+    const notes = allItems.filter(i => i.type_ === ModelType.Note);
+    const resources = allItems.filter(i => i.type_ === ModelType.Resource);
+
+    for (const f of folders) { try { await this.applyFolder(f); } catch (e) { fail++; console.error('[joplin-sync] folder apply failed', f.title, e); } }
+    for (const n of notes) { try { await this.applyNote(n); } catch (e) { fail++; console.error('[joplin-sync] note apply failed', n.title, e); } }
+    for (const r of resources) { try { await this.applyResource(r); } catch (e) { fail++; console.error('[joplin-sync] resource apply failed', r.id, e); } }
+
     this.plugin.mapping.setDeltaCursor(cursor ?? '');
     return { ok, fail };
   }
 
-  private async applyChange(d: DeltaItem, pendingNotes: JoplinItem[]): Promise<void> {
+  /** Download a delta item and return fully unserialized JoplinItems it contains */
+  private async collectChange(d: DeltaItem): Promise<JoplinItem[]> {
     // Handle resource blob items
     if (d.name.startsWith('.resource/')) {
-      const id = d.name.replace('.resource/', '');
-      if (d.type === DeltaChangeType.Delete) return this.applyDelete(id);
-      // Blob will be downloaded when the metadata item is processed
-      return;
+      if (d.type === DeltaChangeType.Delete) { await this.applyDelete(d.name.replace('.resource/', '')); return []; }
+      return [];
     }
-    if (!/^[0-9a-f]{32}\.md$/.test(d.name)) return;
+    if (!/^[0-9a-f]{32}\.md$/.test(d.name)) return [];
     const id = d.name.slice(0, 32);
-    if (d.type === DeltaChangeType.Delete) return this.applyDelete(id);
+    if (d.type === DeltaChangeType.Delete) { await this.applyDelete(id); return []; }
 
     const raw = await this.plugin.api.getItem(d.name);
-    if (raw === null) return;
+    if (raw === null) return [];
 
-    // Feed master key items to decryption service before further processing
     const e2ee = this.plugin.e2ee;
-    if (d.name.endsWith('.md')) {
-      const probe = this.serializer.unserialize(raw);
-      if (probe.type_ === 9) {
-        e2ee.feedMasterKey(probe);
-        return;
-      }
-    }
+    const probe = this.serializer.unserialize(raw);
+    if (probe.type_ === 9) { e2ee.feedMasterKey(probe); return []; }
 
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
@@ -99,36 +102,17 @@ export class DeltaPuller {
         if (decryptedBody !== null) {
           const decrypted = this.serializer.unserialize(decryptedBody);
           decrypted.updated_time = item.updated_time;
-          if (!this.belongsToRoot(decrypted)) return;
-          switch (decrypted.type_) {
-            case ModelType.Note: return this.applyNote(decrypted);
-            case ModelType.Folder: return this.applyFolder(decrypted);
-            case ModelType.Resource: return this.applyResource(decrypted);
-          }
-          return;
+          if (!this.belongsToRoot(decrypted)) return [];
+          return [decrypted];
         }
       } catch (e: any) {
         console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + e.message);
-        return;
+        return [];
       }
     }
 
-    // Skip items not belonging to our root folder (e.g. old server data)
-    if (!this.belongsToRoot(item)) return;
-
-    switch (item.type_) {
-      case ModelType.Folder: return this.applyFolder(item);
-      case ModelType.Note: {
-        if (item.parent_id && !this.plugin.mapping.getById(item.parent_id)) {
-          pendingNotes.push(item);
-          return;
-        }
-        return this.applyNote(item);
-      }
-      case ModelType.Resource: return this.applyResource(item);
-      case ModelType.Tag:
-      case ModelType.NoteTag: return;
-    }
+    if (!this.belongsToRoot(item)) return [];
+    return [item];
   }
 
   private async applyNote(item: JoplinItem): Promise<void> {

@@ -1193,18 +1193,19 @@ var DeltaPuller = class {
   }
   async pullAll() {
     let cursor = this.plugin.mapping.getDeltaCursor();
-    const pendingNotes = [];
+    const allItems = [];
     let ok = 0;
     let fail = 0;
     while (true) {
       const page = await this.plugin.api.delta(cursor || void 0);
       for (const d of page.items) {
         try {
-          await this.applyChange(d, pendingNotes);
+          const items = await this.collectChange(d);
+          allItems.push(...items);
           ok++;
         } catch (e) {
           fail++;
-          console.error("[joplin-sync] apply delta failed", d.name, e);
+          console.error("[joplin-sync] collect delta failed", d.name, e);
         }
       }
       if (page.cursor)
@@ -1212,39 +1213,60 @@ var DeltaPuller = class {
       if (!page.has_more)
         break;
     }
-    for (const note of pendingNotes) {
+    const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
+    const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
+    const resources = allItems.filter((i) => i.type_ === 4 /* Resource */);
+    for (const f of folders) {
       try {
-        await this.applyNote(note);
-        ok++;
-      } catch {
+        await this.applyFolder(f);
+      } catch (e) {
         fail++;
+        console.error("[joplin-sync] folder apply failed", f.title, e);
+      }
+    }
+    for (const n of notes) {
+      try {
+        await this.applyNote(n);
+      } catch (e) {
+        fail++;
+        console.error("[joplin-sync] note apply failed", n.title, e);
+      }
+    }
+    for (const r of resources) {
+      try {
+        await this.applyResource(r);
+      } catch (e) {
+        fail++;
+        console.error("[joplin-sync] resource apply failed", r.id, e);
       }
     }
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
     return { ok, fail };
   }
-  async applyChange(d, pendingNotes) {
+  /** Download a delta item and return fully unserialized JoplinItems it contains */
+  async collectChange(d) {
     if (d.name.startsWith(".resource/")) {
-      const id2 = d.name.replace(".resource/", "");
-      if (d.type === 3 /* Delete */)
-        return this.applyDelete(id2);
-      return;
+      if (d.type === 3 /* Delete */) {
+        await this.applyDelete(d.name.replace(".resource/", ""));
+        return [];
+      }
+      return [];
     }
     if (!/^[0-9a-f]{32}\.md$/.test(d.name))
-      return;
+      return [];
     const id = d.name.slice(0, 32);
-    if (d.type === 3 /* Delete */)
-      return this.applyDelete(id);
+    if (d.type === 3 /* Delete */) {
+      await this.applyDelete(id);
+      return [];
+    }
     const raw = await this.plugin.api.getItem(d.name);
     if (raw === null)
-      return;
+      return [];
     const e2ee = this.plugin.e2ee;
-    if (d.name.endsWith(".md")) {
-      const probe = this.serializer.unserialize(raw);
-      if (probe.type_ === 9) {
-        e2ee.feedMasterKey(probe);
-        return;
-      }
+    const probe = this.serializer.unserialize(raw);
+    if (probe.type_ === 9) {
+      e2ee.feedMasterKey(probe);
+      return [];
     }
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
@@ -1255,40 +1277,17 @@ var DeltaPuller = class {
           const decrypted = this.serializer.unserialize(decryptedBody);
           decrypted.updated_time = item.updated_time;
           if (!this.belongsToRoot(decrypted))
-            return;
-          switch (decrypted.type_) {
-            case 1 /* Note */:
-              return this.applyNote(decrypted);
-            case 2 /* Folder */:
-              return this.applyFolder(decrypted);
-            case 4 /* Resource */:
-              return this.applyResource(decrypted);
-          }
-          return;
+            return [];
+          return [decrypted];
         }
       } catch (e) {
         console.warn("[joplin-sync] E2EE decrypt failed for " + d.name + ": " + e.message);
-        return;
+        return [];
       }
     }
     if (!this.belongsToRoot(item))
-      return;
-    switch (item.type_) {
-      case 2 /* Folder */:
-        return this.applyFolder(item);
-      case 1 /* Note */: {
-        if (item.parent_id && !this.plugin.mapping.getById(item.parent_id)) {
-          pendingNotes.push(item);
-          return;
-        }
-        return this.applyNote(item);
-      }
-      case 4 /* Resource */:
-        return this.applyResource(item);
-      case 5 /* Tag */:
-      case 6 /* NoteTag */:
-        return;
-    }
+      return [];
+    return [item];
   }
   async applyNote(item) {
     const mapping = this.plugin.mapping.getById(item.id);

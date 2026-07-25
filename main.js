@@ -1772,6 +1772,7 @@ var SyncEngine = class {
       let done = 0;
       let failed = 0;
       let skipped = 0;
+      const rootId = this.plugin.mapping.rootFolderId;
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
           continue;
@@ -1783,6 +1784,10 @@ var SyncEngine = class {
             continue;
           const item = this.serializer.unserialize(raw);
           if (item.type_ !== 1 /* Note */) {
+            skipped++;
+            continue;
+          }
+          if (rootId && item.parent_id !== rootId && !this.plugin.mapping.getById(item.parent_id)) {
             skipped++;
             continue;
           }

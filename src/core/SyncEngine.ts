@@ -271,6 +271,7 @@ export class SyncEngine {
 
       // Pass 3: download notes (skip encrypted items we cannot decrypt)
       let done = 0; let failed = 0; let skipped = 0;
+      const rootId = this.plugin.mapping.rootFolderId;
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
         if (stat.name.startsWith('.resource/')) continue;
@@ -281,6 +282,11 @@ export class SyncEngine {
 
           // Skip non-note items
           if (item.type_ !== ModelType.Note) { skipped++; continue; }
+
+          // Skip items not under our root folder (old server data)
+          if (rootId && item.parent_id !== rootId && !this.plugin.mapping.getById(item.parent_id)) {
+            skipped++; continue;
+          }
 
           // E2EE handling
           let body = item.body ?? '';

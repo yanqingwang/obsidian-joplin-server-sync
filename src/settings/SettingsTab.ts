@@ -109,6 +109,53 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
+    // E2EE section
+    new Setting(containerEl).setName('End-to-end encryption').setHeading();
+
+    const e2eeStatus = this.plugin.e2ee.hasLoadedKeys
+      ? 'Keys loaded (' + this.plugin.e2ee.availableMasterKeys.length + ' master key(s))'
+      : 'No keys loaded';
+    new Setting(containerEl)
+      .setName('Status')
+      .setDesc(e2eeStatus);
+
+    new Setting(containerEl)
+      .setName('E2EE password')
+      .setDesc('Enter your Joplin E2EE password to decrypt items')
+      .addText(t => {
+        t.inputEl.type = 'password';
+        t.setPlaceholder('E2EE password');
+        t.setValue(this.plugin.settings.e2eePassword)
+          .onChange(async v => {
+            this.plugin.settings.e2eePassword = v;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('Load E2EE keys')
+      .addButton(b => b
+        .setButtonText('Load keys')
+        .setCta()
+        .onClick(async () => {
+          b.setDisabled(true).setButtonText('Loading\u2026');
+          try {
+            const pw = this.plugin.settings.e2eePassword;
+            if (!pw) { new Notice('Enter E2EE password first'); b.setDisabled(false).setButtonText('Load keys'); return; }
+            const mks = this.plugin.e2ee.availableMasterKeys;
+            if (mks.length === 0) { new Notice('No master key items found. Run a sync cycle first.'); b.setDisabled(false).setButtonText('Load keys'); return; }
+            for (const mkId of mks) {
+              await this.plugin.e2ee.loadMasterKey(mkId, pw);
+            }
+            new Notice('Loaded ' + mks.length + ' master key(s)');
+          } catch (e: any) {
+            new Notice('E2EE key load failed: ' + e.message, 8000);
+          } finally {
+            b.setDisabled(false).setButtonText('Load keys');
+            this.display();
+          }
+        }));
+
     // Sync log
     new Setting(containerEl).setName('Sync history').setHeading();
     const log = this.plugin.settings.syncLog;

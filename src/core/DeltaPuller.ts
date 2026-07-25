@@ -52,8 +52,41 @@ export class DeltaPuller {
 
     const raw = await this.plugin.api.getItem(d.name);
     if (raw === null) return;
+
+    // Feed master key items to decryption service before further processing
+    const e2ee = this.plugin.e2ee;
+    if (d.name.endsWith('.md')) {
+      const probe = this.serializer.unserialize(raw);
+      if (probe.type_ === 9) {
+        e2ee.feedMasterKey(probe);
+        return;
+      }
+    }
+
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
+
+    // E2EE: attempt decryption
+    if (e2ee.isEncrypted(item)) {
+      try {
+        const decryptedBody = await e2ee.decryptItem(item);
+        if (decryptedBody !== null) {
+          // Re-parse the decrypted serialized form
+          const decrypted = this.serializer.unserialize(decryptedBody);
+          decrypted.updated_time = item.updated_time;
+          switch (decrypted.type_) {
+            case ModelType.Note: return this.applyNote(decrypted);
+            case ModelType.Folder: return this.applyFolder(decrypted);
+            case ModelType.Resource: return this.applyResource(decrypted);
+          }
+          return;
+        }
+      } catch (e: any) {
+        console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + e.message);
+        // Skip encrypted items we can't decrypt
+        return;
+      }
+    }
 
     switch (item.type_) {
       case ModelType.Folder: return this.applyFolder(item);

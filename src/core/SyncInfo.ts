@@ -3,7 +3,11 @@ import { JoplinServerApi } from '../api/JoplinServerApi';
 const SUPPORTED_SYNC_VERSION = 3;
 
 export class SyncInfoHandler {
+  private _e2eeEnabled = false;
+
   constructor(private api: JoplinServerApi) {}
+
+  get e2eeEnabled(): boolean { return this._e2eeEnabled; }
 
   async checkOrInit(): Promise<any> {
     const raw = await this.api.getItem('info.json');
@@ -19,8 +23,9 @@ export class SyncInfoHandler {
     if (info.version < SUPPORTED_SYNC_VERSION) {
       throw new Error('Sync target needs upgrade (v' + info.version + '). Run sync in official Joplin client first.');
     }
-    if (info.e2ee?.value === true) {
-      throw new Error('This sync target has E2EE enabled, which is not yet supported.');
+    this._e2eeEnabled = info.e2ee?.value === true;
+    if (this._e2eeEnabled) {
+      console.warn('[joplin-sync] E2EE target detected — read-only decryption mode');
     }
     return info;
   }

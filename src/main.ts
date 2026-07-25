@@ -5,6 +5,7 @@ import { JoplinServerApi } from './api/JoplinServerApi';
 import { MappingStore } from './mapping/MappingStore';
 import { SyncEngine } from './core/SyncEngine';
 import { StatusBar } from './ui/StatusBar';
+import { EncryptionService } from './e2ee/EncryptionService';
 
 export default class JoplinSyncPlugin extends Plugin {
   settings!: PluginSettings;
@@ -12,6 +13,7 @@ export default class JoplinSyncPlugin extends Plugin {
   mapping!: MappingStore;
   engine!: SyncEngine;
   statusBar!: StatusBar;
+  e2ee!: EncryptionService;
   private initialized = false;
 
   async onload() {
@@ -27,6 +29,7 @@ export default class JoplinSyncPlugin extends Plugin {
     await this.mapping.load();
 
     this.statusBar = new StatusBar(this.addStatusBarItem());
+    this.e2ee = new EncryptionService();
     this.engine = new SyncEngine(this);
 
     this.addSettingTab(new JoplinSyncSettingTab(this.app, this));

@@ -137,7 +137,7 @@ export class SyncEngine {
       this.timer = window.setInterval(() => this.syncCycle(), interval * 1000);
     }
     if (this.plugin.settings.syncOnStartup) {
-      setTimeout(() => this.syncCycle(), 5000);
+      window.setTimeout(() => this.syncCycle(), 5000);
     }
   }
 
@@ -217,9 +217,9 @@ export class SyncEngine {
       const allRemote = await this.listAllRemoteItems();
       for (const stat of allRemote) {
         if (stat.name === 'info.json') continue;
-        try { await this.plugin.api.deleteItem(stat.name); deleted++; } catch { }
+        try { await this.plugin.api.deleteItem(stat.name); deleted++; } catch { void 0; }
       }
-      console.log('[joplin-sync] force push: deleted ' + deleted);
+      console.debug('[joplin-sync] force push: deleted ' + deleted);
 
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
@@ -288,12 +288,12 @@ export class SyncEngine {
       let delCount = 0;
       for (const f of allFiles) {
         if (f.extension === 'md') {
-          await this.plugin.app.vault.delete(f);
+          this.plugin.app.fileManager.trashFile(f).catch(() => {});
           delCount++;
         }
       }
       this.plugin.mapping.setDeltaCursor('');
-      console.log('[joplin-sync] force pull: deleted ' + delCount + ' local files');
+      console.debug('[joplin-sync] force pull: deleted ' + delCount + ' local files');
 
       // Use listAllRemoteItems (listChildren) for full download
       // delta API only returns recent changes, not all items
@@ -337,7 +337,7 @@ export class SyncEngine {
         } catch (e: any) {
           failed++;
           const msg = e?.message || '';
-          if (msg.includes('401')) try { await this.plugin.api.login(); } catch {}
+          if (msg.includes('401')) try { await this.plugin.api.login(); } catch { void 0; }
           if (failed <= 3) console.error('[joplin-sync] force-pull:', stat.name, msg);
         }
         this.plugin.statusBar.setProgress(done + failed + skipped, remoteStats.length, 'pull');

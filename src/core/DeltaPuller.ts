@@ -196,7 +196,9 @@ export class DeltaPuller {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
     if (f) {
       this.watcher.suppress(f.path);
-      await this.plugin.app.vault.trash(f, true);
+      if (f instanceof TFile) {
+        this.plugin.app.fileManager.trashFile(f).catch(() => {});
+      }
       this.watcher.release(f.path);
     }
     this.plugin.mapping.remove(id);
@@ -206,7 +208,7 @@ export class DeltaPuller {
     this.watcher.suppress(path);
     try {
       const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-      if (existing) await this.plugin.app.vault.modify(existing as TFile, content);
+      if (existing instanceof TFile) await this.plugin.app.vault.modify(existing, content);
       else await this.plugin.app.vault.create(path, content);
     } finally {
       this.watcher.release(path);

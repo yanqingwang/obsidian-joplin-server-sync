@@ -71,4 +71,4 @@ export class LockManager {
   }
 }
 
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms: number) { return new Promise(r => window.setTimeout(r, ms)); }

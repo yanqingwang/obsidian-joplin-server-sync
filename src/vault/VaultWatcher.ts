@@ -16,7 +16,7 @@ export class VaultWatcher {
   }
 
   suppress(path: string): void { this.suppressed.add(path); }
-  release(path: string): void { setTimeout(() => this.suppressed.delete(path), 2000); }
+  release(path: string): void { window.setTimeout(() => this.suppressed.delete(path), 2000); }
 
   private onEvent(kind: 'create' | 'modify' | 'delete', f: TAbstractFile): void {
     if (this.suppressed.has(f.path)) return;

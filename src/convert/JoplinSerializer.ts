@@ -74,7 +74,7 @@ export class JoplinSerializer {
 
     const headerBody = lines.slice(0, bodyEndIndex);
     item.title = headerBody[0] ?? '';
-    if (Number(item.type_) === ModelType.Note) {
+    if (item.type_ === ModelType.Note) {
       item.body = headerBody.slice(2).join('\n');
     }
     item.type_ = Number(item.type_);

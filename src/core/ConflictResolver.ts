@@ -36,7 +36,7 @@ export class ConflictResolver {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
     this.watcher.suppress(mapping.path);
     try {
-      if (f) await this.plugin.app.vault.modify(f as TFile, remote.body ?? '');
+      if (f instanceof TFile) await this.plugin.app.vault.modify(f, remote.body ?? '');
       else await this.plugin.app.vault.create(mapping.path, remote.body ?? '');
     } finally {
       this.watcher.release(mapping.path);

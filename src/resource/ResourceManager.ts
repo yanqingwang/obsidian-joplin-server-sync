@@ -73,7 +73,7 @@ export class ResourceManager {
       watcher.suppress(path);
       try {
         const f = this.plugin.app.vault.getAbstractFileByPath(path);
-        if (f) await this.plugin.app.vault.modifyBinary(f as TFile, blob);
+        if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, blob);
         else await this.plugin.app.vault.createBinary(path, blob);
       } finally { watcher.release(path); }
     }

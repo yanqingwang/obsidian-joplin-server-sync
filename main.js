@@ -28,7 +28,7 @@ __export(main_exports, {
   default: () => JoplinSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 
 // src/settings/PluginSettings.ts
 var DEFAULT_SETTINGS = {
@@ -416,7 +416,7 @@ var MappingStore = class {
 };
 
 // src/core/SyncEngine.ts
-var import_obsidian7 = require("obsidian");
+var import_obsidian8 = require("obsidian");
 
 // src/convert/JoplinSerializer.ts
 var NOTE_FIELD_ORDER = [
@@ -558,7 +558,7 @@ var JoplinSerializer = class {
     }
     const headerBody = lines.slice(0, bodyEndIndex);
     item.title = headerBody[0] ?? "";
-    if (Number(item.type_) === 1 /* Note */) {
+    if (item.type_ === 1 /* Note */) {
       item.body = headerBody.slice(2).join("\n");
     }
     item.type_ = Number(item.type_);
@@ -733,7 +733,7 @@ var VaultWatcher = class {
     this.suppressed.add(path);
   }
   release(path) {
-    setTimeout(() => this.suppressed.delete(path), 2e3);
+    window.setTimeout(() => this.suppressed.delete(path), 2e3);
   }
   onEvent(kind, f) {
     if (this.suppressed.has(f.path))
@@ -854,7 +854,7 @@ var ResourceManager = class {
       watcher.suppress(path);
       try {
         const f = this.plugin.app.vault.getAbstractFileByPath(path);
-        if (f)
+        if (f instanceof import_obsidian4.TFile)
           await this.plugin.app.vault.modifyBinary(f, blob);
         else
           await this.plugin.app.vault.createBinary(path, blob);
@@ -1078,6 +1078,9 @@ var LocalPusher = class {
   }
 };
 
+// src/core/DeltaPuller.ts
+var import_obsidian7 = require("obsidian");
+
 // src/core/ConflictResolver.ts
 var import_obsidian6 = require("obsidian");
 var ConflictResolver = class {
@@ -1113,7 +1116,7 @@ var ConflictResolver = class {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
     this.watcher.suppress(mapping.path);
     try {
-      if (f)
+      if (f instanceof import_obsidian6.TFile)
         await this.plugin.app.vault.modify(f, remote.body ?? "");
       else
         await this.plugin.app.vault.create(mapping.path, remote.body ?? "");
@@ -1333,7 +1336,10 @@ var DeltaPuller = class {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
     if (f) {
       this.watcher.suppress(f.path);
-      await this.plugin.app.vault.trash(f, true);
+      if (f instanceof import_obsidian7.TFile) {
+        this.plugin.app.fileManager.trashFile(f).catch(() => {
+        });
+      }
       this.watcher.release(f.path);
     }
     this.plugin.mapping.remove(id);
@@ -1342,7 +1348,7 @@ var DeltaPuller = class {
     this.watcher.suppress(path);
     try {
       const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-      if (existing)
+      if (existing instanceof import_obsidian7.TFile)
         await this.plugin.app.vault.modify(existing, content);
       else
         await this.plugin.app.vault.create(path, content);
@@ -1513,7 +1519,7 @@ var SyncEngine = class {
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
     if (this.running) {
-      new import_obsidian7.Notice("Sync already in progress");
+      new import_obsidian8.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1537,7 +1543,7 @@ var SyncEngine = class {
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian7.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
+      new import_obsidian8.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
       if (failed.length)
         console.error("[joplin-sync] failures:", failed);
     } finally {
@@ -1641,13 +1647,13 @@ var SyncEngine = class {
       this.timer = window.setInterval(() => this.syncCycle(), interval * 1e3);
     }
     if (this.plugin.settings.syncOnStartup) {
-      setTimeout(() => this.syncCycle(), 5e3);
+      window.setTimeout(() => this.syncCycle(), 5e3);
     }
   }
   // ============ Phase 2: Sync Cycle ============
   async syncCycle() {
     if (this.state !== 0 /* Idle */) {
-      new import_obsidian7.Notice("Sync already in progress");
+      new import_obsidian8.Notice("Sync already in progress");
       return;
     }
     this.ensureReady();
@@ -1677,13 +1683,13 @@ var SyncEngine = class {
       this.plugin.statusBar.setOk(Date.now(), totalMapped);
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
       this.plugin.logSync("sync", totalMapped, totalFail);
-      new import_obsidian7.Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
+      new import_obsidian8.Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
     } catch (e) {
       this.state = 4 /* Error */;
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] sync cycle failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian7.Notice("Sync failed: " + msg, 8e3);
+      new import_obsidian8.Notice("Sync failed: " + msg, 8e3);
     } finally {
       await this.plugin.mapping.flush();
       this.state = 0 /* Idle */;
@@ -1709,7 +1715,7 @@ var SyncEngine = class {
   // ============ Force Push: overwrite server with local ============
   async forcePush() {
     if (this.running) {
-      new import_obsidian7.Notice("Sync already in progress");
+      new import_obsidian8.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1729,7 +1735,7 @@ var SyncEngine = class {
         } catch {
         }
       }
-      console.log("[joplin-sync] force push: deleted " + deleted);
+      console.debug("[joplin-sync] force push: deleted " + deleted);
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       const folderMap = /* @__PURE__ */ new Map();
@@ -1784,7 +1790,7 @@ var SyncEngine = class {
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian7.Notice("Force push: cleared " + deleted + ", uploaded " + done + " notes");
+      new import_obsidian8.Notice("Force push: cleared " + deleted + ", uploaded " + done + " notes");
       this.plugin.logSync("push", done, 0);
       this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
@@ -1796,7 +1802,7 @@ var SyncEngine = class {
   // ============ Force Pull: overwrite local with server ============
   async forcePull() {
     if (this.running) {
-      new import_obsidian7.Notice("Sync already in progress");
+      new import_obsidian8.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -1807,12 +1813,13 @@ var SyncEngine = class {
       let delCount = 0;
       for (const f of allFiles) {
         if (f.extension === "md") {
-          await this.plugin.app.vault.delete(f);
+          this.plugin.app.fileManager.trashFile(f).catch(() => {
+          });
           delCount++;
         }
       }
       this.plugin.mapping.setDeltaCursor("");
-      console.log("[joplin-sync] force pull: deleted " + delCount + " local files");
+      console.debug("[joplin-sync] force pull: deleted " + delCount + " local files");
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
       let done = 0;
@@ -1890,14 +1897,14 @@ var SyncEngine = class {
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? "");
       await this.plugin.mapping.flush();
-      new import_obsidian7.Notice("Force pull: " + done + " notes, " + failed + " failed");
+      new import_obsidian8.Notice("Force pull: " + done + " notes, " + failed + " failed");
       this.plugin.logSync("pull", done, failed);
       this.plugin.statusBar.setOk(Date.now(), done);
     } catch (e) {
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian7.Notice("Force pull failed: " + msg, 8e3);
+      new import_obsidian8.Notice("Force pull failed: " + msg, 8e3);
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
@@ -2222,7 +2229,7 @@ var EncryptionService = class {
 };
 
 // src/main.ts
-var JoplinSyncPlugin = class extends import_obsidian8.Plugin {
+var JoplinSyncPlugin = class extends import_obsidian9.Plugin {
   constructor() {
     super(...arguments);
     this.initialized = false;
@@ -2266,9 +2273,9 @@ var JoplinSyncPlugin = class extends import_obsidian8.Plugin {
       callback: async () => {
         try {
           await this.api.login();
-          new import_obsidian8.Notice("Joplin Server: connection OK");
+          new import_obsidian9.Notice("Joplin Server: connection OK");
         } catch (e) {
-          new import_obsidian8.Notice("Connection failed: " + e.message);
+          new import_obsidian9.Notice("Connection failed: " + e.message);
         }
       }
     });
@@ -2277,7 +2284,7 @@ var JoplinSyncPlugin = class extends import_obsidian8.Plugin {
       name: "About / Status",
       callback: () => {
         const total = this.mapping.all().length;
-        new import_obsidian8.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
+        new import_obsidian9.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
       }
     });
     if (this.settings.serverUrl) {

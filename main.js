@@ -1590,15 +1590,19 @@ var SyncEngine = class {
       }
       this.state = 1 /* Pushing */;
       await this.pusher.pushAll();
+      this.plugin.statusBar.setProgress(0, 1, "pulling");
       this.state = 2 /* Pulling */;
       await this.deltaPuller.pullAll();
       this.state = 3 /* Resolving */;
+      let resolvedCount = 0;
       for (const t of [...this.plugin.mapping.tombstones]) {
         await this.plugin.api.deleteItem(t.joplinId + ".md");
         this.plugin.mapping.clearTombstone(t.joplinId);
+        resolvedCount++;
       }
-      this.plugin.statusBar.setOk(Date.now());
-      this.plugin.logSync("sync", 0, 0);
+      const totalItems = this.plugin.mapping.all().length;
+      this.plugin.statusBar.setOk(Date.now(), totalItems);
+      this.plugin.logSync("sync", totalItems, 0);
     } catch (e) {
       this.state = 4 /* Error */;
       console.error("[joplin-sync]", e);
@@ -1649,6 +1653,7 @@ var SyncEngine = class {
       }
       new import_obsidian7.Notice("Force push: " + done + " notes uploaded");
       this.plugin.logSync("push", done, 0);
+      this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
@@ -1763,6 +1768,7 @@ var SyncEngine = class {
       await this.plugin.mapping.flush();
       new import_obsidian7.Notice("Force pull: " + done + " notes, " + failed + " failed, " + skipped + " skipped");
       this.plugin.logSync("pull", done, failed);
+      this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;
       this.plugin.statusBar.setIdle();
@@ -1801,16 +1807,17 @@ var StatusBar = class {
     this.setIdle();
   }
   setIdle() {
-    this.el.setText("Joplin: idle");
+    this.el.setText("");
     this.el.className = "joplin-sync-status";
   }
   setSyncing() {
     this.el.setText("Joplin: syncing\u2026");
     this.el.className = "joplin-sync-status syncing";
   }
-  setOk(time) {
+  setOk(time, count) {
     const t = new Date(time).toLocaleTimeString();
-    this.el.setText("Joplin: OK (" + t + ")");
+    const suffix = count !== void 0 ? " (" + count + " items)" : "";
+    this.el.setText("Joplin: OK " + t + suffix);
     this.el.className = "joplin-sync-status ok";
   }
   setError(msg) {
@@ -1818,8 +1825,9 @@ var StatusBar = class {
     this.el.className = "joplin-sync-status error";
     console.error("[joplin-sync]", msg);
   }
-  setProgress(done, total) {
-    this.el.setText("Joplin: " + done + "/" + total);
+  setProgress(done, total, phase) {
+    const prefix = phase ? phase + " " : "";
+    this.el.setText("Joplin: " + prefix + done + "/" + total);
   }
 };
 

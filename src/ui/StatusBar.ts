@@ -8,7 +8,7 @@ export class StatusBar {
   }
 
   setIdle(): void {
-    this.el.setText('Joplin: idle');
+    this.el.setText('');
     this.el.className = 'joplin-sync-status';
   }
 
@@ -17,9 +17,10 @@ export class StatusBar {
     this.el.className = 'joplin-sync-status syncing';
   }
 
-  setOk(time: number): void {
+  setOk(time: number, count?: number): void {
     const t = new Date(time).toLocaleTimeString();
-    this.el.setText('Joplin: OK (' + t + ')');
+    const suffix = count !== undefined ? ' (' + count + ' items)' : '';
+    this.el.setText('Joplin: OK ' + t + suffix);
     this.el.className = 'joplin-sync-status ok';
   }
 
@@ -29,7 +30,8 @@ export class StatusBar {
     console.error('[joplin-sync]', msg);
   }
 
-  setProgress(done: number, total: number): void {
-    this.el.setText('Joplin: ' + done + '/' + total);
+  setProgress(done: number, total: number, phase?: string): void {
+    const prefix = phase ? phase + ' ' : '';
+    this.el.setText('Joplin: ' + prefix + done + '/' + total);
   }
 }

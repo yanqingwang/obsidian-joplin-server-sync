@@ -142,18 +142,22 @@ export class SyncEngine {
 
       this.state = SyncState.Pushing;
       await this.pusher.pushAll();
+      this.plugin.statusBar.setProgress(0, 1, 'pulling');
 
       this.state = SyncState.Pulling;
       await this.deltaPuller.pullAll();
 
       this.state = SyncState.Resolving;
+      let resolvedCount = 0;
       for (const t of [...this.plugin.mapping.tombstones]) {
         await this.plugin.api.deleteItem(t.joplinId + '.md');
         this.plugin.mapping.clearTombstone(t.joplinId);
+        resolvedCount++;
       }
 
-      this.plugin.statusBar.setOk(Date.now());
-      this.plugin.logSync('sync', 0, 0);
+      const totalItems = this.plugin.mapping.all().length;
+      this.plugin.statusBar.setOk(Date.now(), totalItems);
+      this.plugin.logSync('sync', totalItems, 0);
     } catch (e: any) {
       this.state = SyncState.Error;
       console.error('[joplin-sync]', e);
@@ -199,6 +203,7 @@ export class SyncEngine {
       }
       new Notice('Force push: ' + done + ' notes uploaded');
       this.plugin.logSync('push', done, 0);
+      this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
@@ -306,6 +311,7 @@ export class SyncEngine {
       await this.plugin.mapping.flush();
       new Notice('Force pull: ' + done + ' notes, ' + failed + ' failed, ' + skipped + ' skipped');
       this.plugin.logSync('pull', done, failed);
+      this.plugin.statusBar.setOk(Date.now(), done);
     } finally {
       this.running = false;
       this.plugin.statusBar.setIdle();

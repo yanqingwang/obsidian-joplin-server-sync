@@ -6,6 +6,8 @@ interface ApiConfig { baseUrl: string; email: string; password: string; }
 export class JoplinServerApi {
   private sessionId: string | null = null;
   private getConfig: () => ApiConfig;
+  private callCount = 0;
+  private readonly REFRESH_INTERVAL = 200; // re-login every 200 API calls
 
   constructor(getConfig: () => ApiConfig) {
     this.getConfig = getConfig;
@@ -31,6 +33,12 @@ export class JoplinServerApi {
     retries?: number;
   } = {}): Promise<{ status: number; text: string; json: Record<string, unknown>; arrayBuffer: ArrayBuffer }> {
     if (!this.sessionId) await this.login();
+    // Periodic session refresh to avoid expiry during long operations
+    this.callCount++;
+    if (this.callCount >= this.REFRESH_INTERVAL) {
+      this.callCount = 0;
+      try { await this.login(); } catch { /* refresh best-effort */ }
+    }
     const maxRetries = opts.retries ?? 3;
 
     for (let attempt = 0; ; attempt++) {

@@ -169,8 +169,11 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
 // src/api/JoplinServerApi.ts
 var import_obsidian2 = require("obsidian");
 var JoplinServerApi = class {
+  // re-login every 200 API calls
   constructor(getConfig) {
     this.sessionId = null;
+    this.callCount = 0;
+    this.REFRESH_INTERVAL = 200;
     this.getConfig = getConfig;
   }
   async login() {
@@ -190,6 +193,14 @@ var JoplinServerApi = class {
   async exec(method, path, opts = {}) {
     if (!this.sessionId)
       await this.login();
+    this.callCount++;
+    if (this.callCount >= this.REFRESH_INTERVAL) {
+      this.callCount = 0;
+      try {
+        await this.login();
+      } catch {
+      }
+    }
     const maxRetries = opts.retries ?? 3;
     for (let attempt = 0; ; attempt++) {
       const headers = {

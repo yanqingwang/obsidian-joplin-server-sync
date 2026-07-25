@@ -105,13 +105,31 @@ export class JoplinServerApi {
   }
 
   async putItem(name: string, content: string | ArrayBuffer, force = false): Promise<{ id: string; updated_time: number }> {
-    const res = await this.exec('PUT', this.itemPath(name, '/content') + (force ? '?force=1' : ''), {
+    const res = await this.rawRequest('PUT', this.itemPath(name, '/content') + (force ? '?force=1' : ''), {
       body: content,
       contentType: 'application/octet-stream',
     });
     if (res.status !== 200) throw new ApiError(res.status, res.text);
-    if (!res.json) throw new ApiError(res.status, 'PUT response body is not JSON: ' + res.text.slice(0, 200));
-    return res.json as unknown as { id: string; updated_time: number };
+    // PUT /content returns Joplin serialized item, not JSON — parse key:value from last lines
+    const fields = this.parseJoplinFields(res.text);
+    if (!fields.id) throw new ApiError(res.status, 'PUT response missing id field: ' + res.text.slice(0, 200));
+    return { id: fields.id, updated_time: fields.updated_time };
+  }
+
+  private parseJoplinFields(text: string): { id: string; updated_time: number } {
+    const result = { id: '', updated_time: 0 };
+    const lines = text.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      const sep = line.indexOf(':');
+      if (sep > 0) {
+        const key = line.slice(0, sep).trim();
+        if (key === 'id') result.id = line.slice(sep + 1).trim();
+        if (key === 'updated_time') result.updated_time = new Date(line.slice(sep + 1).trim()).getTime();
+      }
+      if (result.id && result.updated_time) break;
+    }
+    return result;
   }
 
   async deleteItem(name: string): Promise<void> {

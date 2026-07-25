@@ -1580,6 +1580,20 @@ var SyncEngine = class {
     this.pusher = new LocalPusher(this.plugin, this.queue);
     this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
   }
+  ensureReady() {
+    if (!this.queue) {
+      this.queue = new ChangeQueue(this.plugin);
+      void this.queue.restore();
+    }
+    if (!this.watcher) {
+      this.watcher = new VaultWatcher(this.plugin, this.queue);
+      this.watcher.start();
+    }
+    if (!this.pusher)
+      this.pusher = new LocalPusher(this.plugin, this.queue);
+    if (!this.deltaPuller)
+      this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
+  }
   startScheduler() {
     const interval = this.plugin.settings.syncIntervalSec;
     if (interval > 0) {
@@ -1591,8 +1605,11 @@ var SyncEngine = class {
   }
   // ============ Phase 2: Sync Cycle ============
   async syncCycle() {
-    if (this.state !== 0 /* Idle */)
+    if (this.state !== 0 /* Idle */) {
+      new import_obsidian7.Notice("Sync already in progress");
       return;
+    }
+    this.ensureReady();
     try {
       this.state = 1 /* Pushing */;
       this.plugin.statusBar.setSyncing();
@@ -1609,19 +1626,21 @@ var SyncEngine = class {
       const pullResult = await this.deltaPuller.pullAll();
       this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), "pull");
       this.state = 3 /* Resolving */;
-      let resolvedCount = 0;
       for (const t of [...this.plugin.mapping.tombstones]) {
         await this.plugin.api.deleteItem(t.joplinId + ".md");
         this.plugin.mapping.clearTombstone(t.joplinId);
-        resolvedCount++;
       }
       const totalMapped = this.plugin.mapping.all().length;
       this.plugin.statusBar.setOk(Date.now(), totalMapped);
-      this.plugin.logSync("sync", totalMapped, pushResult.fail + pullResult.fail);
+      const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
+      this.plugin.logSync("sync", totalMapped, totalFail);
+      new import_obsidian7.Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
     } catch (e) {
       this.state = 4 /* Error */;
-      console.error("[joplin-sync]", e);
-      this.plugin.statusBar.setError(e.message);
+      const msg = e?.message || e?.toString() || "Unknown error";
+      console.error("[joplin-sync] sync cycle failed:", msg);
+      this.plugin.statusBar.setError(msg);
+      new import_obsidian7.Notice("Sync failed: " + msg, 8e3);
     } finally {
       await this.plugin.mapping.flush();
       this.state = 0 /* Idle */;

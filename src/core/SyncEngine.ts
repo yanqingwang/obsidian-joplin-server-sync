@@ -116,6 +116,19 @@ export class SyncEngine {
     this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
   }
 
+  private ensureReady(): void {
+    if (!this.queue) {
+      this.queue = new ChangeQueue(this.plugin);
+      void this.queue.restore();
+    }
+    if (!this.watcher) {
+      this.watcher = new VaultWatcher(this.plugin, this.queue);
+      this.watcher.start();
+    }
+    if (!this.pusher) this.pusher = new LocalPusher(this.plugin, this.queue);
+    if (!this.deltaPuller) this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
+  }
+
   startScheduler(): void {
     const interval = this.plugin.settings.syncIntervalSec;
     if (interval > 0) {
@@ -128,7 +141,8 @@ export class SyncEngine {
 
   // ============ Phase 2: Sync Cycle ============
   async syncCycle(): Promise<void> {
-    if (this.state !== SyncState.Idle) return;
+    if (this.state !== SyncState.Idle) { new Notice('Sync already in progress'); return; }
+    this.ensureReady();
     try {
       this.state = SyncState.Pushing;
       this.plugin.statusBar.setSyncing();
@@ -149,20 +163,22 @@ export class SyncEngine {
       this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), 'pull');
 
       this.state = SyncState.Resolving;
-      let resolvedCount = 0;
       for (const t of [...this.plugin.mapping.tombstones]) {
         await this.plugin.api.deleteItem(t.joplinId + '.md');
         this.plugin.mapping.clearTombstone(t.joplinId);
-        resolvedCount++;
       }
 
       const totalMapped = this.plugin.mapping.all().length;
       this.plugin.statusBar.setOk(Date.now(), totalMapped);
-      this.plugin.logSync('sync', totalMapped, pushResult.fail + pullResult.fail);
+      const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
+      this.plugin.logSync('sync', totalMapped, totalFail);
+      new Notice('Sync complete: ' + totalMapped + ' items mapped, ' + totalFail + ' failed');
     } catch (e: any) {
       this.state = SyncState.Error;
-      console.error('[joplin-sync]', e);
-      this.plugin.statusBar.setError(e.message);
+      const msg = e?.message || e?.toString() || 'Unknown error';
+      console.error('[joplin-sync] sync cycle failed:', msg);
+      this.plugin.statusBar.setError(msg);
+      new Notice('Sync failed: ' + msg, 8000);
     } finally {
       await this.plugin.mapping.flush();
       this.state = SyncState.Idle;

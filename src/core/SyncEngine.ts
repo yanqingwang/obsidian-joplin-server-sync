@@ -229,20 +229,56 @@ export class SyncEngine {
       const folderMap = new Map<string, string>();
       folderMap.set('', rootFolderId);
       const dirs = new Set<string>();
-      for (const f of files) {
-        const d = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
-        if (!d) continue;
-        // Add all intermediate parent directories (a/b/c → a, a/b, a/b/c)
+
+      // Helper to discover directory from a path
+      const discoverParentDirs = (path: string) => {
+        const d = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+        if (!d) return;
         const parts = d.split('/');
         let accumulated = '';
         for (let i = 0; i < parts.length; i++) {
           accumulated = accumulated ? accumulated + '/' + parts[i] : parts[i];
           if (!folderMap.has(accumulated)) {
             const existing = this.plugin.mapping.getByPath(accumulated + '/');
-            if (existing) { folderMap.set(accumulated, existing.joplinId); continue; }
+            if (existing) { 
+              folderMap.set(accumulated, existing.joplinId);
+              pushedFolderIds.add(existing.joplinId);
+              continue; 
+            }
             dirs.add(accumulated);
           }
         }
+      };
+
+      // Discover directories from ALL files (markdown + resources)
+      for (const f of files) discoverParentDirs(f.path);
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (f.extension === 'md') continue;
+        discoverParentDirs(f.path);
+      }
+
+      // Also discover empty directories from the filesystem adapter
+      const adapter = this.plugin.app.vault.adapter;
+      if (adapter && (adapter as any).list) {
+        const walkDirs = async (dir: string): Promise<void> => {
+          try {
+            const listing = await (adapter as any).list(dir);
+            for (const sub of listing.folders) {
+              const rel = dir ? dir + '/' + sub.split('/').pop() : sub.split('/').pop();
+              if (rel && !folderMap.has(rel)) {
+                const existing = this.plugin.mapping.getByPath(rel + '/');
+                if (existing) {
+                  folderMap.set(rel, existing.joplinId);
+                  pushedFolderIds.add(existing.joplinId);
+                } else {
+                  dirs.add(rel);
+                }
+              }
+              await walkDirs(sub);
+            }
+          } catch {}
+        };
+        await walkDirs('').catch(() => {});
       }
       let folderCount = 0;
       for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
@@ -331,7 +367,7 @@ export class SyncEngine {
           const id = noteMatch[1];
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === ModelType.Folder) {
-            if (!pushedFolderIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedFolders++; } catch { /* ignore */ } }
+            // Keep folders — never delete them during cleanup
           } else if (entry?.type === ModelType.Resource) {
             if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedResources++; } catch { /* ignore */ } }
           } else if (!this.plugin.settings.syncFoldersOnly) {
@@ -373,19 +409,64 @@ export class SyncEngine {
       this.plugin.statusBar.setSyncing('force pull: clearing local...');
       await this.plugin.api.login();
 
-      const allFiles = this.plugin.app.vault.getFiles();
-      let delCount = 0;
-      for (const f of allFiles) {
-        if (f.extension === 'md') {
-          this.plugin.app.fileManager.trashFile(f).catch(() => {});
+      // Delete ALL files and folders except .obsidian
+      const adapter = this.plugin.app.vault.adapter;
+      const kept = ['.obsidian'];
+      const isKept = (p: string) => kept.some(k => p === k || p.startsWith(k + '/'));
+      let delCount = 0, delDirCount = 0;
+
+      // Delete all non-kept files
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (!isKept(f.path)) {
+          await this.plugin.app.fileManager.trashFile(f).catch(() => {});
           delCount++;
         }
       }
-      this.plugin.mapping.setDeltaCursor('');
-      console.debug('[joplin-sync] force pull: deleted ' + delCount + ' local files');
 
-      // Sweep empty directories bottom-up after file deletion
-      const removedDirs = await this.removeEmptyDirs(allFiles.map((f: any) => f.path));
+      // Recursively delete all empty directories via adapter (bottom-up)
+      const listAll = async (dir: string): Promise<string[]> => {
+        const result: string[] = [];
+        try {
+          if (adapter.list) {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const children = await listAll(sub);
+              result.push(...children);
+            }
+            result.push(dir);
+          }
+        } catch {}
+        return result;
+      };
+      // List all dirs at vault root (excluding .obsidian)
+      const rootDirs: string[] = [];
+      try {
+        if (adapter.list) {
+          const root = await adapter.list('');
+          for (const d of root.folders) {
+            if (!isKept(d)) rootDirs.push(d);
+          }
+        }
+      } catch {}
+      // Get all subdirectories recursively, then delete bottom-up
+      const allDirs: string[] = [];
+      for (const d of rootDirs) {
+        const subs = await listAll(d);
+        allDirs.push(...subs);
+      }
+      // Delete from deepest to shallowest
+      allDirs.sort((a, b) => b.split('/').length - a.split('/').length);
+      for (const d of allDirs) {
+        try {
+          if (await adapter.exists(d)) {
+            await adapter.rmdir(d, false).catch(() => {});
+            delDirCount++;
+          }
+        } catch {}
+      }
+
+      this.plugin.mapping.setDeltaCursor('');
+      console.debug('[joplin-sync] force pull: deleted ' + delCount + ' files, ' + delDirCount + ' dirs');
 
       // Use listAllRemoteItems (listChildren) for full download
       // delta API only returns recent changes, not all items

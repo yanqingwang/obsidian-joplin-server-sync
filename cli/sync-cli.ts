@@ -35,7 +35,7 @@ function loadCreds(vaultPath: string) {
 
 function makePlugin(vaultRoot: string, creds: any) {
   const vault = new MockVault(vaultRoot);
-  vault.adapter = new DiskAdapter(); // share real plugin mapping on disk
+  vault.adapter = new DiskAdapter(vaultRoot); // share real plugin mapping on disk
   const api = new JoplinServerApi(() => ({
     baseUrl: creds.serverUrl, email: creds.email, password: creds.password,
   }));

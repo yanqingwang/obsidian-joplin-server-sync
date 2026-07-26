@@ -846,7 +846,16 @@ var MIME_MAP = {
   pdf: "application/pdf",
   mp3: "audio/mpeg",
   mp4: "video/mp4",
-  zip: "application/zip"
+  zip: "application/zip",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+  xls: "application/vnd.ms-excel",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  doc: "application/msword",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ppt: "application/vnd.ms-powerpoint",
+  canvas: "application/obsidian-canvas",
+  drawio: "application/x-drawio"
 };
 var ResourceManager = class {
   constructor(plugin) {
@@ -866,6 +875,10 @@ var ResourceManager = class {
     const maxSize = this.plugin.settings.maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
     if (data.byteLength > maxSize)
       throw new Error("Attachment too large: " + file.path);
+    const parentDir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+    if (parentDir && !this.plugin.mapping.getByPath(parentDir + "/")) {
+      await this.ensureRemoteFolder(parentDir);
+    }
     const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
     const st = file.stat || { ctime: now, mtime: now };
@@ -901,6 +914,47 @@ var ResourceManager = class {
     this.hashToId.set(hash, id);
     return id;
   }
+  /** Ensure a remote folder exists for the given vault-relative path */
+  async ensureRemoteFolder(dirPath) {
+    const parts = dirPath.split("/");
+    let accumulated = "";
+    for (let i = 0; i < parts.length; i++) {
+      accumulated = accumulated ? accumulated + "/" + parts[i] : parts[i];
+      const mapped = this.plugin.mapping.getByPath(accumulated + "/");
+      if (mapped)
+        continue;
+      const fid = createJoplinId();
+      const now = Date.now();
+      const item = {
+        id: fid,
+        parent_id: "",
+        title: parts[i],
+        created_time: now,
+        updated_time: now,
+        user_created_time: now,
+        user_updated_time: now,
+        type_: 2 /* Folder */,
+        encryption_applied: 0,
+        encryption_cipher_text: ""
+      };
+      const parentPath = i > 0 ? parts.slice(0, i).join("/") : "";
+      if (parentPath) {
+        const parent = this.plugin.mapping.getByPath(parentPath + "/");
+        if (parent)
+          item.parent_id = parent.joplinId;
+      }
+      const res = await this.plugin.api.putItem(fid + ".md", this.serializer.serialize(item), true);
+      this.plugin.mapping.upsert({
+        joplinId: fid,
+        path: accumulated + "/",
+        type: 2 /* Folder */,
+        localHash: "",
+        remoteUpdatedTime: res.updated_time || now,
+        syncedAt: now
+      });
+    }
+    return accumulated;
+  }
   async downloadResource(meta) {
     const existing = this.plugin.mapping.getById(meta.id);
     if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime)
@@ -913,7 +967,11 @@ var ResourceManager = class {
     let path = (0, import_obsidian4.normalizePath)(relName);
     const clash = this.plugin.mapping.getByPath(path);
     if (clash && clash.joplinId !== meta.id) {
-      path = (0, import_obsidian4.normalizePath)(dir + "/" + meta.id.slice(0, 7) + "_" + (meta.filename || meta.id + "." + (meta.file_extension || "bin")));
+      if (!this.plugin.app.vault.getAbstractFileByPath(path)) {
+        this.plugin.mapping.remove(clash.joplinId);
+      } else {
+        path = (0, import_obsidian4.normalizePath)(dir + "/" + meta.id.slice(0, 7) + "_" + (meta.filename || meta.id + "." + (meta.file_extension || "bin")));
+      }
     }
     const watcher = this.plugin.engine?.watcher;
     const write = async () => {
@@ -1845,10 +1903,10 @@ var SyncEngine = class {
       const folderMap = /* @__PURE__ */ new Map();
       folderMap.set("", rootFolderId);
       const dirs = /* @__PURE__ */ new Set();
-      for (const f of files) {
-        const d = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+      const discoverParentDirs = (path) => {
+        const d = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
         if (!d)
-          continue;
+          return;
         const parts = d.split("/");
         let accumulated = "";
         for (let i = 0; i < parts.length; i++) {
@@ -1857,11 +1915,43 @@ var SyncEngine = class {
             const existing = this.plugin.mapping.getByPath(accumulated + "/");
             if (existing) {
               folderMap.set(accumulated, existing.joplinId);
+              pushedFolderIds.add(existing.joplinId);
               continue;
             }
             dirs.add(accumulated);
           }
         }
+      };
+      for (const f of files)
+        discoverParentDirs(f.path);
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (f.extension === "md")
+          continue;
+        discoverParentDirs(f.path);
+      }
+      const adapter = this.plugin.app.vault.adapter;
+      if (adapter && adapter.list) {
+        const walkDirs = async (dir) => {
+          try {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const rel = dir ? dir + "/" + sub.split("/").pop() : sub.split("/").pop();
+              if (rel && !folderMap.has(rel)) {
+                const existing = this.plugin.mapping.getByPath(rel + "/");
+                if (existing) {
+                  folderMap.set(rel, existing.joplinId);
+                  pushedFolderIds.add(existing.joplinId);
+                } else {
+                  dirs.add(rel);
+                }
+              }
+              await walkDirs(sub);
+            }
+          } catch {
+          }
+        };
+        await walkDirs("").catch(() => {
+        });
       }
       let folderCount = 0;
       for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
@@ -1960,14 +2050,6 @@ var SyncEngine = class {
           const id = noteMatch[1];
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === 2 /* Folder */) {
-            if (!pushedFolderIds.has(id)) {
-              try {
-                await this.plugin.api.deleteItem(stat.name);
-                removed++;
-                removedFolders++;
-              } catch {
-              }
-            }
           } else if (entry?.type === 4 /* Resource */) {
             if (!pushedResourceIds.has(id)) {
               try {
@@ -2028,18 +2110,61 @@ var SyncEngine = class {
     try {
       this.plugin.statusBar.setSyncing("force pull: clearing local...");
       await this.plugin.api.login();
-      const allFiles = this.plugin.app.vault.getFiles();
-      let delCount = 0;
-      for (const f of allFiles) {
-        if (f.extension === "md") {
-          this.plugin.app.fileManager.trashFile(f).catch(() => {
+      const adapter = this.plugin.app.vault.adapter;
+      const kept = [".obsidian"];
+      const isKept = (p) => kept.some((k) => p === k || p.startsWith(k + "/"));
+      let delCount = 0, delDirCount = 0;
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (!isKept(f.path)) {
+          await this.plugin.app.fileManager.trashFile(f).catch(() => {
           });
           delCount++;
         }
       }
+      const listAll = async (dir) => {
+        const result = [];
+        try {
+          if (adapter.list) {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const children = await listAll(sub);
+              result.push(...children);
+            }
+            result.push(dir);
+          }
+        } catch {
+        }
+        return result;
+      };
+      const rootDirs = [];
+      try {
+        if (adapter.list) {
+          const root = await adapter.list("");
+          for (const d of root.folders) {
+            if (!isKept(d))
+              rootDirs.push(d);
+          }
+        }
+      } catch {
+      }
+      const allDirs = [];
+      for (const d of rootDirs) {
+        const subs = await listAll(d);
+        allDirs.push(...subs);
+      }
+      allDirs.sort((a, b) => b.split("/").length - a.split("/").length);
+      for (const d of allDirs) {
+        try {
+          if (await adapter.exists(d)) {
+            await adapter.rmdir(d, false).catch(() => {
+            });
+            delDirCount++;
+          }
+        } catch {
+        }
+      }
       this.plugin.mapping.setDeltaCursor("");
-      console.debug("[joplin-sync] force pull: deleted " + delCount + " local files");
-      const removedDirs = await this.removeEmptyDirs(allFiles.map((f) => f.path));
+      console.debug("[joplin-sync] force pull: deleted " + delCount + " files, " + delDirCount + " dirs");
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
       let done = 0;

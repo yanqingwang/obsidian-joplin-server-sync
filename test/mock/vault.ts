@@ -108,16 +108,38 @@ export class MockAdapter {
 // Disk-backed adapter: writes plugin data (mapping.json) next to the real
 // plugin so the CLI shares state with the Obsidian plugin (no ID churn).
 export class DiskAdapter {
-  async exists(p: string): Promise<boolean> { try { return fs.existsSync(p); } catch { return false; } }
-  async read(p: string): Promise<string> { return fs.readFileSync(p, 'utf8'); }
+  root: string;
+  constructor(root: string) { this.root = root; }
+  async exists(p: string): Promise<boolean> { try { return fs.existsSync(path.join(this.root, p)); } catch { return false; } }
+  async read(p: string): Promise<string> { return fs.readFileSync(path.join(this.root, p), 'utf8'); }
   async write(p: string, content: string): Promise<void> {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, content);
+    const full = path.join(this.root, p);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
   }
-  async mkdir(p: string): Promise<void> { fs.mkdirSync(p, { recursive: true }); }
+  async mkdir(p: string): Promise<void> { fs.mkdirSync(path.join(this.root, p), { recursive: true }); }
+  async list(p: string): Promise<{ files: string[]; folders: string[] }> {
+    const abs = path.join(this.root, p);
+    const files: string[] = [];
+    const folders: string[] = [];
+    try {
+      for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
+        const full = path.join(abs, e.name);
+        const rel = path.relative(this.root, full);
+        if (e.isDirectory()) folders.push(rel);
+        else files.push(rel);
+      }
+    } catch {}
+    return { files, folders };
+  }
   async rename(from: string, to: string): Promise<void> {
-    fs.mkdirSync(path.dirname(to), { recursive: true });
-    fs.renameSync(from, to);
+    const fromAbs = path.join(this.root, from);
+    const toAbs = path.join(this.root, to);
+    fs.mkdirSync(path.dirname(toAbs), { recursive: true });
+    fs.renameSync(fromAbs, toAbs);
   }
-  async remove(p: string): Promise<void> { fs.rmSync(p, { force: true }); }
+  async remove(p: string): Promise<void> { fs.rmSync(path.join(this.root, p), { force: true }); }
+  async rmdir(p: string, recursive: boolean): Promise<void> {
+    try { fs.rmSync(path.join(this.root, p), { recursive, force: true }); } catch {}
+  }
 }

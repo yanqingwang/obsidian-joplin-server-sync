@@ -13,6 +13,7 @@ export interface PluginSettings {
   password: string;
   syncIntervalSec: number;
   syncOnStartup: boolean;
+  syncFoldersOnly: boolean;
   conflictStrategy: ConflictStrategy;
   excludePatterns: string[];
   attachmentFolder: string;
@@ -29,6 +30,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   password: '',
   syncIntervalSec: 300,
   syncOnStartup: false,
+  syncFoldersOnly: false,
   conflictStrategy: 'duplicate',
   excludePatterns: ['.obsidian/', '_conflicts/', 'templates/', '.directory', '.noteforge/'],
   attachmentFolder: 'attachments',

@@ -17,8 +17,11 @@ export class InitialSync {
     // 1. Create folder hierarchy on server
     const folderMap = await this.createFolders(files);
 
-    // 2. Upload all notes with correct parent_ids
+    // 2. Upload all notes with correct parent_ids (skip if folders-only mode)
     let done = 0; let fail = 0;
+    if (this.plugin.settings.syncFoldersOnly) {
+      new Notice('Folders only mode: skipping note upload');
+    } else {
     for (const batch of chunk(files, 5)) {
       await Promise.all(batch.map(async (file) => {
         try {
@@ -32,6 +35,7 @@ export class InitialSync {
         }
       }));
       await this.plugin.mapping.flush();
+    }
     }
 
     // 3. Consume delta stream to set cursor

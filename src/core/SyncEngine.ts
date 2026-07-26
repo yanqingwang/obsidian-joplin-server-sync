@@ -250,19 +250,23 @@ export class SyncEngine {
       }
 
       let done = 0; let fail = 0;
-      for (const batch of chunk(files, 5)) {
-        await Promise.all(batch.map(async (file) => {
-          try {
-            const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
-            const parentId = folderMap.get(dir) || rootFolderId;
-            await this.uploadNote(file, parentId, true);
-            done++;
-          } catch (e: any) {
-            fail++;
-            console.error('[joplin-sync] upload fail [' + fail + ']:', file.path, e?.message || e);
-          }
-        }));
-        await this.plugin.mapping.flush();
+      if (this.plugin.settings.syncFoldersOnly) {
+        new Notice('Folders only mode: skipping note upload');
+      } else {
+        for (const batch of chunk(files, 5)) {
+          await Promise.all(batch.map(async (file) => {
+            try {
+              const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
+              const parentId = folderMap.get(dir) || rootFolderId;
+              await this.uploadNote(file, parentId, true);
+              done++;
+            } catch (e: any) {
+              fail++;
+              console.error('[joplin-sync] upload fail [' + fail + ']:', file.path, e?.message || e);
+            }
+          }));
+          await this.plugin.mapping.flush();
+        }
       }
       new Notice('Force push: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
       this.plugin.logSync('push', done, fail);

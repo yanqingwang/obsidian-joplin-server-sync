@@ -100,6 +100,16 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('Scope').setHeading();
 
     new Setting(containerEl)
+      .setName('Sync folders only')
+      .setDesc('When enabled, only sync folder structure (no note files). Useful for testing.')
+      .addToggle(t => t
+        .setValue(this.plugin.settings.syncFoldersOnly)
+        .onChange(async v => {
+          this.plugin.settings.syncFoldersOnly = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName('Exclude patterns')
       .setDesc('Comma-separated path prefixes to exclude')
       .addText(t => t

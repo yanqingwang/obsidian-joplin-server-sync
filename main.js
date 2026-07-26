@@ -37,6 +37,7 @@ var DEFAULT_SETTINGS = {
   password: "",
   syncIntervalSec: 300,
   syncOnStartup: false,
+  syncFoldersOnly: false,
   conflictStrategy: "duplicate",
   excludePatterns: [".obsidian/", "_conflicts/", "templates/", ".directory", ".noteforge/"],
   attachmentFolder: "attachments",
@@ -101,6 +102,10 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("Scope").setHeading();
+    new import_obsidian.Setting(containerEl).setName("Sync folders only").setDesc("When enabled, only sync folder structure (no note files). Useful for testing.").addToggle((t) => t.setValue(this.plugin.settings.syncFoldersOnly).onChange(async (v) => {
+      this.plugin.settings.syncFoldersOnly = v;
+      await this.plugin.saveSettings();
+    }));
     new import_obsidian.Setting(containerEl).setName("Exclude patterns").setDesc("Comma-separated path prefixes to exclude").addText((t) => t.setValue(this.plugin.settings.excludePatterns.join(", ")).onChange(async (v) => {
       this.plugin.settings.excludePatterns = v.split(",").map((s) => s.trim()).filter(Boolean);
       await this.plugin.saveSettings();
@@ -1226,12 +1231,14 @@ var DeltaPuller = class {
         console.error("[joplin-sync] folder apply failed", f.title, e);
       }
     }
-    for (const n of notes) {
-      try {
-        await this.applyNote(n);
-      } catch (e) {
-        fail++;
-        console.error("[joplin-sync] note apply failed", n.title, e);
+    if (!this.plugin.settings.syncFoldersOnly) {
+      for (const n of notes) {
+        try {
+          await this.applyNote(n);
+        } catch (e) {
+          fail++;
+          console.error("[joplin-sync] note apply failed", n.title, e);
+        }
       }
     }
     for (const r of resources) {
@@ -1475,19 +1482,23 @@ var InitialSync = class {
     const folderMap = await this.createFolders(files);
     let done = 0;
     let fail = 0;
-    for (const batch of chunk(files, 5)) {
-      await Promise.all(batch.map(async (file) => {
-        try {
-          const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
-          const parentId = folderMap.get(dir) || "";
-          await this.uploadNote(file, parentId);
-          done++;
-        } catch (e) {
-          fail++;
-          console.error("[joplin-sync] initial upload fail [" + fail + "]:", file.path, e?.message || e);
-        }
-      }));
-      await this.plugin.mapping.flush();
+    if (this.plugin.settings.syncFoldersOnly) {
+      new import_obsidian8.Notice("Folders only mode: skipping note upload");
+    } else {
+      for (const batch of chunk(files, 5)) {
+        await Promise.all(batch.map(async (file) => {
+          try {
+            const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+            const parentId = folderMap.get(dir) || "";
+            await this.uploadNote(file, parentId);
+            done++;
+          } catch (e) {
+            fail++;
+            console.error("[joplin-sync] initial upload fail [" + fail + "]:", file.path, e?.message || e);
+          }
+        }));
+        await this.plugin.mapping.flush();
+      }
     }
     let cursor;
     while (true) {
@@ -1839,19 +1850,23 @@ var SyncEngine = class {
       }
       let done = 0;
       let fail = 0;
-      for (const batch of chunk(files, 5)) {
-        await Promise.all(batch.map(async (file) => {
-          try {
-            const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
-            const parentId = folderMap.get(dir) || rootFolderId;
-            await this.uploadNote(file, parentId, true);
-            done++;
-          } catch (e) {
-            fail++;
-            console.error("[joplin-sync] upload fail [" + fail + "]:", file.path, e?.message || e);
-          }
-        }));
-        await this.plugin.mapping.flush();
+      if (this.plugin.settings.syncFoldersOnly) {
+        new import_obsidian9.Notice("Folders only mode: skipping note upload");
+      } else {
+        for (const batch of chunk(files, 5)) {
+          await Promise.all(batch.map(async (file) => {
+            try {
+              const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+              const parentId = folderMap.get(dir) || rootFolderId;
+              await this.uploadNote(file, parentId, true);
+              done++;
+            } catch (e) {
+              fail++;
+              console.error("[joplin-sync] upload fail [" + fail + "]:", file.path, e?.message || e);
+            }
+          }));
+          await this.plugin.mapping.flush();
+        }
       }
       new import_obsidian9.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
       this.plugin.logSync("push", done, fail);

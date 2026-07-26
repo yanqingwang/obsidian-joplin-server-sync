@@ -71,7 +71,10 @@ export class DeltaPuller {
     this.buildFolderPaths(folders);
 
     for (const f of folders) { try { await this.applyFolder(f); } catch (e) { fail++; console.error('[joplin-sync] folder apply failed', f.title, e); } }
-    for (const n of notes) { try { await this.applyNote(n); } catch (e) { fail++; console.error('[joplin-sync] note apply failed', n.title, e); } }
+
+    if (!this.plugin.settings.syncFoldersOnly) {
+      for (const n of notes) { try { await this.applyNote(n); } catch (e) { fail++; console.error('[joplin-sync] note apply failed', n.title, e); } }
+    }
     for (const r of resources) { try { await this.applyResource(r); } catch (e) { fail++; console.error('[joplin-sync] resource apply failed', r.id, e); } }
 
     this.plugin.mapping.setDeltaCursor(cursor ?? '');

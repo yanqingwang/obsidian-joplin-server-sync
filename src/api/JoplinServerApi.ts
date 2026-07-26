@@ -130,6 +130,15 @@ export class JoplinServerApi {
     return res.json as unknown as Paginated<RemoteItemStat>;
   }
 
+  async listChildrenOf(parentId: string, cursor?: string): Promise<Paginated<RemoteItemStat>> {
+    const base = parentId ? '/api/items/root:/' + parentId + ':/children' : '/api/items/root:/:/children';
+    const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
+    const res = await this.exec('GET', base + q);
+    if (res.status !== 200) throw new ApiError(res.status, res.text);
+    if (!res.json) throw new ApiError(res.status, 'listChildrenOf body is not JSON: ' + res.text.slice(0, 200));
+    return res.json as unknown as Paginated<RemoteItemStat>;
+  }
+
   async delta(cursor?: string): Promise<Paginated<DeltaItem>> {
     const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
     const res = await this.exec('GET', '/api/items/root:/:/delta' + q);
@@ -141,6 +150,7 @@ export class JoplinServerApi {
       if (item.item_name) item.name = item.item_name;
       if (item.jop_updated_time) item.updated_time = item.jop_updated_time;
       if (item.type !== undefined) item.type = Number(item.type);
+      if (item.item_type !== undefined) (item as any).item_type = Number(item.item_type);
     }
     return { items, has_more: !!raw.has_more, cursor: raw.cursor as string | undefined } as unknown as Paginated<DeltaItem>;
   }

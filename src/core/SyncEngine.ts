@@ -9,6 +9,8 @@ import { VaultWatcher } from '../vault/VaultWatcher';
 import { LocalPusher } from './LocalPusher';
 import { DeltaPuller } from './DeltaPuller';
 import { InitialSync } from './InitialSync';
+import { safeFileName } from './pathUtil';
+import { ResourceManager } from '../resource/ResourceManager';
 
 export enum SyncState { Idle, Pushing, Pulling, Resolving, Error }
 
@@ -23,9 +25,11 @@ export class SyncEngine {
   private deltaPuller!: DeltaPuller;
   private timer: number | null = null;
   e2eeActive = false;
+  resources!: ResourceManager;
 
   constructor(private plugin: JoplinSyncPlugin) {
     this.syncInfo = new SyncInfoHandler(plugin.api);
+    this.resources = new ResourceManager(plugin);
   }
 
   // ============ Phase 1: Legacy full upload ============
@@ -214,6 +218,13 @@ export class SyncEngine {
       const rootFolderId = '';
       const files = this.collectMarkdownFiles();
 
+      // IDs we actually push this run. Anything left on the server that is
+      // NOT in here is a stale/duplicate/orphan item and must be removed so
+      // that "force push" is a true overwrite (otherwise the server keeps
+      // accumulating duplicates every run and the pull target diverges).
+      const pushedNoteIds = new Set<string>();
+      const pushedFolderIds = new Set<string>();
+
       // Create sub-folders on server (if not already existing)
       const folderMap = new Map<string, string>();
       folderMap.set('', rootFolderId);
@@ -252,6 +263,7 @@ export class SyncEngine {
               localHash: '', remoteUpdatedTime: (st as any).updated_time || Date.now(), syncedAt: Date.now(),
             });
             folderMap.set(dp, fid);
+            pushedFolderIds.add(fid);
             folderCount++;
           }
         } catch (e) { /* folder may already exist */ }
@@ -272,6 +284,8 @@ export class SyncEngine {
               const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
               const parentId = folderMap.get(dir) || rootFolderId;
               await this.uploadNote(file, parentId, true);
+              const m = this.plugin.mapping.getByPath(file.path);
+              if (m) pushedNoteIds.add(m.joplinId);
               done++;
             } catch (e: any) {
               fail++;
@@ -282,9 +296,57 @@ export class SyncEngine {
         }
       }
       if (!this.plugin.settings.syncFoldersOnly) {
-        new Notice('Force push: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
+        console.log('[joplin-sync] force push notes: done=' + done + ' fail=' + fail + ' pushedNoteIds=' + pushedNoteIds.size);
         this.plugin.logSync('push', done, fail);
       }
+
+      // ---- Attachments/files: mirror EVERY local non-md file (except config) ----
+      // Force push must be a true full mirror, so unreferenced loose files
+      // (e.g. an exported `resources/` bucket) must also be synced; otherwise
+      // the pull target would silently diverge. .obsidian/ is always excluded.
+      const pushedResourceIds = new Set<string>();
+      if (!this.plugin.settings.syncFoldersOnly) {
+        const excludes = this.plugin.settings.excludePatterns;
+        const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/.obsidian/') || p.startsWith('.obsidian/');
+        const allFiles = this.plugin.app.vault.getFiles();
+        let rDone = 0, rFail = 0;
+        for (const f of allFiles) {
+          if (f.extension === 'md') continue;
+          if (isExcluded(f.path)) continue;
+          try { const rid = await this.resources.uploadResource(f); pushedResourceIds.add(rid); rDone++; }
+          catch (e: any) { rFail++; console.error('[joplin-sync] resource upload fail:', f.path, e?.message || e); }
+        }
+        if (rDone || rFail) console.log('[joplin-sync] force push files: ' + rDone + ' uploaded, ' + rFail + ' failed');
+      }
+
+      // ---- True-overwrite cleanup: delete server items not present locally ----
+      // Notes are only removed when we actually pushed notes this run
+      // (in folders-only mode we must not wipe the server's notes).
+      let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
+      const remote = await this.listAllRemoteItems();
+      console.log('[joplin-sync] force push cleanup: scanning ' + remote.length + ' remote items');
+      for (const stat of remote) {
+        const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
+        if (noteMatch) {
+          const id = noteMatch[1];
+          const entry = this.plugin.mapping.getById(id);
+          if (entry?.type === ModelType.Folder) {
+            if (!pushedFolderIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedFolders++; } catch { /* ignore */ } }
+          } else if (entry?.type === ModelType.Resource) {
+            if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedResources++; } catch { /* ignore */ } }
+          } else if (!this.plugin.settings.syncFoldersOnly) {
+            if (!pushedNoteIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedNotes++; } catch { /* ignore */ } }
+          }
+        } else {
+          // resource blob: cleanup orphans so the server stays in sync
+          const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
+          if (resMatch && !this.plugin.settings.syncFoldersOnly) {
+            const id = resMatch[1];
+            if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; } catch { /* ignore */ } }
+          }
+        }
+      }
+      if (removed) console.log('[joplin-sync] force push cleaned ' + removed + ' items (notes=' + removedNotes + ' folders=' + removedFolders + ' resources=' + removedResources + ')');
 
       // Reset delta cursor so next sync cycle pulls from this point
       let cursor: string | undefined;
@@ -363,7 +425,7 @@ export class SyncEngine {
         if (!f.title) { skipped++; continue; }
         try {
           const parentPath = this.resolveForcePullFolderPath(f.parent_id);
-          const dirName = f.title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+          const dirName = safeFileName(f.title);
           const dirPath = parentPath + dirName;
           if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
             await this.plugin.app.vault.createFolder(dirPath).catch(() => {});
@@ -383,7 +445,7 @@ export class SyncEngine {
         if (!item.title) { skipped++; continue; }
         try {
           const dir = this.resolveForcePullFolderPath(item.parent_id);
-          const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+          const sanitized = safeFileName(item.title);
           const path = dir + sanitized + '.md';
 
           let body = item.body ?? '';
@@ -428,7 +490,31 @@ export class SyncEngine {
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? '');
       await this.plugin.mapping.flush();
-      new Notice('Force pull: ' + done + ' notes, ' + failed + ' failed');
+
+      // ---- Attachments (Joplin Resources) → local files ----
+      const resources = allItems.filter(i => i.type_ === ModelType.Resource);
+      const downloadedPaths = new Set<string>();
+      let rDone = 0, rFail = 0;
+      for (const r of resources) {
+        try { const p = await this.resources.downloadResource(r); if (p) downloadedPaths.add(p); rDone++; }
+        catch (e: any) { rFail++; if (rFail <= 3) console.error('[joplin-sync] force-pull resource:', r.id, e?.message || e); }
+      }
+      if (rDone || rFail) console.log('[joplin-sync] force pull attachments: ' + rDone + ' downloaded, ' + rFail + ' failed');
+
+      // True-overwrite cleanup: remove local non-md files that are NOT on the
+      // server (so force pull is a full mirror, not an additive merge).
+      const excludes = this.plugin.settings.excludePatterns;
+      const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/.obsidian/') || p.startsWith('.obsidian/');
+      let localRemoved = 0;
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (f.extension === 'md') continue;
+        if (isExcluded(f.path)) continue;
+        if (downloadedPaths.has(f.path)) continue;
+        try { await this.plugin.app.fileManager.trashFile(f); localRemoved++; } catch { /* ignore */ }
+      }
+      if (localRemoved) console.log('[joplin-sync] force pull removed ' + localRemoved + ' stale local files');
+
+      new Notice('Force pull: ' + done + ' notes, ' + failed + ' failed' + (rDone ? ', ' + rDone + ' attachments' : ''));
       this.plugin.logSync('pull', done, failed);
       this.plugin.statusBar.setOk(Date.now(), done);
     } catch (e: any) {
@@ -447,7 +533,7 @@ export class SyncEngine {
 
   private buildForcePullFolderPaths(folders: JoplinItem[]): void {
     this.forcePullFolderPaths.clear();
-    const sanitize = (t: string) => t.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+    const sanitize = (t: string) => safeFileName(t);
     const paths = new Map<string, string>();
     let remaining = [...folders];
     while (remaining.length > 0) {
@@ -476,14 +562,32 @@ export class SyncEngine {
     return m ? m.path : '';
   }
 
+  // Enumerate EVERY live item on the server (notes, folders, resource metadata,
+  // and resource blobs). Our addressing is FLAT: every Joplin item lives at
+  // `root:/<id>.md` (or `root:/.resource/<id>` for resource blobs), with the
+  // logical hierarchy encoded in each item's `parent_id` field — NOT in the
+  // file-system path. Because of that, the server's path-based listing exposes
+  // ALL items as direct children of root, regardless of their real folder
+  // nesting. So we simply paginate `listChildrenOf(root)` to obtain the full
+  // live set.
+  //
+  // Why not the `delta` endpoint? The real Joplin Server's delta feed (a) does
+  // NOT return `item_type`, and (b) is a change-log that accumulates delete
+  // events forever. Reconstructing "what is currently live" from it is fragile
+  // and, in practice, caused forcePush's cleanup to delete every note and
+  // forcePull to silently skip the whole vault.
   private async listAllRemoteItems(): Promise<import('../api/models').RemoteItemStat[]> {
     const out: import('../api/models').RemoteItemStat[] = [];
     let cursor: string | undefined;
     while (true) {
-      const page = await this.plugin.api.listChildren(cursor);
-      out.push(...page.items);
-      cursor = page.cursor;
-      if (!page.has_more) break;
+      const page = await this.plugin.api.listChildrenOf('', cursor);
+      for (const it of page.items) {
+        const name = (it as any).name || '';
+        if (!name) continue;
+        out.push({ name, updated_time: Number((it as any).updated_time) || 0 });
+      }
+      cursor = (page as any).cursor;
+      if (!(page as any).has_more) break;
     }
     return out;
   }

@@ -30,16 +30,19 @@ export class ResourceManager {
 
     const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
+    const st = (file.stat as any) || { ctime: now, mtime: now };
     await this.plugin.api.putItem('.resource/' + id, data);
     const meta: JoplinItem = {
       id, parent_id: '', title: file.name,
       mime: MIME_MAP[file.extension.toLowerCase()] ?? 'application/octet-stream',
-      filename: file.name,
+      // Store the FULL relative path in `filename` so the pull side can
+      // recreate the original folder structure (not flatten into one dir).
+      filename: file.path,
       file_extension: file.extension,
       size: data.byteLength,
       blob_updated_time: now,
-      created_time: file.stat.ctime, updated_time: now,
-      user_created_time: file.stat.ctime, user_updated_time: file.stat.mtime,
+      created_time: st.ctime ?? now, updated_time: now,
+      user_created_time: st.ctime ?? now, user_updated_time: st.mtime ?? now,
       type_: ModelType.Resource, encryption_applied: 0, encryption_cipher_text: '',
     };
     const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(meta));
@@ -58,24 +61,26 @@ export class ResourceManager {
     if (!blob) throw new Error('Resource blob missing: ' + meta.id);
 
     const dir = this.plugin.settings.attachmentFolder || 'attachments';
-    if (!this.plugin.app.vault.getAbstractFileByPath(dir)) {
-      await this.plugin.app.vault.createFolder(dir).catch(() => {});
-    }
-    let filename = meta.filename || meta.id + '.' + (meta.file_extension || 'bin');
-    let path = normalizePath(dir + '/' + filename);
+    // Recreate the original relative path when available (filename carries the
+    // full vault-relative path), otherwise fall back to attachmentFolder.
+    const relName = (meta.filename && meta.filename.includes('/')) ? meta.filename : (dir + '/' + (meta.filename || (meta.id + '.' + (meta.file_extension || 'bin'))));
+    let path = normalizePath(relName);
     const clash = this.plugin.mapping.getByPath(path);
     if (clash && clash.joplinId !== meta.id) {
-      path = normalizePath(dir + '/' + meta.id.slice(0, 7) + '_' + filename);
+      path = normalizePath(dir + '/' + meta.id.slice(0, 7) + '_' + (meta.filename || (meta.id + '.' + (meta.file_extension || 'bin'))));
     }
 
-    const watcher = (this.plugin.engine as any).watcher as any;
+    const watcher = (this.plugin.engine as any)?.watcher as any;
+    const write = async () => {
+      const f = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, blob);
+      else await this.plugin.app.vault.createBinary(path, blob);
+    };
     if (watcher?.suppress) {
       watcher.suppress(path);
-      try {
-        const f = this.plugin.app.vault.getAbstractFileByPath(path);
-        if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, blob);
-        else await this.plugin.app.vault.createBinary(path, blob);
-      } finally { watcher.release(path); }
+      try { await write(); } finally { watcher.release(path); }
+    } else {
+      await write();
     }
     this.plugin.mapping.upsert({
       joplinId: meta.id, path, type: ModelType.Resource,

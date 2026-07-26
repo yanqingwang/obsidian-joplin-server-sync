@@ -6,6 +6,7 @@ import { ConflictResolver } from './ConflictResolver';
 import { DeltaChangeType, DeltaItem, ModelType, JoplinItem } from '../api/models';
 import { sha256 } from './SyncEngine';
 import { ResourceManager } from '../resource/ResourceManager';
+import { safeFileName } from './pathUtil';
 
 export class DeltaPuller {
   private serializer = new JoplinSerializer();
@@ -244,7 +245,7 @@ export class DeltaPuller {
   private buildFolderPaths(folders: JoplinItem[]): void {
     this.folderPathCache.clear();
     // Build path for root-level folders first, then recursively for children
-    const sanitize = (t: string) => t.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+    const sanitize = (t: string) => safeFileName(t);
     const known = new Map<string, string>(); // id → sanitized title
     for (const f of folders) known.set(f.id, sanitize(f.title || ''));
 
@@ -266,7 +267,7 @@ export class DeltaPuller {
   }
 
   private sanitize(title: string): string {
-    return title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+    return safeFileName(title);
   }
 
   private uniquePath(dir: string, name: string, id: string): string {

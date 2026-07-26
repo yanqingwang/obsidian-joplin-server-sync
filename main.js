@@ -2039,6 +2039,7 @@ var SyncEngine = class {
       }
       this.plugin.mapping.setDeltaCursor("");
       console.debug("[joplin-sync] force pull: deleted " + delCount + " local files");
+      const removedDirs = await this.removeEmptyDirs(allFiles.map((f) => f.path));
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
       let done = 0;
@@ -2221,6 +2222,31 @@ var SyncEngine = class {
       await this.plugin.mapping.flush();
       this.plugin.statusBar.setIdle();
     }
+  }
+  async removeEmptyDirs(deletedPaths) {
+    const dirs = /* @__PURE__ */ new Set();
+    for (const p of deletedPaths) {
+      const parts = p.split("/");
+      for (let i = parts.length - 1; i > 0; i--) {
+        dirs.add(parts.slice(0, i).join("/"));
+      }
+    }
+    const sorted = [...dirs].sort((a, b) => b.split("/").length - a.split("/").length);
+    let count = 0;
+    const adapter = this.plugin.app.vault.adapter;
+    for (const d of sorted) {
+      try {
+        if (await adapter.exists(d)) {
+          await adapter.rmdir(d, false).catch(() => {
+          });
+          count++;
+        }
+      } catch {
+      }
+    }
+    if (count)
+      console.debug("[joplin-sync] force pull: removed " + count + " empty dirs");
+    return count;
   }
   buildForcePullFolderPaths(folders) {
     this.forcePullFolderPaths.clear();

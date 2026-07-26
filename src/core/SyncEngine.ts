@@ -384,6 +384,9 @@ export class SyncEngine {
       this.plugin.mapping.setDeltaCursor('');
       console.debug('[joplin-sync] force pull: deleted ' + delCount + ' local files');
 
+      // Sweep empty directories bottom-up after file deletion
+      const removedDirs = await this.removeEmptyDirs(allFiles.map((f: any) => f.path));
+
       // Use listAllRemoteItems (listChildren) for full download
       // delta API only returns recent changes, not all items
       const remoteStats = await this.listAllRemoteItems();
@@ -530,6 +533,29 @@ export class SyncEngine {
   }
 
   private forcePullFolderPaths = new Map<string, string>();
+
+  private async removeEmptyDirs(deletedPaths: string[]): Promise<number> {
+    const dirs = new Set<string>();
+    for (const p of deletedPaths) {
+      const parts = p.split('/');
+      for (let i = parts.length - 1; i > 0; i--) {
+        dirs.add(parts.slice(0, i).join('/'));
+      }
+    }
+    const sorted = [...dirs].sort((a, b) => b.split('/').length - a.split('/').length);
+    let count = 0;
+    const adapter = this.plugin.app.vault.adapter;
+    for (const d of sorted) {
+      try {
+        if (await adapter.exists(d)) {
+          await adapter.rmdir(d, false).catch(() => {}); // only succeeds if empty
+          count++;
+        }
+      } catch {}
+    }
+    if (count) console.debug('[joplin-sync] force pull: removed ' + count + ' empty dirs');
+    return count;
+  }
 
   private buildForcePullFolderPaths(folders: JoplinItem[]): void {
     this.forcePullFolderPaths.clear();

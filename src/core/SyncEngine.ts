@@ -27,6 +27,10 @@ export class SyncEngine {
   e2eeActive = false;
   resources!: ResourceManager;
 
+  private get configDir(): string {
+    return (this.plugin.app.vault as any).configDir || '.obsidian';
+  }
+
   constructor(private plugin: JoplinSyncPlugin) {
     this.syncInfo = new SyncInfoHandler(plugin.api);
     this.resources = new ResourceManager(plugin);
@@ -343,7 +347,7 @@ export class SyncEngine {
       const pushedResourceIds = new Set<string>();
       if (!this.plugin.settings.syncFoldersOnly) {
         const excludes = this.plugin.settings.excludePatterns;
-        const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/.obsidian/') || p.startsWith('.obsidian/');
+        const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/' + this.configDir + '/') || p.startsWith(this.configDir + '/');
         const allFiles = this.plugin.app.vault.getFiles();
         let rDone = 0, rFail = 0;
         for (const f of allFiles) {
@@ -409,9 +413,9 @@ export class SyncEngine {
       this.plugin.statusBar.setSyncing('force pull: clearing local...');
       await this.plugin.api.login();
 
-      // Delete ALL files and folders except .obsidian
+      // Delete ALL files and folders except config directory
       const adapter = this.plugin.app.vault.adapter;
-      const kept = ['.obsidian'];
+      const kept = [this.configDir];
       const isKept = (p: string) => kept.some(k => p === k || p.startsWith(k + '/'));
       let delCount = 0, delDirCount = 0;
 
@@ -563,7 +567,7 @@ export class SyncEngine {
           if (msg.includes('401')) try { await this.plugin.api.login(); } catch { void 0; }
           if (failed <= 3) console.error('[joplin-sync] force-pull:', item.title, msg);
         }
-        this.plugin.statusBar.setProgress(done + failed + skipped, remoteStats.length, 'pull');
+        this.plugin.statusBar.setProgress(done, notes.length, 'pull');
       }
 
       let cursor: string | undefined;
@@ -585,10 +589,14 @@ export class SyncEngine {
       }
       if (rDone || rFail) console.log('[joplin-sync] force pull attachments: ' + rDone + ' downloaded, ' + rFail + ' failed');
 
-      // True-overwrite cleanup: remove local non-md files that are NOT on the
-      // server (so force pull is a full mirror, not an additive merge).
+      const totalSynced = done + rDone;
+      new Notice('Force pull: ' + totalSynced + ' items' + (failed ? ', ' + failed + ' failed' : ''));
+      this.plugin.logSync('pull', totalSynced, failed + rFail);
+      this.plugin.statusBar.setOk(Date.now(), totalSynced);
+
+      // Remove stale local non-md files (cleanup from previous syncs)
       const excludes = this.plugin.settings.excludePatterns;
-      const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/.obsidian/') || p.startsWith('.obsidian/');
+      const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/' + this.configDir + '/') || p.startsWith(this.configDir + '/');
       let localRemoved = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
         if (f.extension === 'md') continue;
@@ -598,9 +606,6 @@ export class SyncEngine {
       }
       if (localRemoved) console.log('[joplin-sync] force pull removed ' + localRemoved + ' stale local files');
 
-      new Notice('Force pull: ' + done + ' notes, ' + failed + ' failed' + (rDone ? ', ' + rDone + ' attachments' : ''));
-      this.plugin.logSync('pull', done, failed);
-      this.plugin.statusBar.setOk(Date.now(), done);
     } catch (e: any) {
       const msg = e?.message || e?.toString() || 'Unknown error';
       console.error('[joplin-sync] force pull failed:', msg);

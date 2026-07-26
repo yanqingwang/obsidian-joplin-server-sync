@@ -854,6 +854,8 @@ var MIME_MAP = {
   doc: "application/msword",
   pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   ppt: "application/vnd.ms-powerpoint",
+  html: "text/html",
+  htm: "text/html",
   canvas: "application/obsidian-canvas",
   drawio: "application/x-drawio"
 };
@@ -957,8 +959,10 @@ var ResourceManager = class {
   }
   async downloadResource(meta) {
     const existing = this.plugin.mapping.getById(meta.id);
-    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime)
-      return existing.path;
+    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
+      if (this.plugin.app.vault.getAbstractFileByPath(existing.path))
+        return existing.path;
+    }
     const blob = await this.plugin.api.getItemBinary(".resource/" + meta.id);
     if (!blob)
       throw new Error("Resource blob missing: " + meta.id);
@@ -1703,6 +1707,9 @@ var SyncEngine = class {
     this.syncInfo = new SyncInfoHandler(plugin.api);
     this.resources = new ResourceManager(plugin);
   }
+  get configDir() {
+    return this.plugin.app.vault.configDir || ".obsidian";
+  }
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
     if (this.running) {
@@ -2021,7 +2028,7 @@ var SyncEngine = class {
       const pushedResourceIds = /* @__PURE__ */ new Set();
       if (!this.plugin.settings.syncFoldersOnly) {
         const excludes = this.plugin.settings.excludePatterns;
-        const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/.obsidian/") || p.startsWith(".obsidian/");
+        const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
         const allFiles = this.plugin.app.vault.getFiles();
         let rDone = 0, rFail = 0;
         for (const f of allFiles) {
@@ -2111,7 +2118,7 @@ var SyncEngine = class {
       this.plugin.statusBar.setSyncing("force pull: clearing local...");
       await this.plugin.api.login();
       const adapter = this.plugin.app.vault.adapter;
-      const kept = [".obsidian"];
+      const kept = [this.configDir];
       const isKept = (p) => kept.some((k) => p === k || p.startsWith(k + "/"));
       let delCount = 0, delDirCount = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
@@ -2288,7 +2295,7 @@ var SyncEngine = class {
           if (failed <= 3)
             console.error("[joplin-sync] force-pull:", item.title, msg);
         }
-        this.plugin.statusBar.setProgress(done + failed + skipped, remoteStats.length, "pull");
+        this.plugin.statusBar.setProgress(done, notes.length, "pull");
       }
       let cursor;
       while (true) {
@@ -2316,8 +2323,12 @@ var SyncEngine = class {
       }
       if (rDone || rFail)
         console.log("[joplin-sync] force pull attachments: " + rDone + " downloaded, " + rFail + " failed");
+      const totalSynced = done + rDone;
+      new import_obsidian9.Notice("Force pull: " + totalSynced + " items" + (failed ? ", " + failed + " failed" : ""));
+      this.plugin.logSync("pull", totalSynced, failed + rFail);
+      this.plugin.statusBar.setOk(Date.now(), totalSynced);
       const excludes = this.plugin.settings.excludePatterns;
-      const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/.obsidian/") || p.startsWith(".obsidian/");
+      const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
       let localRemoved = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
         if (f.extension === "md")
@@ -2334,9 +2345,6 @@ var SyncEngine = class {
       }
       if (localRemoved)
         console.log("[joplin-sync] force pull removed " + localRemoved + " stale local files");
-      new import_obsidian9.Notice("Force pull: " + done + " notes, " + failed + " failed" + (rDone ? ", " + rDone + " attachments" : ""));
-      this.plugin.logSync("pull", done, failed);
-      this.plugin.statusBar.setOk(Date.now(), done);
     } catch (e) {
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] force pull failed:", msg);

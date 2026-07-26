@@ -16,6 +16,7 @@ const MIME_MAP: Record<string, string> = {
   doc: 'application/msword',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   ppt: 'application/vnd.ms-powerpoint',
+  html: 'text/html', htm: 'text/html',
   canvas: 'application/obsidian-canvas',
   drawio: 'application/x-drawio',
 };
@@ -102,7 +103,10 @@ export class ResourceManager {
 
   async downloadResource(meta: JoplinItem): Promise<string> {
     const existing = this.plugin.mapping.getById(meta.id);
-    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) return existing.path;
+    // Skip only if mapped AND file exists on disk
+    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
+      if (this.plugin.app.vault.getAbstractFileByPath(existing.path)) return existing.path;
+    }
     const blob = await this.plugin.api.getItemBinary('.resource/' + meta.id);
     if (!blob) throw new Error('Resource blob missing: ' + meta.id);
 

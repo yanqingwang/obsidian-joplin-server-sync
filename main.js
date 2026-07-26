@@ -1817,6 +1817,7 @@ var SyncEngine = class {
           dirs.add(d);
         }
       }
+      let folderCount = 0;
       for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
         const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) || rootFolderId : rootFolderId;
         const fid = createJoplinId();
@@ -1845,6 +1846,7 @@ var SyncEngine = class {
               syncedAt: Date.now()
             });
             folderMap.set(dp, fid);
+            folderCount++;
           }
         } catch (e) {
         }
@@ -1852,7 +1854,7 @@ var SyncEngine = class {
       let done = 0;
       let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
-        new import_obsidian9.Notice("Folders only mode: skipping note upload");
+        new import_obsidian9.Notice("Force push: " + folderCount + " folders created (folders-only mode)");
       } else {
         for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {

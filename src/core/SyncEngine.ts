@@ -227,6 +227,7 @@ export class SyncEngine {
           dirs.add(d);
         }
       }
+      let folderCount = 0;
       for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
         const parent = dp.includes('/') ? (folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) || rootFolderId) : rootFolderId;
         const fid = createJoplinId();
@@ -245,13 +246,14 @@ export class SyncEngine {
               localHash: '', remoteUpdatedTime: (st as any).updated_time || Date.now(), syncedAt: Date.now(),
             });
             folderMap.set(dp, fid);
+            folderCount++;
           }
         } catch (e) { /* folder may already exist */ }
       }
 
       let done = 0; let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
-        new Notice('Folders only mode: skipping note upload');
+        new Notice('Force push: ' + folderCount + ' folders created (folders-only mode)');
       } else {
         for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {

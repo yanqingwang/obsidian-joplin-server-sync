@@ -313,6 +313,9 @@ export class SyncEngine {
       const e2ee = this.plugin.e2ee;
 
       let done = 0; let failed = 0; let skipped = 0;
+
+      // Collect all items: first pass to identify folders and notes
+      const allItems: JoplinItem[] = [];
       for (const stat of remoteStats) {
         if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
         if (stat.name.startsWith('.resource/')) continue;
@@ -321,7 +324,52 @@ export class SyncEngine {
           if (!raw) continue;
           const item = this.serializer.unserialize(raw);
           if (item.type_ === 9) { e2ee.feedMasterKey(item); continue; }
-          if (item.type_ !== ModelType.Note || !item.title) { skipped++; continue; }
+
+          if (e2ee.isEncrypted(item)) {
+            try {
+              const ds = await e2ee.decryptItem(item);
+              if (ds) { const d = this.serializer.unserialize(ds); allItems.push(d); }
+            } catch { failed++; continue; }
+          } else {
+            allItems.push(item);
+          }
+        } catch (e: any) {
+          failed++;
+          if (failed <= 3) console.error('[joplin-sync] force-pull:', stat.name, e);
+        }
+      }
+
+      // Pre-compute folder paths from all items
+      const folders = allItems.filter(i => i.type_ === ModelType.Folder);
+      this.buildForcePullFolderPaths(folders);
+
+      // Create folders first
+      for (const f of folders) {
+        if (!f.title) { skipped++; continue; }
+        try {
+          const parentPath = this.resolveForcePullFolderPath(f.parent_id);
+          const dirName = f.title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+          const dirPath = parentPath + dirName;
+          if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+            await this.plugin.app.vault.createFolder(dirPath).catch(() => {});
+          }
+          this.plugin.mapping.upsert({
+            joplinId: f.id, path: dirPath + '/', type: ModelType.Folder,
+            localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
+          });
+        } catch (e) {
+          console.warn('[joplin-sync] force-pull folder:', f.title, (e as any)?.message || e);
+        }
+      }
+
+      // Then download notes to correct folders
+      const notes = allItems.filter(i => i.type_ === ModelType.Note);
+      for (const item of notes) {
+        if (!item.title) { skipped++; continue; }
+        try {
+          const dir = this.resolveForcePullFolderPath(item.parent_id);
+          const sanitized = item.title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+          const path = dir + sanitized + '.md';
 
           let body = item.body ?? '';
           if (e2ee.isEncrypted(item)) {
@@ -331,9 +379,11 @@ export class SyncEngine {
             } catch { failed++; continue; }
           }
 
-          const title = item.title || 'Untitled';
-          const sanitized = title.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
-          let path = sanitized + '.md';
+          // Ensure parent dir exists (safety net)
+          if (dir && !this.plugin.app.vault.getAbstractFileByPath(dir.replace(/\/$/, ''))) {
+            try { await this.plugin.app.vault.createFolder(dir.replace(/\/$/, '')); } catch {}
+          }
+
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
           if (existing) {
             await this.plugin.app.vault.modify(existing as TFile, body || '');
@@ -350,7 +400,7 @@ export class SyncEngine {
           failed++;
           const msg = e?.message || '';
           if (msg.includes('401')) try { await this.plugin.api.login(); } catch { void 0; }
-          if (failed <= 3) console.error('[joplin-sync] force-pull:', stat.name, msg);
+          if (failed <= 3) console.error('[joplin-sync] force-pull:', item.title, msg);
         }
         this.plugin.statusBar.setProgress(done + failed + skipped, remoteStats.length, 'pull');
       }
@@ -376,6 +426,39 @@ export class SyncEngine {
       await this.plugin.mapping.flush();
       this.plugin.statusBar.setIdle();
     }
+  }
+
+  private forcePullFolderPaths = new Map<string, string>();
+
+  private buildForcePullFolderPaths(folders: JoplinItem[]): void {
+    this.forcePullFolderPaths.clear();
+    const sanitize = (t: string) => t.replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || 'Untitled';
+    const paths = new Map<string, string>();
+    let remaining = [...folders];
+    while (remaining.length > 0) {
+      const next: JoplinItem[] = [];
+      for (const f of remaining) {
+        const parentPath = f.parent_id ? (paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id)) : '';
+        if (f.parent_id && parentPath === undefined) { 
+          // Check mapping fallback
+          const m = this.plugin.mapping.getById(f.parent_id);
+          if (m) { paths.set(f.id, m.path); continue; }
+          next.push(f); continue;
+        }
+        paths.set(f.id, (parentPath || '') + sanitize(f.title || '') + '/');
+      }
+      if (next.length === remaining.length) break;
+      remaining = next;
+    }
+    for (const [id, p] of paths) this.forcePullFolderPaths.set(id, p);
+  }
+
+  private resolveForcePullFolderPath(parentId: string): string {
+    if (!parentId) return '';
+    const cached = this.forcePullFolderPaths.get(parentId);
+    if (cached !== undefined) return cached;
+    const m = this.plugin.mapping.getById(parentId);
+    return m ? m.path : '';
   }
 
   private async listAllRemoteItems(): Promise<import('../api/models').RemoteItemStat[]> {

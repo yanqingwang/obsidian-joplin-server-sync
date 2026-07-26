@@ -539,14 +539,19 @@ export class SyncEngine {
     while (remaining.length > 0) {
       const next: JoplinItem[] = [];
       for (const f of remaining) {
-        const parentPath = f.parent_id ? (paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id)) : '';
-        if (f.parent_id && parentPath === undefined) { 
-          // Check mapping fallback
-          const m = this.plugin.mapping.getById(f.parent_id);
-          if (m) { paths.set(f.id, m.path); continue; }
-          next.push(f); continue;
+        let parentPath: string | undefined;
+        if (f.parent_id) {
+          parentPath = paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id);
+          if (parentPath === undefined) {
+            // Parent not yet resolved — check mapping or defer
+            const m = this.plugin.mapping.getById(f.parent_id);
+            if (m) { paths.set(f.id, m.path); continue; }
+            next.push(f); continue;
+          }
+        } else {
+          parentPath = '';
         }
-        paths.set(f.id, (parentPath || '') + sanitize(f.title || '') + '/');
+        paths.set(f.id, parentPath + sanitize(f.title || '') + '/');
       }
       if (next.length === remaining.length) break;
       remaining = next;

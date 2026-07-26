@@ -2215,17 +2215,22 @@ var SyncEngine = class {
     while (remaining.length > 0) {
       const next = [];
       for (const f of remaining) {
-        const parentPath = f.parent_id ? paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id) : "";
-        if (f.parent_id && parentPath === void 0) {
-          const m = this.plugin.mapping.getById(f.parent_id);
-          if (m) {
-            paths.set(f.id, m.path);
+        let parentPath;
+        if (f.parent_id) {
+          parentPath = paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id);
+          if (parentPath === void 0) {
+            const m = this.plugin.mapping.getById(f.parent_id);
+            if (m) {
+              paths.set(f.id, m.path);
+              continue;
+            }
+            next.push(f);
             continue;
           }
-          next.push(f);
-          continue;
+        } else {
+          parentPath = "";
         }
-        paths.set(f.id, (parentPath || "") + sanitize(f.title || "") + "/");
+        paths.set(f.id, parentPath + sanitize(f.title || "") + "/");
       }
       if (next.length === remaining.length)
         break;

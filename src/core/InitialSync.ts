@@ -58,10 +58,16 @@ export class InitialSync {
     const dirs = new Set<string>();
     for (const f of files) {
       const d = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
-      if (d && !folderMap.has(d)) {
-        const existing = this.plugin.mapping.getByPath(d + '/');
-        if (existing) { folderMap.set(d, existing.joplinId); continue; }
-        dirs.add(d);
+      if (!d) continue;
+      const parts = d.split('/');
+      let accumulated = '';
+      for (let i = 0; i < parts.length; i++) {
+        accumulated = accumulated ? accumulated + '/' + parts[i] : parts[i];
+        if (!folderMap.has(accumulated)) {
+          const existing = this.plugin.mapping.getByPath(accumulated + '/');
+          if (existing) { folderMap.set(accumulated, existing.joplinId); continue; }
+          dirs.add(accumulated);
+        }
       }
     }
 

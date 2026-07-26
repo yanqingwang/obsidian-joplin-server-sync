@@ -1517,13 +1517,20 @@ var InitialSync = class {
     const dirs = /* @__PURE__ */ new Set();
     for (const f of files) {
       const d = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
-      if (d && !folderMap.has(d)) {
-        const existing = this.plugin.mapping.getByPath(d + "/");
-        if (existing) {
-          folderMap.set(d, existing.joplinId);
-          continue;
+      if (!d)
+        continue;
+      const parts = d.split("/");
+      let accumulated = "";
+      for (let i = 0; i < parts.length; i++) {
+        accumulated = accumulated ? accumulated + "/" + parts[i] : parts[i];
+        if (!folderMap.has(accumulated)) {
+          const existing = this.plugin.mapping.getByPath(accumulated + "/");
+          if (existing) {
+            folderMap.set(accumulated, existing.joplinId);
+            continue;
+          }
+          dirs.add(accumulated);
         }
-        dirs.add(d);
       }
     }
     for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
@@ -1808,13 +1815,20 @@ var SyncEngine = class {
       const dirs = /* @__PURE__ */ new Set();
       for (const f of files) {
         const d = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
-        if (d && !folderMap.has(d)) {
-          const existing = this.plugin.mapping.getByPath(d + "/");
-          if (existing) {
-            folderMap.set(d, existing.joplinId);
-            continue;
+        if (!d)
+          continue;
+        const parts = d.split("/");
+        let accumulated = "";
+        for (let i = 0; i < parts.length; i++) {
+          accumulated = accumulated ? accumulated + "/" + parts[i] : parts[i];
+          if (!folderMap.has(accumulated)) {
+            const existing = this.plugin.mapping.getByPath(accumulated + "/");
+            if (existing) {
+              folderMap.set(accumulated, existing.joplinId);
+              continue;
+            }
+            dirs.add(accumulated);
           }
-          dirs.add(d);
         }
       }
       let folderCount = 0;

@@ -72,6 +72,11 @@ export class ResourceManager {
 
     const watcher = (this.plugin.engine as any)?.watcher as any;
     const write = async () => {
+      // Ensure parent directory exists
+      const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+      if (parentDir && !this.plugin.app.vault.getAbstractFileByPath(parentDir)) {
+        try { await this.plugin.app.vault.createFolder(parentDir); } catch {}
+      }
       const f = this.plugin.app.vault.getAbstractFileByPath(path);
       if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, blob);
       else await this.plugin.app.vault.createBinary(path, blob);

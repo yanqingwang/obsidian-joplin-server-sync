@@ -917,6 +917,13 @@ var ResourceManager = class {
     }
     const watcher = this.plugin.engine?.watcher;
     const write = async () => {
+      const parentDir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      if (parentDir && !this.plugin.app.vault.getAbstractFileByPath(parentDir)) {
+        try {
+          await this.plugin.app.vault.createFolder(parentDir);
+        } catch {
+        }
+      }
       const f = this.plugin.app.vault.getAbstractFileByPath(path);
       if (f instanceof import_obsidian4.TFile)
         await this.plugin.app.vault.modifyBinary(f, blob);

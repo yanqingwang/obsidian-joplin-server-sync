@@ -251,9 +251,12 @@ export class SyncEngine {
         } catch (e) { /* folder may already exist */ }
       }
 
+      // Count total folders in map (excluding root)
+      const totalFolders = folderMap.size - 1;
+
       let done = 0; let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
-        new Notice('Force push: ' + folderCount + ' folders created (folders-only mode)');
+        new Notice('Force push: ' + totalFolders + ' folders synced (folders-only mode)');
       } else {
         for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {

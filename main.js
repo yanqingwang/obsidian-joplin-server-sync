@@ -1851,10 +1851,11 @@ var SyncEngine = class {
         } catch (e) {
         }
       }
+      const totalFolders = folderMap.size - 1;
       let done = 0;
       let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
-        new import_obsidian9.Notice("Force push: " + folderCount + " folders created (folders-only mode)");
+        new import_obsidian9.Notice("Force push: " + totalFolders + " folders synced (folders-only mode)");
       } else {
         for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {

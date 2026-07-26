@@ -1856,6 +1856,8 @@ var SyncEngine = class {
       let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
         new import_obsidian9.Notice("Force push: " + totalFolders + " folders synced (folders-only mode)");
+        this.plugin.logSync("folders", totalFolders, 0);
+        done = totalFolders;
       } else {
         for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {
@@ -1872,8 +1874,10 @@ var SyncEngine = class {
           await this.plugin.mapping.flush();
         }
       }
-      new import_obsidian9.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
-      this.plugin.logSync("push", done, fail);
+      if (!this.plugin.settings.syncFoldersOnly) {
+        new import_obsidian9.Notice("Force push: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
+        this.plugin.logSync("push", done, fail);
+      }
       let cursor;
       while (true) {
         const page = await this.plugin.api.delta(cursor);

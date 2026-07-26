@@ -257,6 +257,8 @@ export class SyncEngine {
       let done = 0; let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
         new Notice('Force push: ' + totalFolders + ' folders synced (folders-only mode)');
+        this.plugin.logSync('folders', totalFolders, 0);
+        done = totalFolders;
       } else {
         for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {
@@ -273,8 +275,10 @@ export class SyncEngine {
           await this.plugin.mapping.flush();
         }
       }
-      new Notice('Force push: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
-      this.plugin.logSync('push', done, fail);
+      if (!this.plugin.settings.syncFoldersOnly) {
+        new Notice('Force push: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
+        this.plugin.logSync('push', done, fail);
+      }
 
       // Reset delta cursor so next sync cycle pulls from this point
       let cursor: string | undefined;

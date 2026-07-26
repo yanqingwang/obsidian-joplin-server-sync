@@ -28,7 +28,8 @@ export class SyncEngine {
   resources!: ResourceManager;
 
   private get configDir(): string {
-    return (this.plugin.app.vault as any).configDir || '.obsidian';
+    const vault = this.plugin.app.vault as unknown as { configDir?: string };
+    return vault.configDir || '.obsidian';
   }
 
   constructor(private plugin: JoplinSyncPlugin) {
@@ -280,11 +281,11 @@ export class SyncEngine {
               }
               await walkDirs(sub);
             }
-          } catch {}
+          } catch {/* empty */}
         };
         await walkDirs('').catch(() => {});
       }
-      let folderCount = 0;
+      let folderCount = 0; void folderCount;
       for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
         const parent = dp.includes('/') ? (folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) || rootFolderId) : rootFolderId;
         const fid = createJoplinId();
@@ -306,7 +307,7 @@ export class SyncEngine {
             pushedFolderIds.add(fid);
             folderCount++;
           }
-        } catch (e) { /* folder may already exist */ }
+        } catch { /* folder may already exist */ }
       }
 
       // Count total folders in map (excluding root)
@@ -336,7 +337,7 @@ export class SyncEngine {
         }
       }
       if (!this.plugin.settings.syncFoldersOnly) {
-        console.log('[joplin-sync] force push notes: done=' + done + ' fail=' + fail + ' pushedNoteIds=' + pushedNoteIds.size);
+        console.debug('[joplin-sync] force push notes: done=' + done + ' fail=' + fail + ' pushedNoteIds=' + pushedNoteIds.size);
         this.plugin.logSync('push', done, fail);
       }
 
@@ -356,7 +357,7 @@ export class SyncEngine {
           try { const rid = await this.resources.uploadResource(f); pushedResourceIds.add(rid); rDone++; }
           catch (e: any) { rFail++; console.error('[joplin-sync] resource upload fail:', f.path, e?.message || e); }
         }
-        if (rDone || rFail) console.log('[joplin-sync] force push files: ' + rDone + ' uploaded, ' + rFail + ' failed');
+        if (rDone || rFail) console.debug('[joplin-sync] force push files: ' + rDone + ' uploaded, ' + rFail + ' failed');
       }
 
       // ---- True-overwrite cleanup: delete server items not present locally ----
@@ -364,7 +365,7 @@ export class SyncEngine {
       // (in folders-only mode we must not wipe the server's notes).
       let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
       const remote = await this.listAllRemoteItems();
-      console.log('[joplin-sync] force push cleanup: scanning ' + remote.length + ' remote items');
+      console.debug('[joplin-sync] force push cleanup: scanning ' + remote.length + ' remote items');
       for (const stat of remote) {
         const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
         if (noteMatch) {
@@ -386,7 +387,7 @@ export class SyncEngine {
           }
         }
       }
-      if (removed) console.log('[joplin-sync] force push cleaned ' + removed + ' items (notes=' + removedNotes + ' folders=' + removedFolders + ' resources=' + removedResources + ')');
+      if (removed) console.debug('[joplin-sync] force push cleaned ' + removed + ' items (notes=' + removedNotes + ' folders=' + removedFolders + ' resources=' + removedResources + ')');
 
       // Reset delta cursor so next sync cycle pulls from this point
       let cursor: string | undefined;
@@ -439,7 +440,7 @@ export class SyncEngine {
             }
             result.push(dir);
           }
-        } catch {}
+        } catch {/* empty */}
         return result;
       };
       // List all dirs at vault root (excluding .obsidian)
@@ -451,7 +452,7 @@ export class SyncEngine {
             if (!isKept(d)) rootDirs.push(d);
           }
         }
-      } catch {}
+      } catch {/* empty */}
       // Get all subdirectories recursively, then delete bottom-up
       const allDirs: string[] = [];
       for (const d of rootDirs) {
@@ -466,7 +467,7 @@ export class SyncEngine {
             await adapter.rmdir(d, false).catch(() => {});
             delDirCount++;
           }
-        } catch {}
+        } catch {/* empty */}
       }
 
       this.plugin.mapping.setDeltaCursor('');
@@ -477,7 +478,7 @@ export class SyncEngine {
       const remoteStats = await this.listAllRemoteItems();
       const e2ee = this.plugin.e2ee;
 
-      let done = 0; let failed = 0; let skipped = 0;
+      let done = 0; let failed = 0; let skipped = 0; void skipped;
 
       // Collect all items: first pass to identify folders and notes
       const allItems: JoplinItem[] = [];
@@ -546,7 +547,7 @@ export class SyncEngine {
 
           // Ensure parent dir exists (safety net)
           if (dir && !this.plugin.app.vault.getAbstractFileByPath(dir.replace(/\/$/, ''))) {
-            try { await this.plugin.app.vault.createFolder(dir.replace(/\/$/, '')); } catch {}
+            try { await this.plugin.app.vault.createFolder(dir.replace(/\/$/, '')); } catch {/* empty */}
           }
 
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
@@ -587,7 +588,7 @@ export class SyncEngine {
         try { const p = await this.resources.downloadResource(r); if (p) downloadedPaths.add(p); rDone++; }
         catch (e: any) { rFail++; if (rFail <= 3) console.error('[joplin-sync] force-pull resource:', r.id, e?.message || e); }
       }
-      if (rDone || rFail) console.log('[joplin-sync] force pull attachments: ' + rDone + ' downloaded, ' + rFail + ' failed');
+      if (rDone || rFail) console.debug('[joplin-sync] force pull attachments: ' + rDone + ' downloaded, ' + rFail + ' failed');
 
       const totalSynced = done + rDone;
       new Notice('Force pull: ' + totalSynced + ' items' + (failed ? ', ' + failed + ' failed' : ''));
@@ -604,7 +605,7 @@ export class SyncEngine {
         if (downloadedPaths.has(f.path)) continue;
         try { await this.plugin.app.fileManager.trashFile(f); localRemoved++; } catch { /* ignore */ }
       }
-      if (localRemoved) console.log('[joplin-sync] force pull removed ' + localRemoved + ' stale local files');
+      if (localRemoved) console.debug('[joplin-sync] force pull removed ' + localRemoved + ' stale local files');
 
     } catch (e: any) {
       const msg = e?.message || e?.toString() || 'Unknown error';
@@ -637,7 +638,7 @@ export class SyncEngine {
           await adapter.rmdir(d, false).catch(() => {}); // only succeeds if empty
           count++;
         }
-      } catch {}
+      } catch {/* empty */}
     }
     if (count) console.debug('[joplin-sync] force pull: removed ' + count + ' empty dirs');
     return count;

@@ -1,7 +1,7 @@
 import { TFile, Notice } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
-import { RemoteItemStat, ModelType, JoplinItem } from '../api/models';
+import { ModelType, JoplinItem } from '../api/models';
 import { createJoplinId } from '../mapping/IdGenerator';
 import { sha256, chunk } from './SyncEngine';
 

@@ -1708,7 +1708,8 @@ var SyncEngine = class {
     this.resources = new ResourceManager(plugin);
   }
   get configDir() {
-    return this.plugin.app.vault.configDir || ".obsidian";
+    const vault = this.plugin.app.vault;
+    return vault.configDir || ".obsidian";
   }
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
@@ -1992,7 +1993,7 @@ var SyncEngine = class {
             pushedFolderIds.add(fid);
             folderCount++;
           }
-        } catch (e) {
+        } catch {
         }
       }
       const totalFolders = folderMap.size - 1;
@@ -2022,7 +2023,7 @@ var SyncEngine = class {
         }
       }
       if (!this.plugin.settings.syncFoldersOnly) {
-        console.log("[joplin-sync] force push notes: done=" + done + " fail=" + fail + " pushedNoteIds=" + pushedNoteIds.size);
+        console.debug("[joplin-sync] force push notes: done=" + done + " fail=" + fail + " pushedNoteIds=" + pushedNoteIds.size);
         this.plugin.logSync("push", done, fail);
       }
       const pushedResourceIds = /* @__PURE__ */ new Set();
@@ -2046,11 +2047,11 @@ var SyncEngine = class {
           }
         }
         if (rDone || rFail)
-          console.log("[joplin-sync] force push files: " + rDone + " uploaded, " + rFail + " failed");
+          console.debug("[joplin-sync] force push files: " + rDone + " uploaded, " + rFail + " failed");
       }
       let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
       const remote = await this.listAllRemoteItems();
-      console.log("[joplin-sync] force push cleanup: scanning " + remote.length + " remote items");
+      console.debug("[joplin-sync] force push cleanup: scanning " + remote.length + " remote items");
       for (const stat of remote) {
         const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
         if (noteMatch) {
@@ -2091,7 +2092,7 @@ var SyncEngine = class {
         }
       }
       if (removed)
-        console.log("[joplin-sync] force push cleaned " + removed + " items (notes=" + removedNotes + " folders=" + removedFolders + " resources=" + removedResources + ")");
+        console.debug("[joplin-sync] force push cleaned " + removed + " items (notes=" + removedNotes + " folders=" + removedFolders + " resources=" + removedResources + ")");
       let cursor;
       while (true) {
         const page = await this.plugin.api.delta(cursor);
@@ -2322,7 +2323,7 @@ var SyncEngine = class {
         }
       }
       if (rDone || rFail)
-        console.log("[joplin-sync] force pull attachments: " + rDone + " downloaded, " + rFail + " failed");
+        console.debug("[joplin-sync] force pull attachments: " + rDone + " downloaded, " + rFail + " failed");
       const totalSynced = done + rDone;
       new import_obsidian9.Notice("Force pull: " + totalSynced + " items" + (failed ? ", " + failed + " failed" : ""));
       this.plugin.logSync("pull", totalSynced, failed + rFail);
@@ -2344,7 +2345,7 @@ var SyncEngine = class {
         }
       }
       if (localRemoved)
-        console.log("[joplin-sync] force pull removed " + localRemoved + " stale local files");
+        console.debug("[joplin-sync] force pull removed " + localRemoved + " stale local files");
     } catch (e) {
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] force pull failed:", msg);

@@ -1,5 +1,5 @@
 import type JoplinSyncPlugin from '../main';
-import { TFile, Notice } from 'obsidian';
+import { TFile } from 'obsidian';
 import { VaultWatcher } from '../vault/VaultWatcher';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { ConflictResolver } from './ConflictResolver';
@@ -162,7 +162,7 @@ export class DeltaPuller {
       // Ensure parent directory exists first
       if (parentPath && !this.plugin.app.vault.getAbstractFileByPath(parentPath.replace(/\/$/, ''))) {
         this.watcher.suppress(parentPath.replace(/\/$/, ''));
-        try { await this.plugin.app.vault.createFolder(parentPath.replace(/\/$/, '')); } catch {}
+        try { await this.plugin.app.vault.createFolder(parentPath.replace(/\/$/, '')); } catch {/* empty */}
         this.watcher.release(parentPath.replace(/\/$/, ''));
       }
       this.watcher.suppress(dirPath);
@@ -205,7 +205,7 @@ export class DeltaPuller {
       // Ensure parent directory exists
       const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
       if (parentDir && !this.plugin.app.vault.getAbstractFileByPath(parentDir)) {
-        try { await this.plugin.app.vault.createFolder(parentDir); } catch {}
+        try { await this.plugin.app.vault.createFolder(parentDir); } catch {/* empty */}
       }
       const existing = this.plugin.app.vault.getAbstractFileByPath(path);
       if (existing instanceof TFile) await this.plugin.app.vault.modify(existing, content);

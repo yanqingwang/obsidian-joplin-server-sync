@@ -8,7 +8,7 @@ export enum EncryptionMethod {
 }
 
 const GCM_TAG_BITS = 128;
-const GCM_TAG_BYTES = 16;
+const GCM_TAG_BYTES = 16; void GCM_TAG_BYTES;
 const NONCE_BYTES = 12;
 const PBKDF2_ITERATIONS = 100000;
 const KEY_BITS = 256;

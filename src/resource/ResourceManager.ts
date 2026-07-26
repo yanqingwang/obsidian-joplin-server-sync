@@ -130,7 +130,7 @@ export class ResourceManager {
       // Ensure parent directory exists
       const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
       if (parentDir && !this.plugin.app.vault.getAbstractFileByPath(parentDir)) {
-        try { await this.plugin.app.vault.createFolder(parentDir); } catch {}
+        try { await this.plugin.app.vault.createFolder(parentDir); } catch {/* empty */}
       }
       const f = this.plugin.app.vault.getAbstractFileByPath(path);
       if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, blob);

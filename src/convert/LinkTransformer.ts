@@ -43,7 +43,7 @@ export class LinkTransformer {
   joplinToObsidian(body: string, notePath: string): string {
     return this.transformOutsideCodeSync(body, (segment) =>
       segment.replace(/(!?)\[([^\]]*)\]\(:\/([0-9a-f]{32})\)/g,
-        (_m, bang, label, id) => {
+        (_m: string, bang: string, label: string, id: string) => {
           const target = this.plugin.mapping.getById(id);
           if (!target) {
             if (!this.pendingLinks.has(id)) this.pendingLinks.set(id, new Set());
@@ -52,7 +52,7 @@ export class LinkTransformer {
           }
           const name = target.path.split('/').pop()!;
           const base = name.replace(/\.md$/, '');
-          if (bang || Number(target.type) === ModelType.Resource) return '![[' + name + ']]';
+          if (bang || target.type === ModelType.Resource) return '![[' + name + ']]';
           return label && label !== base ? '[[' + base + '|' + label + ']]' : '[[' + base + ']]';
         }));
   }

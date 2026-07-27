@@ -25,7 +25,7 @@ export class DeltaPuller {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId) return true; // no root folder → accept everything (cursor filters stale data)
-    const hasFolders = this.plugin.mapping.all().some(e => Number((e as unknown as { type: number }).type) === ModelType.Folder);
+    const hasFolders = this.plugin.mapping.all().some(e => ((e as unknown as { type: number }).type as number) === (ModelType.Folder as number));
     if (!hasFolders) return true;
 
     let pid = item.parent_id;
@@ -140,7 +140,7 @@ export class DeltaPuller {
     const localChanged = localContent !== null && (await sha256(localContent)) !== mapping.localHash;
 
     if (localChanged) {
-      await this.conflicts.resolve(mapping, item, localContent!, targetPath);
+      await this.conflicts.resolve(mapping, item, localContent, targetPath);
       return;
     }
 

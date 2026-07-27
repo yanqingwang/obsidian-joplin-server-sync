@@ -29,7 +29,7 @@ export class SyncEngine {
 
   private get configDir(): string {
     const vault = this.plugin.app.vault as unknown as { configDir?: string };
-    return vault.configDir || '.obsidian';
+    return vault.configDir ?? '.obsidian';
   }
 
   constructor(private plugin: JoplinSyncPlugin) {
@@ -507,7 +507,7 @@ export class SyncEngine {
           const raw = await this.plugin.api.getItem(stat.name);
           if (!raw) continue;
           const item = this.serializer.unserialize(raw);
-          if (item.type_ === 9) { e2ee.feedMasterKey(item); continue; }
+          if (item.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(item); continue; }
 
           if (e2ee.isEncrypted(item)) {
             try {

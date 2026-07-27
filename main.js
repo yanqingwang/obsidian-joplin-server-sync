@@ -359,7 +359,7 @@ var JoplinServerApi = class {
     return res.json;
   }
   trimSlash(u) {
-    return u.replace(/[\/`]+$/, "");
+    return u.replace(/[/`]+$/, "");
   }
   sleep(ms) {
     return new Promise((r) => window.setTimeout(r, ms));
@@ -1251,7 +1251,7 @@ var ConflictResolver = class {
 
 // src/core/pathUtil.ts
 function safeFileName(name) {
-  const cleaned = (name || "").replace(/[/\\]/g, "_").replace(/[\x00-\x1f\x7f]/gu, "").trim();
+  const cleaned = (name || "").replace(/[/\\]/g, "_").replace(/\p{Cc}/gu, "").trim();
   return cleaned || "Untitled";
 }
 
@@ -1274,7 +1274,7 @@ var DeltaPuller = class {
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId)
       return true;
-    const hasFolders = this.plugin.mapping.all().some((e) => Number(e.type) === 2 /* Folder */);
+    const hasFolders = this.plugin.mapping.all().some((e) => e.type === 2 /* Folder */);
     if (!hasFolders)
       return true;
     let pid = item.parent_id;
@@ -1712,7 +1712,7 @@ var SyncEngine = class {
   }
   get configDir() {
     const vault = this.plugin.app.vault;
-    return vault.configDir || ".obsidian";
+    return vault.configDir ?? ".obsidian";
   }
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
@@ -2214,7 +2214,7 @@ var SyncEngine = class {
           if (!raw)
             continue;
           const item = this.serializer.unserialize(raw);
-          if (item.type_ === 9) {
+          if (item.type_ === 9 /* MasterKey */) {
             e2ee.feedMasterKey(item);
             continue;
           }
@@ -2543,7 +2543,7 @@ var EncryptionService = class {
   }
   /** Feed a MasterKey item (type_=9) to the service so it can be used for decryption */
   feedMasterKey(item) {
-    if (item.type_ !== 9)
+    if (item.type_ !== 9 /* MasterKey */)
       return;
     this.masterKeyItems.set(item.id, {
       id: item.id,

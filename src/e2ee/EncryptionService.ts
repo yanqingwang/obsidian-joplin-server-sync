@@ -1,4 +1,4 @@
-import { JoplinItem } from '../api/models';
+import { JoplinItem, ModelType } from '../api/models';
 
 export enum EncryptionMethod {
   SJCL1a = 4,
@@ -33,7 +33,7 @@ export class EncryptionService {
 
   /** Feed a MasterKey item (type_=9) to the service so it can be used for decryption */
   feedMasterKey(item: JoplinItem): void {
-    if (item.type_ !== 9) return;
+    if (item.type_ !== ModelType.MasterKey) return;
     this.masterKeyItems.set(item.id, {
       id: item.id,
       encryptionMethod: item.encryption_method as number || 7,
@@ -181,7 +181,7 @@ export class EncryptionService {
 
   /** Decrypt a single hex-encoded chunk with AES-GCM */
   private async decryptChunk(method: number, key: CryptoKey, chunkHex: string): Promise<string> {
-    if (method === EncryptionMethod.StringV1 || method === EncryptionMethod.FileV1) {
+    if (method === (EncryptionMethod.StringV1 as number) || method === (EncryptionMethod.FileV1 as number)) {
       const data = this.hexToBytes(chunkHex);
       const nonce = data.slice(0, NONCE_BYTES);
       const ctWithTag = data.slice(NONCE_BYTES);
@@ -191,7 +191,7 @@ export class EncryptionService {
       );
       return new TextDecoder().decode(plain);
     }
-    if (method === EncryptionMethod.SJCL1a) {
+    if (method === (EncryptionMethod.SJCL1a as number)) {
       // SJCL format: not implemented, skip
       console.warn('[joplin-sync] SJCL encryption method not supported, skipping chunk');
       return '';

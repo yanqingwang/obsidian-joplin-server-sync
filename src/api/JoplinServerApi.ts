@@ -153,7 +153,7 @@ export class JoplinServerApi {
     const res = await this.exec('GET', '/api/items/root:/:/delta' + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
     if (!res.json) throw new ApiError(res.status, 'delta body is not JSON: ' + res.text.slice(0, 200));
-    const raw = res.json as Record<string, unknown>;
+    const raw = res.json;
     const items = (raw.items as unknown[] | undefined) ?? [];
     for (const item of items as RawDeltaItem[]) {
       if (item.item_name) item.name = item.item_name;
@@ -186,7 +186,7 @@ export class JoplinServerApi {
     return res.json as unknown as Paginated<SyncLock>;
   }
 
-  private trimSlash(u: string) { return u.replace(/[\/`]+$/, ''); }
+  private trimSlash(u: string) { return u.replace(/[/`]+$/, ''); }
   private sleep(ms: number) { return new Promise(r => window.setTimeout(r, ms)); }
 }
 

@@ -2039,18 +2039,21 @@ var SyncEngine = class {
         const excludes = this.plugin.settings.excludePatterns;
         const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
         const allFiles = this.plugin.app.vault.getFiles();
-        for (const f of allFiles) {
-          if (f.extension === "md")
-            continue;
-          if (isExcluded(f.path))
-            continue;
-          try {
-            const rid = await this.resources.uploadResource(f, true);
-            pushedResourceIds.add(rid);
-            rDone++;
-          } catch (e) {
-            rFail++;
-            console.error("[joplin-sync] resource upload fail:", f.path, e?.message || e);
+        const resourceFiles = allFiles.filter((f) => f.extension !== "md" && !isExcluded(f.path));
+        if (resourceFiles.length > 0) {
+          for (const batch of chunk(resourceFiles, 5)) {
+            await Promise.all(batch.map(async (f) => {
+              try {
+                const rid = await this.resources.uploadResource(f, true);
+                pushedResourceIds.add(rid);
+                rDone++;
+              } catch (e) {
+                rFail++;
+                console.error("[joplin-sync] resource upload fail:", f.path, e?.message || e);
+              }
+              this.plugin.statusBar.setProgress(rDone + rFail, resourceFiles.length, "files");
+            }));
+            await this.plugin.mapping.flush();
           }
         }
         if (rDone || rFail)
@@ -2329,16 +2332,19 @@ var SyncEngine = class {
       const resources = allItems.filter((i) => i.type_ === 4 /* Resource */);
       const downloadedPaths = /* @__PURE__ */ new Set();
       let rDone = 0, rFail = 0;
-      for (const r of resources) {
-        try {
-          const p = await this.resources.downloadResource(r);
-          if (p)
-            downloadedPaths.add(p);
-          rDone++;
-        } catch (e) {
-          rFail++;
-          if (rFail <= 3)
-            console.error("[joplin-sync] force-pull resource:", r.id, e?.message || e);
+      if (resources.length > 0) {
+        for (const r of resources) {
+          try {
+            const p = await this.resources.downloadResource(r);
+            if (p)
+              downloadedPaths.add(p);
+            rDone++;
+          } catch (e) {
+            rFail++;
+            if (rFail <= 3)
+              console.error("[joplin-sync] force-pull resource:", r.id, e?.message || e);
+          }
+          this.plugin.statusBar.setProgress(rDone + rFail, resources.length, "files");
         }
       }
       if (rDone || rFail)

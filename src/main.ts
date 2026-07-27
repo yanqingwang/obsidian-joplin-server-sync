@@ -65,8 +65,8 @@ export default class JoplinSyncPlugin extends Plugin {
         try {
           await this.api.login();
           new Notice('Joplin Server: connection OK');
-        } catch (e: any) {
-          new Notice('Connection failed: ' + e.message);
+        } catch (e: unknown) {
+          new Notice('Connection failed: ' + (e instanceof Error ? e.message : String(e)));
         }
       },
     });

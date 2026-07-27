@@ -53,8 +53,8 @@ export class SyncEngine {
           try {
             const changed = await this.uploadNote(file, '');
             changed ? done++ : skipped++;
-          } catch (e: any) {
-            failed.push(file.path + ': ' + e.message);
+          } catch (e: unknown) {
+            failed.push(file.path + ': ' + (e instanceof Error ? e.message : String(e)));
           }
           this.plugin.statusBar.setProgress(done + skipped, files.length);
         }));
@@ -94,8 +94,8 @@ export class SyncEngine {
           console.warn('[joplin-sync] verify mismatch for: ' + file.path + ' (expected ' + hash + ', got ' + remoteHash + ')');
         }
       }
-    } catch (verifyErr: any) {
-      console.warn('[joplin-sync] verify skipped for: ' + file.path + ' - ' + (verifyErr?.message || verifyErr));
+    } catch (verifyErr: unknown) {
+      console.warn('[joplin-sync] verify skipped for: ' + file.path + ' - ' + (verifyErr instanceof Error ? verifyErr.message : String(verifyErr)));
     }
 
     this.plugin.mapping.upsert({
@@ -184,9 +184,9 @@ export class SyncEngine {
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
       this.plugin.logSync('sync', totalMapped, totalFail);
       new Notice('Sync complete: ' + totalMapped + ' items mapped, ' + totalFail + ' failed');
-    } catch (e: any) {
+    } catch (e: unknown) {
       this.state = SyncState.Error;
-      const msg = e?.message || e?.toString() || 'Unknown error';
+      const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');
       console.error('[joplin-sync] sync cycle failed:', msg);
       this.plugin.statusBar.setError(msg);
       new Notice('Sync failed: ' + msg, 8000);
@@ -266,10 +266,11 @@ export class SyncEngine {
 
       // Also discover empty directories from the filesystem adapter
       const adapter = this.plugin.app.vault.adapter;
-      if (adapter && (adapter as any).list) {
+      const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ folders: string[] }> };
+      if (adapter && typedAdapter.list) {
         const walkDirs = async (dir: string): Promise<void> => {
           try {
-            const listing = await (adapter as any).list(dir);
+            const listing = await typedAdapter.list(dir);
             for (const sub of listing.folders) {
               const folderName = sub.split('/').pop() || '';
               if (folderName.startsWith('.')) continue; // skip hidden dirs
@@ -333,9 +334,9 @@ export class SyncEngine {
               if (m) pushedNoteIds.add(m.joplinId);
               done++;
               this.plugin.statusBar.setProgress(done, files.length, 'push');
-            } catch (e: any) {
+            } catch (e: unknown) {
               fail++;
-              console.error('[joplin-sync] upload fail [' + fail + ']:', file.path, e?.message || e);
+              console.error('[joplin-sync] upload fail [' + fail + ']:', file.path, e instanceof Error ? e.message : String(e));
             }
           }));
           await this.plugin.mapping.flush();
@@ -361,7 +362,7 @@ export class SyncEngine {
           for (const batch of chunk(resourceFiles, 5)) {
             await Promise.all(batch.map(async (f) => {
               try { const rid = await this.resources.uploadResource(f, true); pushedResourceIds.add(rid); rDone++; }
-              catch (e: any) { rFail++; console.error('[joplin-sync] resource upload fail:', f.path, e?.message || e); }
+              catch (e: unknown) { rFail++; console.error('[joplin-sync] resource upload fail:', f.path, e instanceof Error ? e.message : String(e)); }
               this.plugin.statusBar.setProgress(rDone + rFail, resourceFiles.length, 'files');
             }));
             await this.plugin.mapping.flush();
@@ -516,7 +517,7 @@ export class SyncEngine {
           } else {
             allItems.push(item);
           }
-        } catch (e: any) {
+        } catch (e: unknown) {
           failed++;
           if (failed <= 3) console.error('[joplin-sync] force-pull:', stat.name, e);
         }
@@ -540,8 +541,8 @@ export class SyncEngine {
             joplinId: f.id, path: dirPath + '/', type: ModelType.Folder,
             localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
           });
-        } catch (e) {
-          console.warn('[joplin-sync] force-pull folder:', f.title, (e as any)?.message || e);
+        } catch (e: unknown) {
+          console.warn('[joplin-sync] force-pull folder:', f.title, e instanceof Error ? e.message : String(e));
         }
       }
 
@@ -568,9 +569,9 @@ export class SyncEngine {
           }
 
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-          if (existing) {
-            await this.plugin.app.vault.modify(existing as TFile, body || '');
-          } else {
+          if (existing instanceof TFile) {
+            await this.plugin.app.vault.modify(existing, body || '');
+          } else if (!existing) {
             await this.plugin.app.vault.create(path, body || '');
           }
           const hash = await sha256(body);
@@ -579,9 +580,9 @@ export class SyncEngine {
             localHash: hash, remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
           });
           done++;
-        } catch (e: any) {
+        } catch (e: unknown) {
           failed++;
-          const msg = e?.message || '';
+          const msg = e instanceof Error ? e.message : String(e);
           if (msg.includes('401')) try { await this.plugin.api.login(); } catch { void 0; }
           if (failed <= 3) console.error('[joplin-sync] force-pull:', item.title, msg);
         }
@@ -604,7 +605,7 @@ export class SyncEngine {
       if (resources.length > 0) {
         for (const r of resources) {
           try { const p = await this.resources.downloadResource(r); if (p) downloadedPaths.add(p); rDone++; }
-          catch (e: any) { rFail++; if (rFail <= 3) console.error('[joplin-sync] force-pull resource:', r.id, e?.message || e); }
+          catch (e: unknown) { rFail++; if (rFail <= 3) console.error('[joplin-sync] force-pull resource:', r.id, e instanceof Error ? e.message : String(e)); }
           this.plugin.statusBar.setProgress(rDone + rFail, resources.length, 'files');
         }
       }
@@ -632,8 +633,8 @@ export class SyncEngine {
       }
       if (localRemoved) console.debug('[joplin-sync] force pull removed ' + localRemoved + ' stale local files');
 
-    } catch (e: any) {
-      const msg = e?.message || e?.toString() || 'Unknown error';
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');
       console.error('[joplin-sync] force pull failed:', msg);
       this.plugin.statusBar.setError(msg);
       new Notice('Force pull failed: ' + msg, 8000);

@@ -29,9 +29,9 @@ export class InitialSync {
           const parentId = folderMap.get(dir) || '';
           await this.uploadNote(file, parentId);
           done++;
-        } catch (e: any) {
+        } catch (e: unknown) {
           fail++;
-          console.error('[joplin-sync] initial upload fail [' + fail + ']:', file.path, e?.message || e);
+          console.error('[joplin-sync] initial upload fail [' + fail + ']:', file.path, e instanceof Error ? e.message : String(e));
         }
       }));
       await this.plugin.mapping.flush();
@@ -90,8 +90,8 @@ export class InitialSync {
           });
           folderMap.set(dp, fid);
         }
-      } catch (e) {
-        console.warn('[joplin-sync] folder create skipped:', dp, (e as any)?.message || e);
+      } catch (e: unknown) {
+        console.warn('[joplin-sync] folder create skipped:', dp, e instanceof Error ? e.message : String(e));
       }
     }
     return folderMap;

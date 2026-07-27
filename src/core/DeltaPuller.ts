@@ -25,7 +25,7 @@ export class DeltaPuller {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId) return true; // no root folder → accept everything (cursor filters stale data)
-    const hasFolders = this.plugin.mapping.all().some(e => (e as unknown as { type: number }).type === 2);
+    const hasFolders = this.plugin.mapping.all().some(e => Number((e as unknown as { type: number }).type) === ModelType.Folder);
     if (!hasFolders) return true;
 
     let pid = item.parent_id;
@@ -98,7 +98,7 @@ export class DeltaPuller {
 
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
-    if (Number(probe.type_) === 9) { e2ee.feedMasterKey(probe); return []; }
+    if (probe.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(probe); return []; }
 
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
@@ -113,8 +113,8 @@ export class DeltaPuller {
           if (!this.belongsToRoot(decrypted)) return [];
           return [decrypted];
         }
-      } catch (e: any) {
-        console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + e.message);
+      } catch (e: unknown) {
+        console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + (e instanceof Error ? e.message : String(e)));
         return [];
       }
     }
@@ -136,7 +136,7 @@ export class DeltaPuller {
     if (item.updated_time <= mapping.remoteUpdatedTime) return;
 
     const localFile = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
-    const localContent = localFile ? await this.plugin.app.vault.read(localFile as TFile) : null;
+    const localContent = localFile instanceof TFile ? await this.plugin.app.vault.read(localFile) : null;
     const localChanged = localContent !== null && (await sha256(localContent)) !== mapping.localHash;
 
     if (localChanged) {

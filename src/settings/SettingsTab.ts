@@ -6,6 +6,11 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  getSettingDefinitions(): import('obsidian').SettingDefinitionItem[] {
+    // TODO: convert to declarative settings
+    return [];
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
@@ -54,8 +59,8 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
           try {
             await this.plugin.api.login();
             new Notice('\u2705 Connection OK');
-          } catch (e: any) {
-            new Notice('\u274c Connection failed: ' + e.message, 8000);
+          } catch (e: unknown) {
+            new Notice('\u274c Connection failed: ' + (e instanceof Error ? e.message : String(e)), 8000);
           } finally {
             b.setDisabled(false).setButtonText('Test connection');
           }
@@ -158,8 +163,8 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
               await this.plugin.e2ee.loadMasterKey(mkId, pw);
             }
             new Notice('Loaded ' + mks.length + ' master key(s)');
-          } catch (e: any) {
-            new Notice('E2EE key load failed: ' + e.message, 8000);
+          } catch (e: unknown) {
+            new Notice('E2EE key load failed: ' + (e instanceof Error ? e.message : String(e)), 8000);
           } finally {
             b.setDisabled(false).setButtonText('Load keys');
             this.display();

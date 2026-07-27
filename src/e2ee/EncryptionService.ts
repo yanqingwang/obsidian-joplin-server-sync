@@ -77,9 +77,9 @@ export class EncryptionService {
     if (!password) throw new Error('Password required');
 
     // Parse the encrypted content (JSON: {ct, iv, salt, ...})
-    let payload: any;
+    let payload: Record<string, string>;
     try {
-      payload = JSON.parse(mk.encryptedContent);
+      payload = JSON.parse(mk.encryptedContent) as Record<string, string>;
     } catch {
       // Raw hex format fallback
       payload = { ct: mk.encryptedContent };
@@ -109,9 +109,10 @@ export class EncryptionService {
     const plainStr = new TextDecoder().decode(plain);
 
     // The decrypted content is a JSON with the actual master key
-    let mkPayload: any;
+    interface MkPayload { encryption_method?: number; content?: string; ct?: string }
+    let mkPayload: MkPayload;
     try {
-      mkPayload = JSON.parse(plainStr);
+      mkPayload = JSON.parse(plainStr) as MkPayload;
     } catch {
       // Maybe it's base64-encoded raw key material
       const rawKey = this.base64ToBytes(plainStr);

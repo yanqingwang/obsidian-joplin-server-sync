@@ -67,7 +67,7 @@ export class JoplinServerApi {
   }
 
   private safeJson(text: string): Record<string, unknown> | null {
-    try { return JSON.parse(text); } catch { return null; }
+    try { return JSON.parse(text) as Record<string, unknown>; } catch { return null; }
   }
 
   private execJsonLogCount = 0;
@@ -77,7 +77,7 @@ export class JoplinServerApi {
   } = {}): Promise<{ status: number; text: string; json: Record<string, unknown> | null; arrayBuffer: ArrayBuffer }> {
     const res = await this.rawRequest(method, path, opts);
     let json: Record<string, unknown> | null = null;
-    try { json = JSON.parse(res.text); } catch {
+    try { json = JSON.parse(res.text) as Record<string, unknown>; } catch {
       if (this.execJsonLogCount < 5) {
         this.execJsonLogCount++;
         console.warn('[joplin-sync] non-json response', method, path, 'status=' + res.status, 'body=' + res.text.slice(0, 200));
@@ -140,18 +140,26 @@ export class JoplinServerApi {
   }
 
   async delta(cursor?: string): Promise<Paginated<DeltaItem>> {
+    interface RawDeltaItem {
+      item_name?: string;
+      jop_updated_time?: unknown;
+      type?: unknown;
+      item_type?: unknown;
+      name?: string;
+      updated_time?: unknown;
+      [key: string]: unknown;
+    }
     const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
     const res = await this.exec('GET', '/api/items/root:/:/delta' + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
     if (!res.json) throw new ApiError(res.status, 'delta body is not JSON: ' + res.text.slice(0, 200));
     const raw = res.json as Record<string, unknown>;
-    const items = (raw.items as unknown[]) || [];
-    for (const item of items) {
-      const it = item as Record<string, unknown>;
-      if (it.item_name) it.name = it.item_name;
-      if (it.jop_updated_time) it.updated_time = it.jop_updated_time;
-      if (it.type !== undefined) it.type = Number(it.type);
-      if (it.item_type !== undefined) it.item_type = Number(it.item_type);
+    const items = (raw.items as unknown[] | undefined) ?? [];
+    for (const item of items as RawDeltaItem[]) {
+      if (item.item_name) item.name = item.item_name;
+      if (item.jop_updated_time) item.updated_time = item.jop_updated_time;
+      if (item.type !== undefined && item.type !== null) item.type = Number(item.type);
+      if (item.item_type !== undefined && item.item_type !== null) item.item_type = Number(item.item_type);
     }
     return { items, has_more: !!raw.has_more, cursor: raw.cursor as string | undefined } as unknown as Paginated<DeltaItem>;
   }

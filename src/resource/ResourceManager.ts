@@ -36,7 +36,7 @@ export class ResourceManager {
     // This keeps downloadResource (which fetches .resource/<meta.id>) in sync.
     const metaId = force ? createJoplinId() : (existing?.joplinId ?? createJoplinId());
 
-    const maxSize = (this.plugin.settings as any).maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
+    const maxSize = (this.plugin.settings.maxAttachmentMB ?? 100) * 1024 * 1024;
     if (data.byteLength > maxSize) throw new Error('Attachment too large: ' + file.path);
 
     // Ensure parent directory exists on server before uploading
@@ -128,7 +128,7 @@ export class ResourceManager {
       }
     }
 
-    const watcher = (this.plugin.engine as any)?.watcher as any;
+    const watcher = (this.plugin.engine as unknown as { watcher?: { suppress: (path: string) => void; release: (path: string) => void } })?.watcher;
     const write = async () => {
       // Ensure parent directory exists
       const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';

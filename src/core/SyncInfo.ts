@@ -2,6 +2,11 @@ import { JoplinServerApi } from '../api/JoplinServerApi';
 
 const SUPPORTED_SYNC_VERSION = 3;
 
+interface SyncInfo {
+  version: number;
+  e2ee?: { value?: boolean };
+}
+
 export class SyncInfoHandler {
   private _e2eeEnabled = false;
 
@@ -9,14 +14,14 @@ export class SyncInfoHandler {
 
   get e2eeEnabled(): boolean { return this._e2eeEnabled; }
 
-  async checkOrInit(): Promise<any> {
+  async checkOrInit(): Promise<SyncInfo> {
     const raw = await this.api.getItem('info.json');
     if (raw === null) {
       const info = { version: SUPPORTED_SYNC_VERSION };
       await this.api.putItem('info.json', JSON.stringify(info));
       return info;
     }
-    const info = JSON.parse(raw);
+    const info = JSON.parse(raw) as SyncInfo;
     if (info.version > SUPPORTED_SYNC_VERSION) {
       throw new Error('Sync target version ' + info.version + ' > supported ' + SUPPORTED_SYNC_VERSION + '. Please update the plugin.');
     }

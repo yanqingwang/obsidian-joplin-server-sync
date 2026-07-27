@@ -55,6 +55,9 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  getSettingDefinitions() {
+    return [];
+  }
   display() {
     const { containerEl } = this;
     containerEl.empty();
@@ -80,7 +83,7 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.api.login();
         new import_obsidian.Notice("\u2705 Connection OK");
       } catch (e) {
-        new import_obsidian.Notice("\u274C Connection failed: " + e.message, 8e3);
+        new import_obsidian.Notice("\u274C Connection failed: " + (e instanceof Error ? e.message : String(e)), 8e3);
       } finally {
         b.setDisabled(false).setButtonText("Test connection");
       }
@@ -141,7 +144,7 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
         }
         new import_obsidian.Notice("Loaded " + mks.length + " master key(s)");
       } catch (e) {
-        new import_obsidian.Notice("E2EE key load failed: " + e.message, 8e3);
+        new import_obsidian.Notice("E2EE key load failed: " + (e instanceof Error ? e.message : String(e)), 8e3);
       } finally {
         b.setDisabled(false).setButtonText("Load keys");
         this.display();
@@ -318,17 +321,16 @@ var JoplinServerApi = class {
     if (!res.json)
       throw new ApiError(res.status, "delta body is not JSON: " + res.text.slice(0, 200));
     const raw = res.json;
-    const items = raw.items || [];
+    const items = raw.items ?? [];
     for (const item of items) {
-      const it = item;
-      if (it.item_name)
-        it.name = it.item_name;
-      if (it.jop_updated_time)
-        it.updated_time = it.jop_updated_time;
-      if (it.type !== void 0)
-        it.type = Number(it.type);
-      if (it.item_type !== void 0)
-        it.item_type = Number(it.item_type);
+      if (item.item_name)
+        item.name = item.item_name;
+      if (item.jop_updated_time)
+        item.updated_time = item.jop_updated_time;
+      if (item.type !== void 0 && item.type !== null)
+        item.type = Number(item.type);
+      if (item.item_type !== void 0 && item.item_type !== null)
+        item.item_type = Number(item.item_type);
     }
     return { items, has_more: !!raw.has_more, cursor: raw.cursor };
   }
@@ -873,7 +875,7 @@ var ResourceManager = class {
     if (!force && existing && existing.localHash === hash)
       return existing.joplinId;
     const metaId = force ? createJoplinId() : existing?.joplinId ?? createJoplinId();
-    const maxSize = this.plugin.settings.maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
+    const maxSize = (this.plugin.settings.maxAttachmentMB ?? 100) * 1024 * 1024;
     if (data.byteLength > maxSize)
       throw new Error("Attachment too large: " + file.path);
     const parentDir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -1249,7 +1251,7 @@ var ConflictResolver = class {
 
 // src/core/pathUtil.ts
 function safeFileName(name) {
-  const cleaned = (name || "").replace(/[\\/]/g, "_").replace(/[\x00-\x1f\x7f]/g, "").trim();
+  const cleaned = (name || "").replace(/[/\\]/g, "_").replace(/[\x00-\x1f\x7f]/gu, "").trim();
   return cleaned || "Untitled";
 }
 
@@ -1272,7 +1274,7 @@ var DeltaPuller = class {
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId)
       return true;
-    const hasFolders = this.plugin.mapping.all().some((e) => e.type === 2);
+    const hasFolders = this.plugin.mapping.all().some((e) => Number(e.type) === 2 /* Folder */);
     if (!hasFolders)
       return true;
     let pid = item.parent_id;
@@ -1365,7 +1367,7 @@ var DeltaPuller = class {
       return [];
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
-    if (Number(probe.type_) === 9) {
+    if (probe.type_ === 9 /* MasterKey */) {
       e2ee.feedMasterKey(probe);
       return [];
     }
@@ -1382,7 +1384,7 @@ var DeltaPuller = class {
           return [decrypted];
         }
       } catch (e) {
-        console.warn("[joplin-sync] E2EE decrypt failed for " + d.name + ": " + e.message);
+        console.warn("[joplin-sync] E2EE decrypt failed for " + d.name + ": " + (e instanceof Error ? e.message : String(e)));
         return [];
       }
     }
@@ -1402,7 +1404,7 @@ var DeltaPuller = class {
     if (item.updated_time <= mapping.remoteUpdatedTime)
       return;
     const localFile = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
-    const localContent = localFile ? await this.plugin.app.vault.read(localFile) : null;
+    const localContent = localFile instanceof import_obsidian7.TFile ? await this.plugin.app.vault.read(localFile) : null;
     const localChanged = localContent !== null && await sha256(localContent) !== mapping.localHash;
     if (localChanged) {
       await this.conflicts.resolve(mapping, item, localContent, targetPath);
@@ -1586,7 +1588,7 @@ var InitialSync = class {
             done++;
           } catch (e) {
             fail++;
-            console.error("[joplin-sync] initial upload fail [" + fail + "]:", file.path, e?.message || e);
+            console.error("[joplin-sync] initial upload fail [" + fail + "]:", file.path, e instanceof Error ? e.message : String(e));
           }
         }));
         await this.plugin.mapping.flush();
@@ -1655,7 +1657,7 @@ var InitialSync = class {
           folderMap.set(dp, fid);
         }
       } catch (e) {
-        console.warn("[joplin-sync] folder create skipped:", dp, e?.message || e);
+        console.warn("[joplin-sync] folder create skipped:", dp, e instanceof Error ? e.message : String(e));
       }
     }
     return folderMap;
@@ -1732,7 +1734,7 @@ var SyncEngine = class {
             const changed = await this.uploadNote(file, "");
             changed ? done++ : skipped++;
           } catch (e) {
-            failed.push(file.path + ": " + e.message);
+            failed.push(file.path + ": " + (e instanceof Error ? e.message : String(e)));
           }
           this.plugin.statusBar.setProgress(done + skipped, files.length);
         }));
@@ -1780,7 +1782,7 @@ var SyncEngine = class {
         }
       }
     } catch (verifyErr) {
-      console.warn("[joplin-sync] verify skipped for: " + file.path + " - " + (verifyErr?.message || verifyErr));
+      console.warn("[joplin-sync] verify skipped for: " + file.path + " - " + (verifyErr instanceof Error ? verifyErr.message : String(verifyErr)));
     }
     this.plugin.mapping.upsert({
       joplinId: id,
@@ -1867,7 +1869,7 @@ var SyncEngine = class {
       new import_obsidian9.Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
     } catch (e) {
       this.state = 4 /* Error */;
-      const msg = e?.message || e?.toString() || "Unknown error";
+      const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
       console.error("[joplin-sync] sync cycle failed:", msg);
       this.plugin.statusBar.setError(msg);
       new import_obsidian9.Notice("Sync failed: " + msg, 8e3);
@@ -1941,10 +1943,11 @@ var SyncEngine = class {
         discoverParentDirs(f.path);
       }
       const adapter = this.plugin.app.vault.adapter;
-      if (adapter && adapter.list) {
+      const typedAdapter = adapter;
+      if (adapter && typedAdapter.list) {
         const walkDirs = async (dir) => {
           try {
-            const listing = await adapter.list(dir);
+            const listing = await typedAdapter.list(dir);
             for (const sub of listing.folders) {
               const folderName = sub.split("/").pop() || "";
               if (folderName.startsWith("."))
@@ -2023,7 +2026,7 @@ var SyncEngine = class {
               this.plugin.statusBar.setProgress(done, files.length, "push");
             } catch (e) {
               fail++;
-              console.error("[joplin-sync] upload fail [" + fail + "]:", file.path, e?.message || e);
+              console.error("[joplin-sync] upload fail [" + fail + "]:", file.path, e instanceof Error ? e.message : String(e));
             }
           }));
           await this.plugin.mapping.flush();
@@ -2049,7 +2052,7 @@ var SyncEngine = class {
                 rDone++;
               } catch (e) {
                 rFail++;
-                console.error("[joplin-sync] resource upload fail:", f.path, e?.message || e);
+                console.error("[joplin-sync] resource upload fail:", f.path, e instanceof Error ? e.message : String(e));
               }
               this.plugin.statusBar.setProgress(rDone + rFail, resourceFiles.length, "files");
             }));
@@ -2259,7 +2262,7 @@ var SyncEngine = class {
             syncedAt: Date.now()
           });
         } catch (e) {
-          console.warn("[joplin-sync] force-pull folder:", f.title, e?.message || e);
+          console.warn("[joplin-sync] force-pull folder:", f.title, e instanceof Error ? e.message : String(e));
         }
       }
       const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
@@ -2292,9 +2295,9 @@ var SyncEngine = class {
             }
           }
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-          if (existing) {
+          if (existing instanceof import_obsidian9.TFile) {
             await this.plugin.app.vault.modify(existing, body || "");
-          } else {
+          } else if (!existing) {
             await this.plugin.app.vault.create(path, body || "");
           }
           const hash = await sha256(body);
@@ -2309,7 +2312,7 @@ var SyncEngine = class {
           done++;
         } catch (e) {
           failed++;
-          const msg = e?.message || "";
+          const msg = e instanceof Error ? e.message : String(e);
           if (msg.includes("401"))
             try {
               await this.plugin.api.login();
@@ -2342,7 +2345,7 @@ var SyncEngine = class {
           } catch (e) {
             rFail++;
             if (rFail <= 3)
-              console.error("[joplin-sync] force-pull resource:", r.id, e?.message || e);
+              console.error("[joplin-sync] force-pull resource:", r.id, e instanceof Error ? e.message : String(e));
           }
           this.plugin.statusBar.setProgress(rDone + rFail, resources.length, "files");
         }
@@ -2377,7 +2380,7 @@ var SyncEngine = class {
       if (localRemoved)
         console.debug("[joplin-sync] force pull removed " + localRemoved + " stale local files");
     } catch (e) {
-      const msg = e?.message || e?.toString() || "Unknown error";
+      const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
       new import_obsidian9.Notice("Force pull failed: " + msg, 8e3);
@@ -2834,7 +2837,7 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
           await this.api.login();
           new import_obsidian10.Notice("Joplin Server: connection OK");
         } catch (e) {
-          new import_obsidian10.Notice("Connection failed: " + e.message);
+          new import_obsidian10.Notice("Connection failed: " + (e instanceof Error ? e.message : String(e)));
         }
       }
     });

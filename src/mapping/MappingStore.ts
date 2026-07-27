@@ -34,7 +34,7 @@ export class MappingStore {
     const adapter = this.plugin.app.vault.adapter;
     if (adapter.exists) {
       if (await adapter.exists(this.filePath)) {
-        this.data = JSON.parse(await adapter.read(this.filePath));
+        this.data = JSON.parse(await adapter.read(this.filePath)) as MappingData;
       }
     }
     this.rebuildIndexes();

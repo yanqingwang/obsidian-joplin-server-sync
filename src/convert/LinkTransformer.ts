@@ -1,10 +1,11 @@
 import { TFile } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
+import { ModelType } from '../api/models';
 
 export class LinkTransformer {
   private pendingLinks = new Map<string, Set<string>>();
 
-  constructor(private plugin: JoplinSyncPlugin, private resources: any) {}
+  constructor(private plugin: JoplinSyncPlugin, private resources: { uploadResource: (file: TFile) => Promise<string> } | null) {}
 
   async obsidianToJoplin(body: string, sourcePath: string): Promise<string> {
     return this.transformOutsideCode(body, async (segment) => {
@@ -34,7 +35,7 @@ export class LinkTransformer {
     const mapped = this.plugin.mapping.getByPath(dest.path);
     if (mapped) return mapped.joplinId;
     if (dest.extension === 'md') {
-      return (this.plugin.engine as any).preassignNoteId?.(dest) ?? null;
+      return (this.plugin.engine as unknown as { preassignNoteId?: (dest: TFile) => Promise<string> }).preassignNoteId?.call(this.plugin.engine, dest) ?? null;
     }
     return this.resources?.uploadResource(dest) ?? null;
   }
@@ -51,7 +52,7 @@ export class LinkTransformer {
           }
           const name = target.path.split('/').pop()!;
           const base = name.replace(/\.md$/, '');
-          if (bang || target.type === 4) return '![[' + name + ']]';
+          if (bang || Number(target.type) === ModelType.Resource) return '![[' + name + ']]';
           return label && label !== base ? '[[' + base + '|' + label + ']]' : '[[' + base + ']]';
         }));
   }
@@ -66,9 +67,10 @@ export class LinkTransformer {
       const content = await this.plugin.app.vault.read(f);
       const fixed = this.joplinToObsidian(content, path);
       if (fixed !== content) {
-        (this.plugin.engine as any).watcher?.suppress?.(path);
+        const watcher = (this.plugin.engine as unknown as { watcher?: { suppress?: (path: string) => void; release?: (path: string) => void } }).watcher;
+        watcher?.suppress?.(path);
         await this.plugin.app.vault.modify(f, fixed);
-        (this.plugin.engine as any).watcher?.release?.(path);
+        watcher?.release?.(path);
       }
     }
   }

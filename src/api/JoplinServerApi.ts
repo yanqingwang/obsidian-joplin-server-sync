@@ -178,7 +178,7 @@ export class JoplinServerApi {
     return res.json as unknown as Paginated<SyncLock>;
   }
 
-  private trimSlash(u: string) { return u.replace(/\/+$/, ''); }
+  private trimSlash(u: string) { return u.replace(/[\/`]+$/, ''); }
   private sleep(ms: number) { return new Promise(r => window.setTimeout(r, ms)); }
 }
 

@@ -27,16 +27,14 @@ export class ResourceManager {
 
   constructor(private plugin: JoplinSyncPlugin) {}
 
-  async uploadResource(file: TFile): Promise<string> {
+  async uploadResource(file: TFile, force = false): Promise<string> {
     const data = await this.plugin.app.vault.readBinary(file);
     const hash = await sha256(data);
     const existing = this.plugin.mapping.getByPath(file.path);
-    if (existing && existing.localHash === hash) return existing.joplinId;
-    const dedupId = this.hashToId.get(hash);
-    const skipBlob = dedupId !== undefined;
-    // Blob ID (reuse if deduped) and metadata ID (always unique per path)
-    const blobId = skipBlob ? dedupId : (existing?.joplinId ?? createJoplinId());
-    const metaId = createJoplinId();
+    if (!force && existing && existing.localHash === hash) return existing.joplinId;
+    // Every resource gets a unique ID — blob and metadata share the same ID.
+    // This keeps downloadResource (which fetches .resource/<meta.id>) in sync.
+    const metaId = force ? createJoplinId() : (existing?.joplinId ?? createJoplinId());
 
     const maxSize = (this.plugin.settings as any).maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
     if (data.byteLength > maxSize) throw new Error('Attachment too large: ' + file.path);
@@ -49,7 +47,7 @@ export class ResourceManager {
 
     const now = Date.now();
     const st = (file.stat as unknown as { ctime: number; mtime: number }) ?? { ctime: now, mtime: now };
-    if (!skipBlob) { await this.plugin.api.putItem('.resource/' + blobId, data); }
+    await this.plugin.api.putItem('.resource/' + metaId, data);
     const meta: JoplinItem = {
       id: metaId, parent_id: '', title: file.name,
       mime: MIME_MAP[file.extension.toLowerCase()] ?? 'application/octet-stream',
@@ -68,7 +66,6 @@ export class ResourceManager {
       joplinId: metaId, path: file.path, type: ModelType.Resource,
       localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: now,
     });
-    this.hashToId.set(hash, blobId);
     return metaId;
   }
 

@@ -351,15 +351,15 @@ export class SyncEngine {
       // (e.g. an exported `resources/` bucket) must also be synced; otherwise
       // the pull target would silently diverge. .obsidian/ is always excluded.
       const pushedResourceIds = new Set<string>();
+      let rDone = 0, rFail = 0;
       if (!this.plugin.settings.syncFoldersOnly) {
         const excludes = this.plugin.settings.excludePatterns;
         const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/' + this.configDir + '/') || p.startsWith(this.configDir + '/');
         const allFiles = this.plugin.app.vault.getFiles();
-        let rDone = 0, rFail = 0;
         for (const f of allFiles) {
           if (f.extension === 'md') continue;
           if (isExcluded(f.path)) continue;
-          try { const rid = await this.resources.uploadResource(f); pushedResourceIds.add(rid); rDone++; }
+          try { const rid = await this.resources.uploadResource(f, true); pushedResourceIds.add(rid); rDone++; }
           catch (e: any) { rFail++; console.error('[joplin-sync] resource upload fail:', f.path, e?.message || e); }
         }
         if (rDone || rFail) console.debug('[joplin-sync] force push files: ' + rDone + ' uploaded, ' + rFail + ' failed');
@@ -407,11 +407,14 @@ export class SyncEngine {
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? '');
 
-      this.plugin.statusBar.setOk(Date.now(), done);
+      if (fail || rFail) {
+        this.plugin.statusBar.setError('push: ' + fail + ' note + ' + rFail + ' resource failed');
+      } else {
+        this.plugin.statusBar.setOk(Date.now(), done + rDone);
+      }
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
-      this.plugin.statusBar.setIdle();
     }
   }
 
@@ -600,9 +603,14 @@ export class SyncEngine {
       if (rDone || rFail) console.debug('[joplin-sync] force pull attachments: ' + rDone + ' downloaded, ' + rFail + ' failed');
 
       const totalSynced = done + rDone;
-      new Notice('Force pull: ' + totalSynced + ' items' + (failed ? ', ' + failed + ' failed' : ''));
-      this.plugin.logSync('pull', totalSynced, failed + rFail);
-      this.plugin.statusBar.setOk(Date.now(), totalSynced);
+      const totalFail = failed + rFail;
+      if (totalFail) {
+        this.plugin.statusBar.setError('pull: ' + totalFail + ' failed');
+      } else {
+        this.plugin.statusBar.setOk(Date.now(), totalSynced);
+      }
+      new Notice('Force pull: ' + totalSynced + ' items' + (totalFail ? ', ' + totalFail + ' failed' : ''));
+      this.plugin.logSync('pull', totalSynced, totalFail);
 
       // Remove stale local non-md files (cleanup from previous syncs)
       const excludes = this.plugin.settings.excludePatterns;
@@ -624,7 +632,6 @@ export class SyncEngine {
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
-      this.plugin.statusBar.setIdle();
     }
   }
 

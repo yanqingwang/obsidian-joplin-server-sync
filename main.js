@@ -357,7 +357,7 @@ var JoplinServerApi = class {
     return res.json;
   }
   trimSlash(u) {
-    return u.replace(/\/+$/, "");
+    return u.replace(/[\/`]+$/, "");
   }
   sleep(ms) {
     return new Promise((r) => window.setTimeout(r, ms));
@@ -866,16 +866,13 @@ var ResourceManager = class {
     this.serializer = new JoplinSerializer();
     this.hashToId = /* @__PURE__ */ new Map();
   }
-  async uploadResource(file) {
+  async uploadResource(file, force = false) {
     const data = await this.plugin.app.vault.readBinary(file);
     const hash = await sha256(data);
     const existing = this.plugin.mapping.getByPath(file.path);
-    if (existing && existing.localHash === hash)
+    if (!force && existing && existing.localHash === hash)
       return existing.joplinId;
-    const dedupId = this.hashToId.get(hash);
-    const skipBlob = dedupId !== void 0;
-    const blobId = skipBlob ? dedupId : existing?.joplinId ?? createJoplinId();
-    const metaId = createJoplinId();
+    const metaId = force ? createJoplinId() : existing?.joplinId ?? createJoplinId();
     const maxSize = this.plugin.settings.maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
     if (data.byteLength > maxSize)
       throw new Error("Attachment too large: " + file.path);
@@ -885,9 +882,7 @@ var ResourceManager = class {
     }
     const now = Date.now();
     const st = file.stat ?? { ctime: now, mtime: now };
-    if (!skipBlob) {
-      await this.plugin.api.putItem(".resource/" + blobId, data);
-    }
+    await this.plugin.api.putItem(".resource/" + metaId, data);
     const meta = {
       id: metaId,
       parent_id: "",
@@ -916,7 +911,6 @@ var ResourceManager = class {
       remoteUpdatedTime: res.updated_time,
       syncedAt: now
     });
-    this.hashToId.set(hash, blobId);
     return metaId;
   }
   /** Ensure a remote folder exists for the given vault-relative path */
@@ -2040,18 +2034,18 @@ var SyncEngine = class {
         this.plugin.logSync("push", done, fail);
       }
       const pushedResourceIds = /* @__PURE__ */ new Set();
+      let rDone = 0, rFail = 0;
       if (!this.plugin.settings.syncFoldersOnly) {
         const excludes = this.plugin.settings.excludePatterns;
         const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
         const allFiles = this.plugin.app.vault.getFiles();
-        let rDone = 0, rFail = 0;
         for (const f of allFiles) {
           if (f.extension === "md")
             continue;
           if (isExcluded(f.path))
             continue;
           try {
-            const rid = await this.resources.uploadResource(f);
+            const rid = await this.resources.uploadResource(f, true);
             pushedResourceIds.add(rid);
             rDone++;
           } catch (e) {
@@ -2123,11 +2117,14 @@ var SyncEngine = class {
           break;
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? "");
-      this.plugin.statusBar.setOk(Date.now(), done);
+      if (fail || rFail) {
+        this.plugin.statusBar.setError("push: " + fail + " note + " + rFail + " resource failed");
+      } else {
+        this.plugin.statusBar.setOk(Date.now(), done + rDone);
+      }
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
-      this.plugin.statusBar.setIdle();
     }
   }
   // ============ Force Pull: overwrite local with server ============
@@ -2347,9 +2344,14 @@ var SyncEngine = class {
       if (rDone || rFail)
         console.debug("[joplin-sync] force pull attachments: " + rDone + " downloaded, " + rFail + " failed");
       const totalSynced = done + rDone;
-      new import_obsidian9.Notice("Force pull: " + totalSynced + " items" + (failed ? ", " + failed + " failed" : ""));
-      this.plugin.logSync("pull", totalSynced, failed + rFail);
-      this.plugin.statusBar.setOk(Date.now(), totalSynced);
+      const totalFail = failed + rFail;
+      if (totalFail) {
+        this.plugin.statusBar.setError("pull: " + totalFail + " failed");
+      } else {
+        this.plugin.statusBar.setOk(Date.now(), totalSynced);
+      }
+      new import_obsidian9.Notice("Force pull: " + totalSynced + " items" + (totalFail ? ", " + totalFail + " failed" : ""));
+      this.plugin.logSync("pull", totalSynced, totalFail);
       const excludes = this.plugin.settings.excludePatterns;
       const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
       let localRemoved = 0;
@@ -2376,7 +2378,6 @@ var SyncEngine = class {
     } finally {
       this.running = false;
       await this.plugin.mapping.flush();
-      this.plugin.statusBar.setIdle();
     }
   }
   async removeEmptyDirs(deletedPaths) {

@@ -842,6 +842,8 @@ var MIME_MAP = {
   doc: "application/msword",
   pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   ppt: "application/vnd.ms-powerpoint",
+  html: "text/html",
+  htm: "text/html",
   canvas: "application/obsidian-canvas",
   drawio: "application/x-drawio"
 };
@@ -857,9 +859,8 @@ var ResourceManager = class {
     const existing = this.plugin.mapping.getByPath(file.path);
     if (existing && existing.localHash === hash)
       return existing.joplinId;
-    const dedup = this.hashToId.get(hash);
-    if (dedup)
-      return dedup;
+    const dedupId = this.hashToId.get(hash);
+    const dedupBlob = dedupId !== void 0;
     const maxSize = this.plugin.settings.maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
     if (data.byteLength > maxSize)
       throw new Error("Attachment too large: " + file.path);
@@ -870,7 +871,9 @@ var ResourceManager = class {
     const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
     const st = file.stat || { ctime: now, mtime: now };
-    await this.plugin.api.putItem(".resource/" + id, data);
+    if (!dedupBlob) {
+      await this.plugin.api.putItem(".resource/" + id, data);
+    }
     const meta = {
       id,
       parent_id: "",
@@ -945,17 +948,23 @@ var ResourceManager = class {
   }
   async downloadResource(meta) {
     const existing = this.plugin.mapping.getById(meta.id);
-    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime)
-      return existing.path;
+    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
+      if (this.plugin.app.vault.getAbstractFileByPath(existing.path))
+        return existing.path;
+    }
     const blob = await this.plugin.api.getItemBinary(".resource/" + meta.id);
     if (!blob)
       throw new Error("Resource blob missing: " + meta.id);
     const dir = this.plugin.settings.attachmentFolder || "attachments";
-    const relName = meta.filename && meta.filename.includes("/") ? meta.filename : dir + "/" + (meta.filename || meta.id + "." + (meta.file_extension || "bin"));
+    const relName = meta.filename ? meta.filename : dir + "/" + meta.id + "." + (meta.file_extension || "bin");
     let path4 = normalizePath(relName);
     const clash = this.plugin.mapping.getByPath(path4);
     if (clash && clash.joplinId !== meta.id) {
-      path4 = normalizePath(dir + "/" + meta.id.slice(0, 7) + "_" + (meta.filename || meta.id + "." + (meta.file_extension || "bin")));
+      if (!this.plugin.app.vault.getAbstractFileByPath(path4)) {
+        this.plugin.mapping.remove(clash.joplinId);
+      } else {
+        path4 = normalizePath(dir + "/" + meta.id.slice(0, 7) + "_" + (meta.filename || meta.id + "." + (meta.file_extension || "bin")));
+      }
     }
     const watcher = this.plugin.engine?.watcher;
     const write = async () => {
@@ -1691,6 +1700,10 @@ var SyncEngine = class {
     this.syncInfo = new SyncInfoHandler(plugin.api);
     this.resources = new ResourceManager(plugin);
   }
+  get configDir() {
+    const vault = this.plugin.app.vault;
+    return vault.configDir || ".obsidian";
+  }
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
     if (this.running) {
@@ -1973,7 +1986,7 @@ var SyncEngine = class {
             pushedFolderIds.add(fid);
             folderCount++;
           }
-        } catch (e) {
+        } catch {
         }
       }
       const totalFolders = folderMap.size - 1;
@@ -2003,13 +2016,13 @@ var SyncEngine = class {
         }
       }
       if (!this.plugin.settings.syncFoldersOnly) {
-        console.log("[joplin-sync] force push notes: done=" + done + " fail=" + fail + " pushedNoteIds=" + pushedNoteIds.size);
+        console.debug("[joplin-sync] force push notes: done=" + done + " fail=" + fail + " pushedNoteIds=" + pushedNoteIds.size);
         this.plugin.logSync("push", done, fail);
       }
       const pushedResourceIds = /* @__PURE__ */ new Set();
       if (!this.plugin.settings.syncFoldersOnly) {
         const excludes = this.plugin.settings.excludePatterns;
-        const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/.obsidian/") || p.startsWith(".obsidian/");
+        const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
         const allFiles = this.plugin.app.vault.getFiles();
         let rDone = 0, rFail = 0;
         for (const f of allFiles) {
@@ -2027,11 +2040,11 @@ var SyncEngine = class {
           }
         }
         if (rDone || rFail)
-          console.log("[joplin-sync] force push files: " + rDone + " uploaded, " + rFail + " failed");
+          console.debug("[joplin-sync] force push files: " + rDone + " uploaded, " + rFail + " failed");
       }
       let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
       const remote = await this.listAllRemoteItems();
-      console.log("[joplin-sync] force push cleanup: scanning " + remote.length + " remote items");
+      console.debug("[joplin-sync] force push cleanup: scanning " + remote.length + " remote items");
       for (const stat of remote) {
         const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
         if (noteMatch) {
@@ -2072,7 +2085,7 @@ var SyncEngine = class {
         }
       }
       if (removed)
-        console.log("[joplin-sync] force push cleaned " + removed + " items (notes=" + removedNotes + " folders=" + removedFolders + " resources=" + removedResources + ")");
+        console.debug("[joplin-sync] force push cleaned " + removed + " items (notes=" + removedNotes + " folders=" + removedFolders + " resources=" + removedResources + ")");
       let cursor;
       while (true) {
         const page = await this.plugin.api.delta(cursor);
@@ -2099,7 +2112,7 @@ var SyncEngine = class {
       this.plugin.statusBar.setSyncing("force pull: clearing local...");
       await this.plugin.api.login();
       const adapter = this.plugin.app.vault.adapter;
-      const kept = [".obsidian"];
+      const kept = [this.configDir];
       const isKept = (p) => kept.some((k) => p === k || p.startsWith(k + "/"));
       let delCount = 0, delDirCount = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
@@ -2276,7 +2289,7 @@ var SyncEngine = class {
           if (failed <= 3)
             console.error("[joplin-sync] force-pull:", item.title, msg);
         }
-        this.plugin.statusBar.setProgress(done + failed + skipped, remoteStats.length, "pull");
+        this.plugin.statusBar.setProgress(done, notes.length, "pull");
       }
       let cursor;
       while (true) {
@@ -2303,9 +2316,13 @@ var SyncEngine = class {
         }
       }
       if (rDone || rFail)
-        console.log("[joplin-sync] force pull attachments: " + rDone + " downloaded, " + rFail + " failed");
+        console.debug("[joplin-sync] force pull attachments: " + rDone + " downloaded, " + rFail + " failed");
+      const totalSynced = done + rDone;
+      new Notice("Force pull: " + totalSynced + " items" + (failed ? ", " + failed + " failed" : ""));
+      this.plugin.logSync("pull", totalSynced, failed + rFail);
+      this.plugin.statusBar.setOk(Date.now(), totalSynced);
       const excludes = this.plugin.settings.excludePatterns;
-      const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/.obsidian/") || p.startsWith(".obsidian/");
+      const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
       let localRemoved = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
         if (f.extension === "md")
@@ -2321,10 +2338,7 @@ var SyncEngine = class {
         }
       }
       if (localRemoved)
-        console.log("[joplin-sync] force pull removed " + localRemoved + " stale local files");
-      new Notice("Force pull: " + done + " notes, " + failed + " failed" + (rDone ? ", " + rDone + " attachments" : ""));
-      this.plugin.logSync("pull", done, failed);
-      this.plugin.statusBar.setOk(Date.now(), done);
+        console.debug("[joplin-sync] force pull removed " + localRemoved + " stale local files");
     } catch (e) {
       const msg = e?.message || e?.toString() || "Unknown error";
       console.error("[joplin-sync] force pull failed:", msg);

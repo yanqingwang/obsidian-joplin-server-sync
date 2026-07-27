@@ -145,12 +145,13 @@ export class JoplinServerApi {
     if (res.status !== 200) throw new ApiError(res.status, res.text);
     if (!res.json) throw new ApiError(res.status, 'delta body is not JSON: ' + res.text.slice(0, 200));
     const raw = res.json as Record<string, unknown>;
-    const items = (raw.items as any[]) || [];
+    const items = (raw.items as unknown[]) || [];
     for (const item of items) {
-      if (item.item_name) item.name = item.item_name;
-      if (item.jop_updated_time) item.updated_time = item.jop_updated_time;
-      if (item.type !== undefined) item.type = Number(item.type);
-      if (item.item_type !== undefined) (item as any).item_type = Number(item.item_type);
+      const it = item as Record<string, unknown>;
+      if (it.item_name) it.name = it.item_name;
+      if (it.jop_updated_time) it.updated_time = it.jop_updated_time;
+      if (it.type !== undefined) it.type = Number(it.type);
+      if (it.item_type !== undefined) it.item_type = Number(it.item_type);
     }
     return { items, has_more: !!raw.has_more, cursor: raw.cursor as string | undefined } as unknown as Paginated<DeltaItem>;
   }

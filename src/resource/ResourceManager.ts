@@ -46,7 +46,7 @@ export class ResourceManager {
 
     const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
-    const st = (file.stat as any) || { ctime: now, mtime: now };
+    const st = (file.stat as unknown as { ctime: number; mtime: number }) ?? { ctime: now, mtime: now };
     await this.plugin.api.putItem('.resource/' + id, data);
     const meta: JoplinItem = {
       id, parent_id: '', title: file.name,

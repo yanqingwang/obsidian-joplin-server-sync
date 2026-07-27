@@ -301,7 +301,7 @@ export class SyncEngine {
           if (st && st.id) {
             this.plugin.mapping.upsert({
               joplinId: fid, path: dp + '/', type: ModelType.Folder,
-              localHash: '', remoteUpdatedTime: (st as any).updated_time || Date.now(), syncedAt: Date.now(),
+              localHash: '', remoteUpdatedTime: (st as unknown as { updated_time: number }).updated_time || Date.now(), syncedAt: Date.now(),
             });
             folderMap.set(dp, fid);
             pushedFolderIds.add(fid);

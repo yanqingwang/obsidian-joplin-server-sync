@@ -320,14 +320,15 @@ var JoplinServerApi = class {
     const raw = res.json;
     const items = raw.items || [];
     for (const item of items) {
-      if (item.item_name)
-        item.name = item.item_name;
-      if (item.jop_updated_time)
-        item.updated_time = item.jop_updated_time;
-      if (item.type !== void 0)
-        item.type = Number(item.type);
-      if (item.item_type !== void 0)
-        item.item_type = Number(item.item_type);
+      const it = item;
+      if (it.item_name)
+        it.name = it.item_name;
+      if (it.jop_updated_time)
+        it.updated_time = it.jop_updated_time;
+      if (it.type !== void 0)
+        it.type = Number(it.type);
+      if (it.item_type !== void 0)
+        it.item_type = Number(it.item_type);
     }
     return { items, has_more: !!raw.has_more, cursor: raw.cursor };
   }
@@ -883,7 +884,7 @@ var ResourceManager = class {
     }
     const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
-    const st = file.stat || { ctime: now, mtime: now };
+    const st = file.stat ?? { ctime: now, mtime: now };
     await this.plugin.api.putItem(".resource/" + id, data);
     const meta = {
       id,
@@ -1248,7 +1249,7 @@ var ConflictResolver = class {
 
 // src/core/pathUtil.ts
 function safeFileName(name) {
-  const cleaned = (name || "").replace(/[\/\\]/g, "_").replace(/[\x00-\x1f\x7f]/g, "").trim();
+  const cleaned = (name || "").replace(/[\\/]/g, "_").replace(/[\x00-\x1f\x7f]/g, "").trim();
   return cleaned || "Untitled";
 }
 
@@ -1364,7 +1365,7 @@ var DeltaPuller = class {
       return [];
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
-    if (probe.type_ === 9) {
+    if (Number(probe.type_) === 9) {
       e2ee.feedMasterKey(probe);
       return [];
     }
@@ -1464,7 +1465,7 @@ var DeltaPuller = class {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
     if (f) {
       this.watcher.suppress(f.path);
-      if (f instanceof import_obsidian7.TFile) {
+      if ("stat" in f) {
         this.plugin.app.fileManager.trashFile(f).catch(() => {
         });
       }

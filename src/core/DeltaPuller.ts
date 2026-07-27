@@ -25,7 +25,7 @@ export class DeltaPuller {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId) return true; // no root folder → accept everything (cursor filters stale data)
-    const hasFolders = this.plugin.mapping.all().some(e => e.type === 2);
+    const hasFolders = this.plugin.mapping.all().some(e => (e as unknown as { type: number }).type === 2);
     if (!hasFolders) return true;
 
     let pid = item.parent_id;
@@ -98,7 +98,7 @@ export class DeltaPuller {
 
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
-    if (probe.type_ === 9) { e2ee.feedMasterKey(probe); return []; }
+    if (Number(probe.type_) === 9) { e2ee.feedMasterKey(probe); return []; }
 
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
@@ -191,7 +191,7 @@ export class DeltaPuller {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
     if (f) {
       this.watcher.suppress(f.path);
-      if (f instanceof TFile) {
+      if ("stat" in f) {
         this.plugin.app.fileManager.trashFile(f).catch(() => {});
       }
       this.watcher.release(f.path);

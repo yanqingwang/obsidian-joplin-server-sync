@@ -872,9 +872,10 @@ var ResourceManager = class {
     const existing = this.plugin.mapping.getByPath(file.path);
     if (existing && existing.localHash === hash)
       return existing.joplinId;
-    const dedup = this.hashToId.get(hash);
-    if (dedup)
-      return dedup;
+    const dedupId = this.hashToId.get(hash);
+    const skipBlob = dedupId !== void 0;
+    const blobId = skipBlob ? dedupId : existing?.joplinId ?? createJoplinId();
+    const metaId = createJoplinId();
     const maxSize = this.plugin.settings.maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
     if (data.byteLength > maxSize)
       throw new Error("Attachment too large: " + file.path);
@@ -882,12 +883,13 @@ var ResourceManager = class {
     if (parentDir && !this.plugin.mapping.getByPath(parentDir + "/")) {
       await this.ensureRemoteFolder(parentDir);
     }
-    const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
     const st = file.stat ?? { ctime: now, mtime: now };
-    await this.plugin.api.putItem(".resource/" + id, data);
+    if (!skipBlob) {
+      await this.plugin.api.putItem(".resource/" + blobId, data);
+    }
     const meta = {
-      id,
+      id: metaId,
       parent_id: "",
       title: file.name,
       mime: MIME_MAP[file.extension.toLowerCase()] ?? "application/octet-stream",
@@ -905,17 +907,17 @@ var ResourceManager = class {
       encryption_applied: 0,
       encryption_cipher_text: ""
     };
-    const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(meta));
+    const res = await this.plugin.api.putItem(metaId + ".md", this.serializer.serialize(meta));
     this.plugin.mapping.upsert({
-      joplinId: id,
+      joplinId: metaId,
       path: file.path,
       type: 4 /* Resource */,
       localHash: hash,
       remoteUpdatedTime: res.updated_time,
       syncedAt: now
     });
-    this.hashToId.set(hash, id);
-    return id;
+    this.hashToId.set(hash, blobId);
+    return metaId;
   }
   /** Ensure a remote folder exists for the given vault-relative path */
   async ensureRemoteFolder(dirPath) {
@@ -960,15 +962,19 @@ var ResourceManager = class {
   }
   async downloadResource(meta) {
     const existing = this.plugin.mapping.getById(meta.id);
+    const correctPath = meta.filename ? (0, import_obsidian4.normalizePath)(meta.filename) : "";
     if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
-      if (this.plugin.app.vault.getAbstractFileByPath(existing.path))
+      if (correctPath && existing.path !== correctPath) {
+        this.plugin.mapping.remove(existing.joplinId);
+      } else if (this.plugin.app.vault.getAbstractFileByPath(existing.path)) {
         return existing.path;
+      }
     }
     const blob = await this.plugin.api.getItemBinary(".resource/" + meta.id);
     if (!blob)
       throw new Error("Resource blob missing: " + meta.id);
     const dir = this.plugin.settings.attachmentFolder || "attachments";
-    const relName = meta.filename && meta.filename.includes("/") ? meta.filename : dir + "/" + (meta.filename || meta.id + "." + (meta.file_extension || "bin"));
+    const relName = meta.filename ? meta.filename : dir + "/" + meta.id + "." + (meta.file_extension || "bin");
     let path = (0, import_obsidian4.normalizePath)(relName);
     const clash = this.plugin.mapping.getByPath(path);
     if (clash && clash.joplinId !== meta.id) {
@@ -1917,6 +1923,8 @@ var SyncEngine = class {
         if (!d)
           return;
         const parts = d.split("/");
+        if (parts.some((p) => p.startsWith(".")))
+          return;
         let accumulated = "";
         for (let i = 0; i < parts.length; i++) {
           accumulated = accumulated ? accumulated + "/" + parts[i] : parts[i];
@@ -1944,7 +1952,10 @@ var SyncEngine = class {
           try {
             const listing = await adapter.list(dir);
             for (const sub of listing.folders) {
-              const rel = dir ? dir + "/" + sub.split("/").pop() : sub.split("/").pop();
+              const folderName = sub.split("/").pop() || "";
+              if (folderName.startsWith("."))
+                continue;
+              const rel = dir ? dir + "/" + folderName : folderName;
               if (rel && !folderMap.has(rel)) {
                 const existing = this.plugin.mapping.getByPath(rel + "/");
                 if (existing) {
@@ -2015,6 +2026,7 @@ var SyncEngine = class {
               if (m)
                 pushedNoteIds.add(m.joplinId);
               done++;
+              this.plugin.statusBar.setProgress(done, files.length, "push");
             } catch (e) {
               fail++;
               console.error("[joplin-sync] upload fail [" + fail + "]:", file.path, e?.message || e);
@@ -2059,6 +2071,14 @@ var SyncEngine = class {
           const id = noteMatch[1];
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === 2 /* Folder */) {
+            if (!pushedFolderIds.has(id)) {
+              try {
+                await this.plugin.api.deleteItem(stat.name);
+                removed++;
+                removedFolders++;
+              } catch {
+              }
+            }
           } else if (entry?.type === 4 /* Resource */) {
             if (!pushedResourceIds.has(id)) {
               try {
@@ -2068,8 +2088,9 @@ var SyncEngine = class {
               } catch {
               }
             }
-          } else if (!this.plugin.settings.syncFoldersOnly) {
-            if (!pushedNoteIds.has(id)) {
+          } else {
+            const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
+            if (!inPushed && !this.plugin.settings.syncFoldersOnly) {
               try {
                 await this.plugin.api.deleteItem(stat.name);
                 removed++;
@@ -2444,13 +2465,12 @@ var SyncEngine = class {
     while (true) {
       const page = await this.plugin.api.listChildrenOf("", cursor);
       for (const it of page.items) {
-        const name = it.name || "";
-        if (!name)
-          continue;
-        out.push({ name, updated_time: Number(it.updated_time) || 0 });
+        out.push(it);
       }
       cursor = page.cursor;
       if (!page.has_more)
+        break;
+      if (!cursor)
         break;
     }
     return out;

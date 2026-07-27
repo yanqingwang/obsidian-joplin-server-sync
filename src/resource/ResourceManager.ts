@@ -32,8 +32,11 @@ export class ResourceManager {
     const hash = await sha256(data);
     const existing = this.plugin.mapping.getByPath(file.path);
     if (existing && existing.localHash === hash) return existing.joplinId;
-    const dedup = this.hashToId.get(hash);
-    if (dedup) return dedup;
+    const dedupId = this.hashToId.get(hash);
+    const skipBlob = dedupId !== undefined;
+    // Blob ID (reuse if deduped) and metadata ID (always unique per path)
+    const blobId = skipBlob ? dedupId : (existing?.joplinId ?? createJoplinId());
+    const metaId = createJoplinId();
 
     const maxSize = (this.plugin.settings as any).maxAttachmentMB * 1024 * 1024 || 100 * 1024 * 1024;
     if (data.byteLength > maxSize) throw new Error('Attachment too large: ' + file.path);
@@ -44,12 +47,11 @@ export class ResourceManager {
       await this.ensureRemoteFolder(parentDir);
     }
 
-    const id = existing?.joplinId ?? createJoplinId();
     const now = Date.now();
     const st = (file.stat as unknown as { ctime: number; mtime: number }) ?? { ctime: now, mtime: now };
-    await this.plugin.api.putItem('.resource/' + id, data);
+    if (!skipBlob) { await this.plugin.api.putItem('.resource/' + blobId, data); }
     const meta: JoplinItem = {
-      id, parent_id: '', title: file.name,
+      id: metaId, parent_id: '', title: file.name,
       mime: MIME_MAP[file.extension.toLowerCase()] ?? 'application/octet-stream',
       // Store the FULL relative path in `filename` so the pull side can
       // recreate the original folder structure (not flatten into one dir).
@@ -61,13 +63,13 @@ export class ResourceManager {
       user_created_time: st.ctime ?? now, user_updated_time: st.mtime ?? now,
       type_: ModelType.Resource, encryption_applied: 0, encryption_cipher_text: '',
     };
-    const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(meta));
+    const res = await this.plugin.api.putItem(metaId + '.md', this.serializer.serialize(meta));
     this.plugin.mapping.upsert({
-      joplinId: id, path: file.path, type: ModelType.Resource,
+      joplinId: metaId, path: file.path, type: ModelType.Resource,
       localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: now,
     });
-    this.hashToId.set(hash, id);
-    return id;
+    this.hashToId.set(hash, blobId);
+    return metaId;
   }
 
   /** Ensure a remote folder exists for the given vault-relative path */
@@ -103,17 +105,21 @@ export class ResourceManager {
 
   async downloadResource(meta: JoplinItem): Promise<string> {
     const existing = this.plugin.mapping.getById(meta.id);
-    // Skip only if mapped AND file exists on disk
+    const correctPath = meta.filename ? normalizePath(meta.filename) : '';
+    // Skip only if mapped AND file exists on disk AT THE CORRECT PATH
     if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
-      if (this.plugin.app.vault.getAbstractFileByPath(existing.path)) return existing.path;
+      if (correctPath && existing.path !== correctPath) {
+        // Path changed (e.g. old version used attachments/) — re-download to correct path
+        this.plugin.mapping.remove(existing.joplinId);
+      } else if (this.plugin.app.vault.getAbstractFileByPath(existing.path)) {
+        return existing.path;
+      }
     }
     const blob = await this.plugin.api.getItemBinary('.resource/' + meta.id);
     if (!blob) throw new Error('Resource blob missing: ' + meta.id);
 
     const dir = this.plugin.settings.attachmentFolder || 'attachments';
-    // Recreate the original relative path when available (filename carries the
-    // full vault-relative path), otherwise fall back to attachmentFolder.
-    const relName = (meta.filename && meta.filename.includes('/')) ? meta.filename : (dir + '/' + (meta.filename || (meta.id + '.' + (meta.file_extension || 'bin'))));
+    const relName = meta.filename ? meta.filename : (dir + '/' + meta.id + '.' + (meta.file_extension || 'bin'));
     let path = normalizePath(relName);
     const clash = this.plugin.mapping.getByPath(path);
     if (clash && clash.joplinId !== meta.id) {

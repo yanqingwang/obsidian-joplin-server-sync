@@ -240,6 +240,8 @@ export class SyncEngine {
         const d = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
         if (!d) return;
         const parts = d.split('/');
+        // Skip if any part starts with . (hidden directories)
+        if (parts.some(p => p.startsWith('.'))) return;
         let accumulated = '';
         for (let i = 0; i < parts.length; i++) {
           accumulated = accumulated ? accumulated + '/' + parts[i] : parts[i];
@@ -269,7 +271,9 @@ export class SyncEngine {
           try {
             const listing = await (adapter as any).list(dir);
             for (const sub of listing.folders) {
-              const rel = dir ? dir + '/' + sub.split('/').pop() : sub.split('/').pop();
+              const folderName = sub.split('/').pop() || '';
+              if (folderName.startsWith('.')) continue; // skip hidden dirs
+              const rel = dir ? dir + '/' + folderName : folderName;
               if (rel && !folderMap.has(rel)) {
                 const existing = this.plugin.mapping.getByPath(rel + '/');
                 if (existing) {
@@ -328,6 +332,7 @@ export class SyncEngine {
               const m = this.plugin.mapping.getByPath(file.path);
               if (m) pushedNoteIds.add(m.joplinId);
               done++;
+              this.plugin.statusBar.setProgress(done, files.length, 'push');
             } catch (e: any) {
               fail++;
               console.error('[joplin-sync] upload fail [' + fail + ']:', file.path, e?.message || e);
@@ -372,11 +377,15 @@ export class SyncEngine {
           const id = noteMatch[1];
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === ModelType.Folder) {
-            // Keep folders — never delete them during cleanup
+            if (!pushedFolderIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedFolders++; } catch { /* ignore */ } }
           } else if (entry?.type === ModelType.Resource) {
             if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedResources++; } catch { /* ignore */ } }
-          } else if (!this.plugin.settings.syncFoldersOnly) {
-            if (!pushedNoteIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedNotes++; } catch { /* ignore */ } }
+          } else {
+            // Delete any item not in our pushed sets (notes, stale, or unknown)
+            const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
+            if (!inPushed && !this.plugin.settings.syncFoldersOnly) {
+              try { await this.plugin.api.deleteItem(stat.name); removed++; removedNotes++; } catch { /* ignore */ }
+            }
           }
         } else {
           // resource blob: cleanup orphans so the server stays in sync
@@ -700,12 +709,11 @@ export class SyncEngine {
     while (true) {
       const page = await this.plugin.api.listChildrenOf('', cursor);
       for (const it of page.items) {
-        const name = (it as any).name || '';
-        if (!name) continue;
-        out.push({ name, updated_time: Number((it as any).updated_time) || 0 });
+        out.push(it);
       }
-      cursor = (page as any).cursor;
-      if (!(page as any).has_more) break;
+      cursor = page.cursor;
+      if (!page.has_more) break;
+      if (!cursor) break; // safety: no cursor but has_more = prevent infinite loop
     }
     return out;
   }

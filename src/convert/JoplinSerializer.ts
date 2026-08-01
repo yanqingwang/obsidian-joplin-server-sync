@@ -23,6 +23,16 @@ const RESOURCE_FIELD_ORDER = [
   'blob_updated_time', 'ocr_text', 'ocr_details', 'ocr_status', 'ocr_error', 'type_',
 ];
 
+// Joplin Server stores a MasterKey item (type_=9) with the encrypted key in the
+// `content` field (plus `encryption_method` / `checksum`) — NOT in
+// `encryption_cipher_text` (which is reserved for notes/resources). The server
+// re-serializes master keys on store, so we must emit this exact shape or the
+// cipher text is dropped on write.
+const MASTER_KEY_FIELD_ORDER = [
+  'id', 'created_time', 'updated_time', 'user_created_time', 'user_updated_time',
+  'encryption_method', 'checksum', 'content', 'type_',
+];
+
 const TIME_FIELDS = new Set([
   'created_time', 'updated_time', 'user_created_time', 'user_updated_time',
 ]);
@@ -44,7 +54,7 @@ export class JoplinSerializer {
 
     lines.push(item.title ?? '');
     lines.push('');
-    if (item.type_ === ModelType.Note) {
+    if (item.type_ === ModelType.Note || item.type_ === ModelType.MasterKey) {
       lines.push(item.body ?? '');
       lines.push('');
     }
@@ -74,7 +84,7 @@ export class JoplinSerializer {
 
     const headerBody = lines.slice(0, bodyEndIndex);
     item.title = headerBody[0] ?? '';
-    if (item.type_ === ModelType.Note) {
+    if (item.type_ === ModelType.Note || item.type_ === ModelType.MasterKey) {
       item.body = headerBody.slice(2).join('\n');
     }
     item.type_ = Number(item.type_);
@@ -86,6 +96,7 @@ export class JoplinSerializer {
       case ModelType.Note: return NOTE_FIELD_ORDER;
       case ModelType.Folder: return FOLDER_FIELD_ORDER;
       case ModelType.Resource: return RESOURCE_FIELD_ORDER;
+      case ModelType.MasterKey: return MASTER_KEY_FIELD_ORDER;
       default: return NOTE_FIELD_ORDER;
     }
   }

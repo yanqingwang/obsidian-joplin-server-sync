@@ -10,6 +10,12 @@ export class MockVault {
     if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
   }
 
+  configDir = '.obsidian';
+  on(_event: string, _cb: (...args: any[]) => any): { unload: () => void } {
+    return { unload: () => {} };
+  }
+  off(_event: string, _cb: (...args: any[]) => any): void { /* noop */ }
+
   private abs(p: string): string {
     return path.join(this.root, p.replace(/^\/+/, ''));
   }

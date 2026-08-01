@@ -31,6 +31,11 @@ export interface JoplinItem {
   // Joplin NoteTag specifics
   note_id?: string;
   tag_id?: string;
+  // MasterKey-specific: encrypted key blob lives in `content` (not
+  // `encryption_cipher_text`, which is for notes/resources).
+  content?: string;
+  encryption_method?: number;
+  checksum?: string;
   // Tolerate unknown fields for forward compatibility
   [key: string]: unknown;
 }

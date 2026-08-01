@@ -16,6 +16,7 @@ interface MappingData {
   rootFolderId: string;
   entries: MappingEntry[];
   tombstones: { joplinId: string; type: ModelType; deletedAt: number }[];
+  e2eeMasterKeyId?: string;
 }
 
 export class MappingStore {
@@ -105,6 +106,9 @@ export class MappingStore {
     }
     this.dirty = true;
   }
+
+  get e2eeMasterKeyId(): string | undefined { return this.data.e2eeMasterKeyId; }
+  setE2eeMasterKeyId(id: string): void { this.data.e2eeMasterKeyId = id; this.dirty = true; }
 
   private rebuildIndexes(): void {
     this.byId.clear();

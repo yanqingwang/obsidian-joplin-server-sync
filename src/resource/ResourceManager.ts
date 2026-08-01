@@ -47,7 +47,6 @@ export class ResourceManager {
 
     const now = Date.now();
     const st = (file.stat as unknown as { ctime: number; mtime: number }) ?? { ctime: now, mtime: now };
-    await this.plugin.api.putItem('.resource/' + metaId, data);
     const meta: JoplinItem = {
       id: metaId, parent_id: '', title: file.name,
       mime: MIME_MAP[file.extension.toLowerCase()] ?? 'application/octet-stream',
@@ -61,6 +60,29 @@ export class ResourceManager {
       user_created_time: st.ctime ?? now, user_updated_time: st.mtime ?? now,
       type_: ModelType.Resource, encryption_applied: 0, encryption_cipher_text: '',
     };
+
+    // E2EE: encrypt the blob AND the metadata item if a master key is loaded.
+    const e2ee = this.plugin.e2ee;
+    const mkId = e2ee.activeKeyId ?? e2ee.firstLoadedKeyId;
+    const encrypt = this.plugin.engine.e2eeActive && !!mkId;
+    if (encrypt) {
+      const blobCipher = await e2ee.encryptBlobData(data, mkId);
+      await this.plugin.api.putItem('.resource/' + metaId, blobCipher);
+      const ct = await e2ee.encryptItem(this.serializer.serialize(meta), mkId);
+      const encMeta: JoplinItem = {
+        id: metaId, parent_id: '', title: '',
+        created_time: now, updated_time: now, user_created_time: now, user_updated_time: now,
+        type_: ModelType.Resource, encryption_applied: 1, encryption_cipher_text: ct,
+      };
+      const res = await this.plugin.api.putItem(metaId + '.md', this.serializer.serialize(encMeta));
+      this.plugin.mapping.upsert({
+        joplinId: metaId, path: file.path, type: ModelType.Resource,
+        localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: now,
+      });
+      return metaId;
+    }
+
+    await this.plugin.api.putItem('.resource/' + metaId, data);
     const res = await this.plugin.api.putItem(metaId + '.md', this.serializer.serialize(meta));
     this.plugin.mapping.upsert({
       joplinId: metaId, path: file.path, type: ModelType.Resource,
@@ -112,11 +134,28 @@ export class ResourceManager {
         return existing.path;
       }
     }
+    const e2ee = this.plugin.e2ee;
+    // The E2EE signal must come from the SERVER item (meta), because once we
+    // decrypt the metadata below, metaToUse is the plaintext original whose
+    // encryption_applied is 0 — so it can no longer tell us the blob is sealed.
+    const resourceIsEncrypted = e2ee.isEncrypted(meta);
+    let metaToUse = meta;
+    if (resourceIsEncrypted) {
+      const ds = await e2ee.decryptItem(meta);
+      if (ds) metaToUse = this.serializer.unserialize(ds);
+    }
+
     const blob = await this.plugin.api.getItemBinary('.resource/' + meta.id);
     if (!blob) throw new Error('Resource blob missing: ' + meta.id);
 
+    // E2EE: decrypt the blob if the resource was encrypted.
+    let plainBlob: ArrayBuffer = blob;
+    if (resourceIsEncrypted) {
+      plainBlob = await e2ee.decryptBlobData(blob);
+    }
+
     const dir = this.plugin.settings.attachmentFolder || 'attachments';
-    const relName = meta.filename ? meta.filename : (dir + '/' + meta.id + '.' + (meta.file_extension || 'bin'));
+    const relName = metaToUse.filename ? metaToUse.filename : (dir + '/' + meta.id + '.' + (metaToUse.file_extension || 'bin'));
     let path = normalizePath(relName);
     const clash = this.plugin.mapping.getByPath(path);
     if (clash && clash.joplinId !== meta.id) {
@@ -124,7 +163,7 @@ export class ResourceManager {
       if (!this.plugin.app.vault.getAbstractFileByPath(path)) {
         this.plugin.mapping.remove(clash.joplinId);
       } else {
-        path = normalizePath(dir + '/' + meta.id.slice(0, 7) + '_' + (meta.filename || (meta.id + '.' + (meta.file_extension || 'bin'))));
+        path = normalizePath(dir + '/' + meta.id.slice(0, 7) + '_' + (metaToUse.filename || (meta.id + '.' + (metaToUse.file_extension || 'bin'))));
       }
     }
 
@@ -136,8 +175,8 @@ export class ResourceManager {
         try { await this.plugin.app.vault.createFolder(parentDir); } catch {/* empty */}
       }
       const f = this.plugin.app.vault.getAbstractFileByPath(path);
-      if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, blob);
-      else await this.plugin.app.vault.createBinary(path, blob);
+      if (f instanceof TFile) await this.plugin.app.vault.modifyBinary(f, plainBlob);
+      else await this.plugin.app.vault.createBinary(path, plainBlob);
     };
     if (watcher?.suppress) {
       watcher.suppress(path);
@@ -147,8 +186,8 @@ export class ResourceManager {
     }
     this.plugin.mapping.upsert({
       joplinId: meta.id, path, type: ModelType.Resource,
-      localHash: await sha256(blob),
-      remoteUpdatedTime: meta.blob_updated_time ?? meta.updated_time,
+      localHash: await sha256(plainBlob),
+      remoteUpdatedTime: metaToUse.blob_updated_time ?? metaToUse.updated_time,
       syncedAt: Date.now(),
     });
     return path;

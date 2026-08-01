@@ -37,6 +37,96 @@ export class SyncEngine {
     this.resources = new ResourceManager(plugin);
   }
 
+  /**
+   * Provision + load the E2EE master key so the live sync path can encrypt.
+   *
+   * Driven by the LOCAL `e2eePassword` setting (not the server's info.json),
+   * so enabling E2EE here is a local decision:
+   *   1. If a master key already exists on the server, feed + load it.
+   *   2. Otherwise generate a fresh master key, upload it (type_=9), and mark
+   *      the sync target as E2EE-enabled.
+   *   3. Load every fed master key with the password and set `e2eeActive`.
+   */
+  async enableE2EE(): Promise<boolean> {
+    const pw = this.plugin.settings.e2eePassword;
+    if (!pw) { this.e2eeActive = false; return false; }
+    // Keys already loaded this session — keep them active.
+    if (this.plugin.e2ee.hasLoadedKeys) { this.e2eeActive = true; return true; }
+
+    const e2ee = this.plugin.e2ee;
+
+    // Fast path: a known master-key id is cached locally — load just that one
+    // item instead of enumerating the whole server (which is one GET per item).
+    const cachedId = this.plugin.mapping.e2eeMasterKeyId;
+    if (cachedId) {
+      try {
+        const raw = await this.plugin.api.getItem(cachedId + '.md');
+        if (raw) {
+          const item = this.serializer.unserialize(raw);
+          if (item.type_ === ModelType.MasterKey) {
+            e2ee.feedMasterKey(item);
+            await e2ee.loadMasterKey(cachedId, pw);
+            this.e2eeActive = true;
+            console.log('[joplin-sync] E2EE active (cached key ' + cachedId + ')');
+            return true;
+          }
+        }
+      } catch (e: unknown) {
+        console.warn('[joplin-sync] E2EE cached key ' + cachedId + ' failed: ' + (e instanceof Error ? e.message : String(e)));
+      }
+    }
+
+    // Slow path: enumerate the server to discover any master keys.
+    const mkIds = await this.discoverMasterKeys();
+    let anyLoaded = false;
+    for (const id of mkIds) {
+      try { await e2ee.loadMasterKey(id, pw); anyLoaded = true; }
+      catch (e: unknown) {
+        console.warn('[joplin-sync] E2EE master key ' + id + ' failed to load: ' + (e instanceof Error ? e.message : String(e)));
+      }
+    }
+    // If none loaded (none exist, or all stale/corrupt), provision a fresh one.
+    if (!anyLoaded) {
+      const mkId = createJoplinId();
+      const mk = await e2ee.generateMasterKey(pw, mkId);
+      await this.plugin.api.putItem(mkId + '.md', this.serializer.serialize({
+        id: mkId, type_: ModelType.MasterKey, content: mk.encryptedContent, encryption_cipher_text: '', encryption_applied: 0,
+      } as any), true);
+      e2ee.feedMasterKey({ id: mkId, type_: 9, content: mk.encryptedContent } as any);
+      try { await e2ee.loadMasterKey(mkId, pw); anyLoaded = true; } catch { /* ignore */ }
+      this.plugin.mapping.setE2eeMasterKeyId(mkId);
+      // Mark the sync target as E2EE-enabled for cross-client visibility.
+      try { await this.plugin.api.putItem('info.json', JSON.stringify({ version: 3, e2ee: { value: true } })); } catch { /* best effort */ }
+      console.log('[joplin-sync] E2EE: generated + uploaded new master key ' + mkId);
+    }
+    this.e2eeActive = anyLoaded;
+    if (anyLoaded) console.log('[joplin-sync] E2EE active with ' + e2ee.availableMasterKeys.length + ' master key(s)');
+    else new Notice('E2EE enabled but master key could not be loaded — check E2EE password');
+    return anyLoaded;
+  }
+
+  /** Find existing MasterKey items (type_=9) on the server. */
+  private async discoverMasterKeys(): Promise<string[]> {
+    const e2ee = this.plugin.e2ee;
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    while (true) {
+      // NOTE: this Joplin Server ignores the `item_type` query param on the
+      // children endpoint, so we enumerate everything and filter by type_.
+      const page = await this.plugin.api.listChildrenOf('', cursor);
+      for (const stat of page.items) {
+        if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith('.resource/')) continue;
+        const raw = await this.plugin.api.getItem(stat.name);
+        if (!raw) continue;
+        const item = this.serializer.unserialize(raw);
+        if (item.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(item); ids.push(item.id); }
+      }
+      cursor = page.cursor;
+      if (!page.has_more || !cursor) break;
+    }
+    return ids;
+  }
+
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload(): Promise<void> {
     if (this.running) { new Notice('Sync already in progress'); return; }
@@ -45,6 +135,7 @@ export class SyncEngine {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      await this.enableE2EE();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
       const failed: string[] = [];
@@ -81,21 +172,42 @@ export class SyncEngine {
       user_created_time: file.stat.ctime, user_updated_time: file.stat.mtime,
       type_: ModelType.Note, encryption_applied: 0, encryption_cipher_text: '', markup_language: 1,
     };
-    const payload = this.serializer.serialize(item);
+
+    // E2EE: encrypt the serialized note if a master key is loaded.
+    const mkId = this.plugin.e2ee.activeKeyId ?? this.plugin.e2ee.firstLoadedKeyId;
+    let payload: string;
+    let encrypted = false;
+    if (this.e2eeActive && mkId) {
+      const serialized = this.serializer.serialize(item);
+      const cipherText = await this.plugin.e2ee.encryptItem(serialized, mkId);
+      const encItem: JoplinItem = {
+        id, parent_id: parentId, title: '', body: '',
+        created_time: item.created_time, updated_time: item.updated_time,
+        user_created_time: item.user_created_time, user_updated_time: item.user_updated_time,
+        type_: ModelType.Note, encryption_applied: 1, encryption_cipher_text: cipherText, markup_language: 1,
+      };
+      payload = this.serializer.serialize(encItem);
+      encrypted = true;
+    } else {
+      payload = this.serializer.serialize(item);
+    }
     const result = await this.plugin.api.putItem(id + '.md', payload, force);
 
-    // Write-then-verify: GET back and compare hash (non-fatal, log only)
-    try {
-      const raw = await this.plugin.api.getItem(id + '.md');
-      if (raw) {
-        const remote = this.serializer.unserialize(raw);
-        const remoteHash = await sha256(remote.body ?? '');
-        if (remoteHash !== hash) {
-          console.warn('[joplin-sync] verify mismatch for: ' + file.path + ' (expected ' + hash + ', got ' + remoteHash + ')');
+    // Write-then-verify: GET back and compare hash (only meaningful for
+    // plaintext; when encrypted the remote body is empty, so skip the check).
+    if (!encrypted) {
+      try {
+        const raw = await this.plugin.api.getItem(id + '.md');
+        if (raw) {
+          const remote = this.serializer.unserialize(raw);
+          const remoteHash = await sha256(remote.body ?? '');
+          if (remoteHash !== hash) {
+            console.warn('[joplin-sync] verify mismatch for: ' + file.path + ' (expected ' + hash + ', got ' + remoteHash + ')');
+          }
         }
+      } catch (verifyErr: unknown) {
+        console.warn('[joplin-sync] verify skipped for: ' + file.path + ' - ' + (verifyErr instanceof Error ? verifyErr.message : String(verifyErr)));
       }
-    } catch (verifyErr: unknown) {
-      console.warn('[joplin-sync] verify skipped for: ' + file.path + ' - ' + (verifyErr instanceof Error ? verifyErr.message : String(verifyErr)));
     }
 
     this.plugin.mapping.upsert({
@@ -158,6 +270,7 @@ export class SyncEngine {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      await this.enableE2EE();
 
       if (!this.plugin.mapping.getDeltaCursor()) {
         this.plugin.statusBar.setSyncing('initial sync...');
@@ -219,6 +332,7 @@ export class SyncEngine {
       await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      await this.enableE2EE();
 
       const rootFolderId = '';
       const files = this.collectMarkdownFiles();
@@ -431,6 +545,7 @@ export class SyncEngine {
     try {
       this.plugin.statusBar.setSyncing('force pull: clearing local...');
       await this.plugin.api.login();
+      await this.enableE2EE();
 
       // Delete ALL files and folders except config directory
       const adapter = this.plugin.app.vault.adapter;

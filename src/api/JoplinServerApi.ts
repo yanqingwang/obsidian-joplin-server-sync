@@ -130,9 +130,12 @@ export class JoplinServerApi {
     return res.json as unknown as Paginated<RemoteItemStat>;
   }
 
-  async listChildrenOf(parentId: string, cursor?: string): Promise<Paginated<RemoteItemStat>> {
+  async listChildrenOf(parentId: string, cursor?: string, itemType?: number): Promise<Paginated<RemoteItemStat>> {
     const base = parentId ? '/api/items/root:/' + parentId + ':/children' : '/api/items/root:/:/children';
-    const q = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
+    const params: string[] = [];
+    if (cursor) params.push('cursor=' + encodeURIComponent(cursor));
+    if (itemType !== undefined) params.push('item_type=' + itemType);
+    const q = params.length ? '?' + params.join('&') : '';
     const res = await this.exec('GET', base + q);
     if (res.status !== 200) throw new ApiError(res.status, res.text);
     if (!res.json) throw new ApiError(res.status, 'listChildrenOf body is not JSON: ' + res.text.slice(0, 200));

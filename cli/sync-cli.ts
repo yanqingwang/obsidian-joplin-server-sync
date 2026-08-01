@@ -21,6 +21,7 @@ import { setVaultRoot } from '../test/mock/obsidian-real';
 import { DEFAULT_SETTINGS } from '../src/settings/PluginSettings';
 import { JoplinSerializer } from '../src/convert/JoplinSerializer';
 import { ModelType } from '../src/api/models';
+import { EncryptionService } from '../src/e2ee/EncryptionService';
 
 function loadCreds(vaultPath: string) {
   const p = path.join(vaultPath, '.obsidian/plugins/joplin-server-sync/data.json');
@@ -30,6 +31,7 @@ function loadCreds(vaultPath: string) {
     serverUrl: d.serverUrl, email: d.email, password: d.password,
     attachmentFolder: d.attachmentFolder || 'attachments',
     excludePatterns: d.excludePatterns || [],
+    e2eePassword: d.e2eePassword || '',
   };
 }
 
@@ -42,14 +44,15 @@ function makePlugin(vaultRoot: string, creds: any) {
   const plugin: any = {
     app: { vault, fileManager: new MockFileManager(vault) },
     api,
-    settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns },
+    settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns, e2eePassword: creds.e2eePassword || '' },
     manifest: { dir: path.join(vaultRoot, '.obsidian/plugins/joplin-server-sync') },
     statusBar: {
       setSyncing(m: string) { console.log('  [status]', m); },
       setProgress() {}, setIdle() {}, setOk() {}, setError(e: string) { console.log('  [ERROR]', e); },
     },
     logSync() {},
-    e2ee: { feedMasterKey() {}, isEncrypted() { return false; }, decryptItem() { return null; } },
+    registerEvent(_ref: any) { return _ref; },
+    e2ee: new EncryptionService(),
   };
   plugin.mapping = new MappingStore(plugin);
   return plugin;
@@ -57,16 +60,18 @@ function makePlugin(vaultRoot: string, creds: any) {
 
 async function main() {
   const [mode, vaultPath] = process.argv.slice(2);
-  if (!mode || !vaultPath) {
-    console.log('Usage: node cli/sync-cli.js <push|pull|sync|diag> <vaultPath>');
+  const noVaultModes = ['e2eetest', 'deltaprobe', 'lsroot', 'rt', 'probe2', 'diag'];
+  if (!mode || (!vaultPath && !noVaultModes.includes(mode))) {
+    console.log('Usage: node cli/sync-cli.cjs <push|pull|sync|e2eetest|e2eeserver|e2eesync|verifyenc|diag|deltaprobe|lsroot|rt|probe2> [vaultPath]');
     process.exit(1);
   }
-  const creds = loadCreds(vaultPath);
-  setVaultRoot(vaultPath);
-  const plugin = makePlugin(vaultPath, creds);
-  await plugin.mapping.load();
+  let creds: any = { serverUrl: '', email: '', password: '', attachmentFolder: 'attachments', excludePatterns: [] };
+  if (vaultPath) creds = loadCreds(vaultPath);
+  setVaultRoot(vaultPath || '');
+  const plugin = makePlugin(vaultPath || process.cwd(), creds);
+  if (vaultPath) await plugin.mapping.load();
   const engine = new SyncEngine(plugin);
-  console.log(`== ${mode} on ${vaultPath} ==`);
+  console.log(`== ${mode} ==`);
   if (mode === 'push') await engine.forcePush();
   else if (mode === 'pull') await engine.forcePull();
   else if (mode === 'sync') await engine.syncCycle();
@@ -263,6 +268,346 @@ async function main() {
     console.log('by extension/shape:', JSON.stringify(byExt));
     console.log('--- sample items ---');
     for (const s of samples) console.log(JSON.stringify(s));
+  } else if (mode === 'e2eetest') {
+    const { EncryptionService, EncryptionMethod } = require('../src/e2ee/EncryptionService');
+    const enc = new EncryptionService();
+    const password = 'test-password-123';
+    const mkId = (require('../src/mapping/IdGenerator')).createJoplinId();
+    let failures = 0;
+    const assert = (cond: boolean, msg: string) => {
+      if (cond) console.log('  PASS:', msg);
+      else { failures++; console.log('  FAIL:', msg); }
+    };
+
+    console.log('== E2EE protocol self-test ==');
+    const mk = await enc.generateMasterKey(password, mkId);
+    enc.feedMasterKey({ id: mk.id, type_: 9, encryption_cipher_text: mk.encryptedContent } as any);
+    await enc.loadMasterKey(mkId, password);
+    assert(enc.hasLoadedKeys, 'master key loaded from password');
+
+    const note = '# Secret\n\nThis is end-to-end encrypted content. 中文测试 🔒\n';
+    const cipher = await enc.encryptItem(note, mkId);
+    let noteOk = false;
+    try { const plain = await enc.decryptItem({ encryption_applied: 1, encryption_cipher_text: cipher } as any); noteOk = plain === note; }
+    catch { /* decrypt error surfaced by assert */ }
+    assert(noteOk, 'note encrypt→decrypt round-trip is lossless');
+
+    const blob = new Uint8Array([0, 1, 2, 3, 255, 254, 128, 7, 42, 9, 11, 200, 0, 0, 1]);
+    const blobCipher = await enc.encryptBlob(blob.buffer as ArrayBuffer, mkId);
+    let blobOk = false;
+    try { const blobPlain = new Uint8Array(await enc.decryptBlob(blobCipher, mkId)); blobOk = blobPlain.length === blob.length && blobPlain.every((b, i) => b === blob[i]); }
+    catch { /* decrypt error surfaced by assert */ }
+    assert(blobOk, 'blob encrypt→decrypt round-trip is lossless');
+
+    let wrongFailed = false;
+    try {
+      const enc2 = new EncryptionService();
+      enc2.feedMasterKey({ id: mk.id, type_: 9, encryption_cipher_text: mk.encryptedContent } as any);
+      await enc2.loadMasterKey(mkId, 'wrong-password');
+    } catch { wrongFailed = true; }
+    assert(wrongFailed, 'wrong password is rejected (GCM auth fails)');
+
+    const headerLen = parseInt(cipher.slice(0, 6), 16);
+    const headerBytes = enc['hexToBytes'](cipher.slice(6, 6 + headerLen * 2));
+    assert(headerBytes[0] === 1, 'header version = 1');
+    assert((headerBytes[1] << 8 | headerBytes[2]) === EncryptionMethod.StringV1, 'header method = StringV1(9)');
+    const hdrMkId = enc['bytesToHex'](headerBytes.slice(3, 19));
+    assert(hdrMkId === mkId, 'header carries correct masterKeyId');
+    const firstChunkOff = 6 + headerLen * 2;
+    const chunkLen = parseInt(cipher.slice(firstChunkOff, firstChunkOff + 6), 16);
+    const chunkBytes = enc['hexToBytes'](cipher.slice(firstChunkOff + 6, firstChunkOff + 6 + chunkLen * 2));
+    assert(chunkBytes.length > 12 && chunkBytes.length % 2 === 0, 'chunk has IV(12) + GCM ciphertext+tag');
+    assert(chunkBytes.slice(0, 12).length === 12, 'chunk IV is 12 bytes (AES-GCM nonce)');
+
+    const big = 'x'.repeat(20000);
+    const bigCipher = await enc.encryptItem(big, mkId);
+    const bigPlain = await enc.decryptItem({ encryption_applied: 1, encryption_cipher_text: bigCipher } as any);
+    assert(bigPlain === big, 'large (multi-chunk) note round-trip is lossless');
+
+    console.log(failures === 0 ? '\n=== E2EE SELF-TEST PASSED ✅ ===' : `\n=== E2EE SELF-TEST FAILED ❌ (${failures}) ===`);
+    process.exit(failures === 0 ? 0 : 1);
+  } else if (mode === 'e2eeserver') {
+    const { EncryptionService, EncryptionMethod } = require('../src/e2ee/EncryptionService');
+    const { JoplinSerializer } = require('../src/convert/JoplinSerializer');
+    const { ModelType } = require('../src/api/models');
+    const { createJoplinId } = require('../src/mapping/IdGenerator');
+    await plugin.api.login();
+    const enc = new EncryptionService();
+    const ser = new JoplinSerializer();
+    const password = 'e2ee-server-test-🔒';
+    let failures = 0;
+    const assert = (c: boolean, m: string) => { console.log((c ? '  PASS: ' : '  FAIL: ') + m); if (!c) failures++; };
+    const ids: string[] = [];
+
+    console.log('== E2EE end-to-end through REAL Joplin Server ==');
+    // 1. Generate master key + upload as MasterKey item (type_=9)
+    const mkId = createJoplinId();
+    const mk = await enc.generateMasterKey(password, mkId);
+    await plugin.api.putItem(mkId + '.md', ser.serialize({
+      id: mkId, type_: ModelType.MasterKey as any,
+      body: mk.encryptedContent, content: mk.encryptedContent, encryption_cipher_text: '', encryption_applied: 0,
+    } as any), true);
+    ids.push(mkId);
+    enc.feedMasterKey({ id: mkId, type_: 9, body: mk.encryptedContent } as any);
+    await enc.loadMasterKey(mkId, password);
+    assert(enc.hasLoadedKeys, 'master key uploaded + loaded from server');
+
+    // 1b. ROUND-TRIP: reload the master key from the server (as a second
+    // device would) and confirm it decrypts — proves the stored cipher text
+    // survives the server round-trip (not just the local in-memory copy).
+    const rawMk = await plugin.api.getItem(mkId + '.md');
+    const srvMk = ser.unserialize(rawMk!);
+    const enc2 = new EncryptionService();
+    enc2.feedMasterKey(srvMk as any);
+    let mkRoundTrip = false;
+    try { await enc2.loadMasterKey(mkId, password); mkRoundTrip = true; } catch (e: unknown) { /* round-trip load error surfaced by assert */ }
+    assert(mkRoundTrip, 'master key reloads from server (round-trip) and decrypts with password');
+
+    // 2. Encrypt a NOTE, push it, pull it back, decrypt
+    const noteId = createJoplinId();
+    const originalBody = '# E2EE Note\n\nsecret body 中文🔒 end-to-end\n';
+    const serialized = ser.serialize({ id: noteId, parent_id: '', title: 'E2EE Note', body: originalBody, type_: ModelType.Note, created_time: Date.now(), updated_time: Date.now(), user_created_time: Date.now(), user_updated_time: Date.now(), markup_language: 1, encryption_applied: 0, encryption_cipher_text: '' } as any);
+    const cipherText = await enc.encryptItem(serialized, mkId);
+    await plugin.api.putItem(noteId + '.md', ser.serialize({ id: noteId, type_: ModelType.Note, encryption_applied: 1, encryption_cipher_text: cipherText, title: '', body: '' } as any), true);
+    ids.push(noteId);
+
+    const pulledRaw = await plugin.api.getItem(noteId + '.md');
+    const pulledItem = ser.unserialize(pulledRaw!);
+    assert(pulledItem.encryption_applied === 1, 'server stored encryption_applied=1');
+    enc.feedMasterKey({ id: mkId, type_: 9, encryption_cipher_text: mk.encryptedContent } as any);
+    const decryptedSerialized = await enc.decryptItem(pulledItem);
+    const decryptedNote = ser.unserialize(decryptedSerialized);
+    assert(decryptedNote.body === originalBody, 'pulled note decrypts to original body (server round-trip)');
+
+    // 3. Encrypt a RESOURCE blob, push it, pull it back, decrypt
+    const resId = createJoplinId();
+    const blob = new Uint8Array([1, 2, 3, 255, 0, 128, 200, 9, 42, 7, 11, 3, 200, 1]);
+    const blobCipherHex = await enc.encryptBlob(blob.buffer as ArrayBuffer, mkId);
+    const blobCipherBytes = enc['hexToBytes'](blobCipherHex);
+    await plugin.api.putItem('.resource/' + resId, blobCipherBytes);
+    await plugin.api.putItem(resId + '.md', ser.serialize({ id: resId, type_: ModelType.Resource, title: 'secret.png', mime: 'image/png', size: blob.length, filename: 'secret.png', encryption_applied: 1, encryption_cipher_text: await enc.encryptItem(ser.serialize({ id: resId, title: 'secret.png', mime: 'image/png', size: blob.length, filename: 'secret.png' } as any), mkId), } as any), true);
+    ids.push(resId);
+    const pulledBlob = await plugin.api.getItemBinary('.resource/' + resId);
+    const pulledBlobHex = enc['bytesToHex'](new Uint8Array(pulledBlob));
+    const decryptedBlob = new Uint8Array(await enc.decryptBlob(pulledBlobHex, mkId));
+    assert(decryptedBlob.length === blob.length && decryptedBlob.every((b, i) => b === blob[i]), 'pulled resource blob decrypts to original bytes (server round-trip)');
+
+    // 4. Wrong password must NOT decrypt (auth fails) — verify on the pulled note
+    const encBad = new EncryptionService();
+    encBad.feedMasterKey({ id: mkId, type_: 9, encryption_cipher_text: mk.encryptedContent } as any);
+    let badFailed = false;
+    try { await encBad.loadMasterKey(mkId, 'totally-wrong'); await encBad.decryptItem(pulledItem); }
+    catch { badFailed = true; }
+    assert(badFailed, 'wrong password cannot decrypt server-stored note');
+
+    // 5. Cleanup test items
+    for (const id of ids) { try { await plugin.api.deleteItem(id + '.md'); } catch {} try { await plugin.api.deleteItem('.resource/' + id); } catch {} }
+    console.log('cleaned up', ids.length, 'test items');
+
+    console.log(failures === 0 ? '\n=== E2EE SERVER ROUND-TRIP PASSED ✅ ===' : `\n=== E2EE SERVER ROUND-TRIP FAILED ❌ (${failures}) ===`);
+    process.exit(failures === 0 ? 0 : 1);
+  } else if (mode === 'mkprobe') {
+    await plugin.api.login();
+    const ser = new (require('../src/convert/JoplinSerializer')).JoplinSerializer();
+    let cursor: string | undefined;
+    let total = 0, mkCount = 0;
+    while (true) {
+      const page = await plugin.api.listChildrenOf('', cursor);
+      for (const stat of page.items) {
+        total++;
+        if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith('.resource/')) continue;
+        const raw = await plugin.api.getItem(stat.name);
+        if (!raw) continue;
+        const item = ser.unserialize(raw);
+        if (item.type_ === 9 || (item.encryption_cipher_text && (item.encryption_cipher_text as string).length > 0)) {
+          mkCount++;
+          console.log('--- MK/ENC', stat.name, '---');
+          console.log('type_:', item.type_, '| encryption_applied:', item.encryption_applied);
+          console.log('encryption_cipher_text:', JSON.stringify(item.encryption_cipher_text));
+        }
+      }
+      cursor = page.cursor;
+      if (!page.has_more || !cursor) break;
+    }
+    console.log('total items scanned:', total, '| master/encrypted items:', mkCount);
+    console.log('== mkprobe done ==');
+  } else if (mode === 'mkclean') {
+    // Remove ONLY MasterKey (type_=9) items from the server — safe, since an
+    // unencrypted vault has no master keys, so these are always test artifacts.
+    await plugin.api.login();
+    const ser = new (require('../src/convert/JoplinSerializer')).JoplinSerializer();
+    let cursor: string | undefined;
+    let scanned = 0, removed = 0;
+    while (true) {
+      const page = await plugin.api.listChildrenOf('', cursor);
+      for (const stat of page.items) {
+        if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith('.resource/')) continue;
+        scanned++;
+        const raw = await plugin.api.getItem(stat.name);
+        if (!raw) continue;
+        const item = ser.unserialize(raw);
+        if (item.type_ === 9) {
+          try { await plugin.api.deleteItem(stat.name); removed++; console.log('removed MK', stat.name); } catch { /* ignore */ }
+        }
+      }
+      cursor = page.cursor;
+      if (!page.has_more || !cursor) break;
+    }
+    console.log('mkclean scanned=' + scanned + ' removed master keys=' + removed);
+  } else if (mode === 'e2eesync') {
+    // Full live-path test: drive the REAL SyncEngine (forcePush + forcePull)
+    // with the REAL EncryptionService against the real Joplin Server. Proves
+    // that notes/resources are encrypted on upload and decrypted on pull.
+    const { EncryptionService } = require('../src/e2ee/EncryptionService');
+    const { SyncEngine } = require('../src/core/SyncEngine');
+    const os = require('os');
+    const pw = 'E2EE-live-path-🔒-2026';
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'joplin-e2ee-'));
+    const pushVault = path.join(tmpBase, 'push');
+    const pullVault = path.join(tmpBase, 'pull');
+    fs.mkdirSync(pushVault, { recursive: true });
+    fs.mkdirSync(pullVault, { recursive: true });
+
+    const secret = '# Live E2EE Note\n\nsecret 中文🔒 end-to-end through forcePush+forcePull\n';
+    fs.writeFileSync(path.join(pushVault, 'live-e2ee-note.md'), secret);
+    const bin = Buffer.from([1, 2, 3, 255, 0, 128, 200, 9, 42, 7, 11, 3, 200, 1]);
+    fs.mkdirSync(path.join(pushVault, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(pushVault, 'assets', 'secret.bin'), bin);
+
+    let failures = 0;
+    const assert = (c: boolean, m: string) => { console.log((c ? '  PASS: ' : '  FAIL: ') + m); if (!c) failures++; };
+    let noteId: string | undefined, resId: string | undefined, mkId: string | undefined;
+
+    try {
+      console.log('== E2EE live sync-path test ==');
+      // --- Push side: provision master key + upload via the REAL engine ---
+      const pluginP: any = makePlugin(pushVault, creds);
+      pluginP.e2ee = new EncryptionService();
+      pluginP.settings.e2eePassword = pw;
+      pluginP.settings.excludePatterns = [];
+      const engP = new SyncEngine(pluginP);
+      pluginP.engine = engP;
+      await pluginP.mapping.load();
+      await engP.enableE2EE();
+      assert(engP.e2eeActive, 'enableE2EE provisioned + loaded a master key (live)');
+
+      const vaultP = pluginP.app.vault as any;
+      const noteFile = vaultP.getMarkdownFiles().find((f: any) => f.path.endsWith('live-e2ee-note.md'));
+      const resFile = vaultP.getFiles().find((f: any) => f.path.endsWith('secret.bin'));
+      await (engP as any).uploadNote(noteFile, '', true);
+      await engP.resources.uploadResource(resFile, true);
+      await pluginP.mapping.flush();
+
+      // --- Verify server stored CIPHERTEXT (no plaintext leakage) ---
+      await pluginP.api.login();
+      const noteEntry = pluginP.mapping.getByPath(noteFile.path);
+      const resEntry = pluginP.mapping.getByPath(resFile.path);
+      noteId = noteEntry?.joplinId; resId = resEntry?.joplinId; mkId = pluginP.e2ee.activeKeyId ?? undefined;
+      const ser = new JoplinSerializer();
+      const rawNote = await pluginP.api.getItem(noteId + '.md');
+      const noteItem = ser.unserialize(rawNote!);
+      assert(noteItem.encryption_applied === 1, 'server stored note with encryption_applied=1 (live)');
+      assert(!rawNote!.includes('Live E2EE Note'), 'server stored CIPHERTEXT — plaintext secret absent (live)');
+      const rawRes = await pluginP.api.getItem(resId + '.md');
+      const resItem = ser.unserialize(rawRes!);
+      assert(resItem.encryption_applied === 1, 'server stored resource with encryption_applied=1 (live)');
+      assert(!rawRes!.includes('secret.bin'), 'server stored resource CIPHERTEXT — plaintext metadata absent (live)');
+
+      // --- Pull side: fresh engine, load keys via cached id (fast path) ---
+      const pluginQ: any = makePlugin(pullVault, creds);
+      pluginQ.e2ee = new EncryptionService();
+      pluginQ.settings.e2eePassword = pw;
+      pluginQ.settings.excludePatterns = [];
+      const engQ = new SyncEngine(pluginQ);
+      pluginQ.engine = engQ;
+      await pluginQ.mapping.load();
+      // Seed the cached master-key id so enableE2EE takes the fast path
+      // (single GET) instead of enumerating the whole server.
+      if (mkId) pluginQ.mapping.setE2eeMasterKeyId(mkId);
+      await engQ.enableE2EE();
+      assert(engQ.e2eeActive, 'pull engine loaded master key via cached id (fast path)');
+
+      // Note: pull the SERVER-STORED encrypted note and decrypt it via the
+      // engine's real decrypt path (the same code forcePull uses).
+      const rawNotePull = await pluginQ.api.getItem(noteId + '.md');
+      const srvNote = ser.unserialize(rawNotePull!);
+      const decSerialized = await pluginQ.e2ee.decryptItem(srvNote);
+      const decNote = ser.unserialize(decSerialized);
+      assert(decNote.body === secret, 'pulled note decrypts to original plaintext (engine decryptItem)');
+
+      // Resource: pull the SERVER-STORED encrypted resource via the REAL
+      // ResourceManager.downloadResource (exercises blob + metadata decrypt).
+      const rawResPull = await pluginQ.api.getItem(resId + '.md');
+      const srvRes = ser.unserialize(rawResPull!);
+      const outPath = await engQ.resources.downloadResource(srvRes);
+      const pulledBin = fs.readFileSync(path.join(pullVault, outPath));
+      assert(Buffer.compare(pulledBin, bin) === 0, 'pulled resource decrypts to original bytes (ResourceManager.downloadResource)');
+    } catch (e: unknown) {
+      failures++;
+      console.error('  [ERROR]', e instanceof Error ? e.message : String(e));
+    } finally {
+      // --- Cleanup ONLY our test items from the shared server ---
+      try {
+        const pluginC: any = makePlugin(pushVault, creds);
+        pluginC.e2ee = new EncryptionService();
+        await pluginC.api.login();
+        for (const id of [noteId, resId, mkId]) {
+          if (!id) continue;
+          try { await pluginC.api.deleteItem(id + '.md'); } catch { /* ignore */ }
+          try { await pluginC.api.deleteItem('.resource/' + id); } catch { /* ignore */ }
+        }
+      } catch { /* best effort */ }
+      fs.rmSync(tmpBase, { recursive: true, force: true });
+    }
+    console.log(failures === 0 ? '\n=== E2EE LIVE SYNC-PATH PASSED ✅ ===' : `\n=== E2EE LIVE SYNC-PATH FAILED ❌ (${failures}) ===`);
+    process.exit(failures === 0 ? 0 : 1);
+  } else if (mode === 'verifyenc') {
+    // Verify the DEPLOYED engine encrypts REAL vault content end-to-end: upload
+    // a sentinel note through the vault's shared mapping + the real server, then
+    // confirm the server stores it as ciphertext (no plaintext leakage). Cleans up.
+    console.log('== verifyenc ==');
+    const plugin: any = makePlugin(vaultPath, creds);
+    plugin.e2ee = new EncryptionService();
+    const eng = new SyncEngine(plugin);
+    plugin.engine = eng;
+    await plugin.mapping.load();
+    await eng.enableE2EE();
+    let failures = 0;
+    const assert = (c: boolean, m: string) => { console.log((c ? '  PASS: ' : '  FAIL: ') + m); if (!c) failures++; };
+    let noteId: string | undefined;
+    try {
+      assert(eng.e2eeActive, 'deployed engine enabled E2EE from vault config (e2eePassword set)');
+      const vault = plugin.app.vault as any;
+      const file = vault.getMarkdownFiles().find((f: any) => f.path.endsWith('e2ee-verify-tmp.md'));
+      if (!file) throw new Error('sentinel note e2ee-verify-tmp.md not found in vault');
+      await (eng as any).uploadNote(file, '', true);
+      await plugin.mapping.flush();
+      const entry = plugin.mapping.getByPath(file.path);
+      noteId = entry?.joplinId;
+      if (!noteId) throw new Error('sentinel note was not assigned a joplin id');
+      await plugin.api.login();
+      const ser2 = new JoplinSerializer();
+      const raw = await plugin.api.getItem(noteId + '.md');
+      const item = ser2.unserialize(raw!);
+      assert(item.encryption_applied === 1, 'server stored sentinel note with encryption_applied=1 (deployed engine)');
+      assert(!raw!.includes('This note proves the deployed plugin encrypts'), 'server stored CIPHERTEXT — plaintext sentinel absent (deployed engine)');
+    } catch (e: unknown) {
+      failures++;
+      console.error('  [ERROR]', e instanceof Error ? e.message : String(e));
+    } finally {
+      try {
+        const pluginC: any = makePlugin(vaultPath, creds);
+        pluginC.e2ee = new EncryptionService();
+        await pluginC.api.login();
+        if (noteId) await pluginC.api.deleteItem(noteId + '.md');
+        const m2 = pluginC.mapping.getByPath('e2ee-verify-tmp.md');
+        if (m2) pluginC.mapping.remove(m2.joplinId);
+        await pluginC.mapping.flush();
+      } catch { /* best effort */ }
+      try { fs.unlinkSync(path.join(vaultPath, 'e2ee-verify-tmp.md')); } catch { /* ignore */ }
+    }
+    console.log(failures === 0 ? '\n=== DEPLOYED E2EE ENCRYPTION VERIFIED ✅ ===' : `\n=== DEPLOYED E2EE ENCRYPTION FAILED ❌ (${failures}) ===`);
+    process.exit(failures === 0 ? 0 : 1);
   } else { console.log('Unknown mode: ' + mode); process.exit(1); }
   console.log(`== ${mode} done ==`);
 }

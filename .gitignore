@@ -4,3 +4,4 @@ data.json
 .obsidian/
 test/*-out.cjs
 test/*-out.mjs
+cli/run-real-plugin.cjs

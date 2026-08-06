@@ -135,9 +135,10 @@ export class ResourceManager {
       }
     }
     const e2ee = this.plugin.e2ee;
-    // The E2EE signal must come from the SERVER item (meta), because once we
-    // decrypt the metadata below, metaToUse is the plaintext original whose
-    // encryption_applied is 0 — so it can no longer tell us the blob is sealed.
+    // The blob's own header decides encryption — the meta passed in may
+    // already be decrypted by the caller (forcePull decrypts collected items),
+    // so meta.encryption_applied is not a reliable signal. JED01 is the fixed
+    // prefix of every E2EE cipher text, so sniff the blob bytes directly.
     const resourceIsEncrypted = e2ee.isEncrypted(meta);
     let metaToUse = meta;
     if (resourceIsEncrypted) {
@@ -148,9 +149,12 @@ export class ResourceManager {
     const blob = await this.plugin.api.getItemBinary('.resource/' + meta.id);
     if (!blob) throw new Error('Resource blob missing: ' + meta.id);
 
-    // E2EE: decrypt the blob if the resource was encrypted.
+    // E2EE: decrypt the blob when its content carries the JED01 header,
+    // regardless of the (possibly already-decrypted) meta flag.
+    const blobHead = new TextDecoder().decode(blob.slice(0, 5));
+    const blobIsEncrypted = blobHead === 'JED01';
     let plainBlob: ArrayBuffer = blob;
-    if (resourceIsEncrypted) {
+    if (blobIsEncrypted) {
       plainBlob = await e2ee.decryptBlobData(blob);
     }
 

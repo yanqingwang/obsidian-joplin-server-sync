@@ -710,8 +710,10 @@ var init_ResourceManager = __esm({
         const blob = await this.plugin.api.getItemBinary(".resource/" + meta.id);
         if (!blob)
           throw new Error("Resource blob missing: " + meta.id);
+        const blobHead = new TextDecoder().decode(blob.slice(0, 5));
+        const blobIsEncrypted = blobHead === "JED01";
         let plainBlob = blob;
-        if (resourceIsEncrypted) {
+        if (blobIsEncrypted) {
           plainBlob = await e2ee.decryptBlobData(blob);
         }
         const dir = this.plugin.settings.attachmentFolder || "attachments";

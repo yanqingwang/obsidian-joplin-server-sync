@@ -1937,38 +1937,49 @@ var init_SyncEngine = __esm({
           }
           const adapter = this.plugin.app.vault.adapter;
           const typedAdapter = adapter;
+          const excludes = this.plugin.settings.excludePatterns;
+          const isExcludedDir = (rel) => excludes.some((e) => (rel + "/").startsWith(e));
           if (adapter && typedAdapter.list) {
             const walkDirs = async (dir) => {
               try {
                 const listing = await typedAdapter.list(dir);
+                let hasSyncable = false;
+                for (const f of listing.files) {
+                  const base = f.split("/").pop() || "";
+                  if (base.startsWith("."))
+                    continue;
+                  const rel = dir ? dir + "/" + base : base;
+                  if (excludes.some((e) => rel.startsWith(e)))
+                    continue;
+                  hasSyncable = true;
+                }
                 for (const sub of listing.folders) {
                   const folderName = sub.split("/").pop() || "";
                   if (folderName.startsWith("."))
                     continue;
                   const rel = dir ? dir + "/" + folderName : folderName;
-                  let hasFiles = listing.files.length > 0;
-                  const subListing = await typedAdapter.list(sub).catch(() => null);
-                  if (subListing && (subListing.files.length > 0 || subListing.folders.length > 0)) {
-                    hasFiles = true;
-                  }
-                  if (!hasFiles)
+                  if (isExcludedDir(rel))
                     continue;
-                  if (rel && !folderMap.has(rel)) {
-                    const existing = this.plugin.mapping.getByPath(rel + "/");
-                    if (existing) {
-                      folderMap.set(rel, existing.joplinId);
-                      pushedFolderIds.add(existing.joplinId);
-                    } else {
-                      dirs.add(rel);
+                  const subHas = await walkDirs(sub);
+                  if (subHas) {
+                    hasSyncable = true;
+                    if (!folderMap.has(rel)) {
+                      const existing = this.plugin.mapping.getByPath(rel + "/");
+                      if (existing) {
+                        folderMap.set(rel, existing.joplinId);
+                        pushedFolderIds.add(existing.joplinId);
+                      } else {
+                        dirs.add(rel);
+                      }
                     }
                   }
-                  await walkDirs(sub);
                 }
+                return hasSyncable;
               } catch {
+                return false;
               }
             };
-            await walkDirs("").catch(() => {
-            });
+            await walkDirs("");
           }
           let folderCount = 0;
           for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
@@ -2039,8 +2050,8 @@ var init_SyncEngine = __esm({
           const pushedResourceIds = /* @__PURE__ */ new Set();
           let rDone = 0, rFail = 0;
           if (!this.plugin.settings.syncFoldersOnly) {
-            const excludes = this.plugin.settings.excludePatterns;
-            const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
+            const excludes2 = this.plugin.settings.excludePatterns;
+            const isExcluded = (p) => excludes2.some((e) => p.startsWith(e)) || p.includes("/" + this.configDir + "/") || p.startsWith(this.configDir + "/");
             const allFiles = this.plugin.app.vault.getFiles();
             const resourceFiles = allFiles.filter((f) => f.extension !== "md" && !isExcluded(f.path));
             if (resourceFiles.length > 0) {

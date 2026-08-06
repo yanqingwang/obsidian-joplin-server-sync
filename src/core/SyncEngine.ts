@@ -48,6 +48,8 @@ export class SyncEngine {
    *   3. Load every fed master key with the password and set `e2eeActive`.
    */
   async enableE2EE(): Promise<boolean> {
+    // Both the toggle AND a non-empty password are required.
+    if (!this.plugin.settings.e2eeEnabled) { this.e2eeActive = false; return false; }
     const pw = this.plugin.settings.e2eePassword;
     if (!pw) { this.e2eeActive = false; return false; }
     // Keys already loaded this session — keep them active.

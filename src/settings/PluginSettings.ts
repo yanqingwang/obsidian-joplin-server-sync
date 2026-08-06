@@ -21,6 +21,7 @@ export interface PluginSettings {
   clientId: string;
   logLevel: 'error' | 'info' | 'debug';
   syncLog: SyncLogEntry[];
+  e2eeEnabled: boolean;
   e2eePassword: string;
 }
 
@@ -38,5 +39,6 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   clientId: '',
   logLevel: 'info',
   syncLog: [],
+  e2eeEnabled: false,
   e2eePassword: '',
 };

@@ -1558,6 +1558,10 @@ var init_SyncEngine = __esm({
        *   3. Load every fed master key with the password and set `e2eeActive`.
        */
       async enableE2EE() {
+        if (!this.plugin.settings.e2eeEnabled) {
+          this.e2eeActive = false;
+          return false;
+        }
         const pw = this.plugin.settings.e2eePassword;
         if (!pw) {
           this.e2eeActive = false;
@@ -3442,6 +3446,7 @@ var DEFAULT_SETTINGS = {
   clientId: "",
   logLevel: "info",
   syncLog: [],
+  e2eeEnabled: false,
   e2eePassword: ""
 };
 
@@ -3459,6 +3464,7 @@ function loadCreds(vaultPath) {
     password: d.password,
     attachmentFolder: d.attachmentFolder || "attachments",
     excludePatterns: d.excludePatterns || [],
+    e2eeEnabled: d.e2eeEnabled === true,
     e2eePassword: d.e2eePassword || ""
   };
 }
@@ -3473,7 +3479,7 @@ function makePlugin(vaultRoot2, creds) {
   const plugin = {
     app: { vault, fileManager: new MockFileManager(vault) },
     api,
-    settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns, e2eePassword: creds.e2eePassword || "" },
+    settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns, e2eeEnabled: creds.e2eeEnabled === true, e2eePassword: creds.e2eePassword || "" },
     manifest: { dir: path3.join(vaultRoot2, ".obsidian/plugins/joplin-server-sync") },
     statusBar: {
       setSyncing(m) {
@@ -4007,6 +4013,7 @@ async function main() {
       const pluginP = makePlugin(pushVault, creds);
       pluginP.e2ee = new EncryptionService2();
       pluginP.settings.e2eePassword = pw;
+      pluginP.settings.e2eeEnabled = true;
       pluginP.settings.excludePatterns = [];
       const engP = new SyncEngine2(pluginP);
       pluginP.engine = engP;
@@ -4037,6 +4044,7 @@ async function main() {
       const pluginQ = makePlugin(pullVault, creds);
       pluginQ.e2ee = new EncryptionService2();
       pluginQ.settings.e2eePassword = pw;
+      pluginQ.settings.e2eeEnabled = true;
       pluginQ.settings.excludePatterns = [];
       const engQ = new SyncEngine2(pluginQ);
       pluginQ.engine = engQ;
@@ -4237,8 +4245,8 @@ async function main() {
     assert(remoteFolders === localDirs.size, "folder count matches (" + localDirs.size + " local dirs vs " + remoteFolders + " remote folders)");
     assert(localNonMd.length === 0 ? true : remoteBlobs >= localNonMd.length, "resource blobs cover non-md files (" + localNonMd.length + " local vs " + remoteBlobs + " remote)");
     assert(remoteContent <= localTotal + remoteMk + remoteFolders + 2, "no runaway duplicates on server (remote " + remoteContent + " \u2264 local " + localTotal + " + infra)");
-    if (creds.e2eePassword) {
-      console.log("  E2EE: e2eePassword configured \u2014 checking ciphertext...");
+    if (creds.e2eeEnabled && creds.e2eePassword) {
+      console.log("  E2EE: enabled + password set \u2014 checking ciphertext...");
       let sampleChecked = 0, sampleEncrypted = 0, plaintextLeak = 0;
       cursor = void 0;
       while (true) {
@@ -4272,7 +4280,7 @@ async function main() {
         console.log("  (no encrypted notes found on server to sample)");
       }
     } else {
-      console.log("  E2EE: no e2eePassword configured \u2014 skipping ciphertext check");
+      console.log("  E2EE: disabled or no password \u2014 skipping ciphertext check");
     }
     console.log(failures === 0 ? "\n=== VERIFYCOUNT PASSED \u2705 ===" : `
 === VERIFYCOUNT FAILED \u274C (${failures}) ===`);

@@ -45,6 +45,7 @@ var DEFAULT_SETTINGS = {
   clientId: "",
   logLevel: "info",
   syncLog: [],
+  e2eeEnabled: false,
   e2eePassword: ""
 };
 
@@ -114,17 +115,24 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("End-to-end encryption").setHeading();
+    new import_obsidian.Setting(containerEl).setName("Enable E2EE").setDesc("Encrypt notes and attachments before uploading to the server. Requires a password.").addToggle((t) => t.setValue(this.plugin.settings.e2eeEnabled).onChange(async (v) => {
+      this.plugin.settings.e2eeEnabled = v;
+      await this.plugin.saveSettings();
+      this.display();
+    }));
     const e2eeStatus = this.plugin.e2ee.hasLoadedKeys ? "Keys loaded (" + this.plugin.e2ee.availableMasterKeys.length + " master key(s))" : "No keys loaded";
     new import_obsidian.Setting(containerEl).setName("Status").setDesc(e2eeStatus);
-    new import_obsidian.Setting(containerEl).setName("E2EE password").setDesc("Enter your Joplin E2EE password to decrypt items").addText((t) => {
+    const e2eeOn = this.plugin.settings.e2eeEnabled;
+    new import_obsidian.Setting(containerEl).setName("E2EE password").setDesc(e2eeOn ? "Enter your Joplin E2EE password to encrypt/decrypt items" : "Enable E2EE first to set the password").addText((t) => {
       t.inputEl.type = "password";
       t.setPlaceholder("E2EE password");
+      t.setDisabled(!e2eeOn);
       t.setValue(this.plugin.settings.e2eePassword).onChange(async (v) => {
         this.plugin.settings.e2eePassword = v;
         await this.plugin.saveSettings();
       });
     });
-    new import_obsidian.Setting(containerEl).setName("Load E2EE keys").addButton((b) => b.setButtonText("Load keys").setCta().onClick(async () => {
+    new import_obsidian.Setting(containerEl).setName("Load E2EE keys").addButton((b) => b.setButtonText("Load keys").setCta().setDisabled(!e2eeOn).onClick(async () => {
       b.setDisabled(true).setButtonText("Loading\u2026");
       try {
         const pw = this.plugin.settings.e2eePassword;
@@ -1798,6 +1806,10 @@ var SyncEngine = class {
    *   3. Load every fed master key with the password and set `e2eeActive`.
    */
   async enableE2EE() {
+    if (!this.plugin.settings.e2eeEnabled) {
+      this.e2eeActive = false;
+      return false;
+    }
     const pw = this.plugin.settings.e2eePassword;
     if (!pw) {
       this.e2eeActive = false;

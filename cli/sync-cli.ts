@@ -31,6 +31,7 @@ function loadCreds(vaultPath: string) {
     serverUrl: d.serverUrl, email: d.email, password: d.password,
     attachmentFolder: d.attachmentFolder || 'attachments',
     excludePatterns: d.excludePatterns || [],
+    e2eeEnabled: d.e2eeEnabled === true,
     e2eePassword: d.e2eePassword || '',
   };
 }
@@ -44,7 +45,7 @@ function makePlugin(vaultRoot: string, creds: any) {
   const plugin: any = {
     app: { vault, fileManager: new MockFileManager(vault) },
     api,
-    settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns, e2eePassword: creds.e2eePassword || '' },
+    settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns, e2eeEnabled: creds.e2eeEnabled === true, e2eePassword: creds.e2eePassword || '' },
     manifest: { dir: path.join(vaultRoot, '.obsidian/plugins/joplin-server-sync') },
     statusBar: {
       setSyncing(m: string) { console.log('  [status]', m); },
@@ -485,6 +486,7 @@ async function main() {
       const pluginP: any = makePlugin(pushVault, creds);
       pluginP.e2ee = new EncryptionService();
       pluginP.settings.e2eePassword = pw;
+      pluginP.settings.e2eeEnabled = true;
       pluginP.settings.excludePatterns = [];
       const engP = new SyncEngine(pluginP);
       pluginP.engine = engP;
@@ -518,6 +520,7 @@ async function main() {
       const pluginQ: any = makePlugin(pullVault, creds);
       pluginQ.e2ee = new EncryptionService();
       pluginQ.settings.e2eePassword = pw;
+      pluginQ.settings.e2eeEnabled = true;
       pluginQ.settings.excludePatterns = [];
       const engQ = new SyncEngine(pluginQ);
       pluginQ.engine = engQ;
@@ -694,8 +697,8 @@ async function main() {
     assert(remoteContent <= localTotal + remoteMk + remoteFolders + 2, 'no runaway duplicates on server (remote ' + remoteContent + ' ≤ local ' + localTotal + ' + infra)');
 
     // E2EE ciphertext check
-    if (creds.e2eePassword) {
-      console.log('  E2EE: e2eePassword configured — checking ciphertext...');
+    if (creds.e2eeEnabled && creds.e2eePassword) {
+      console.log('  E2EE: enabled + password set — checking ciphertext...');
       let sampleChecked = 0, sampleEncrypted = 0, plaintextLeak = 0;
       cursor = undefined;
       while (true) {
@@ -723,7 +726,7 @@ async function main() {
         console.log('  (no encrypted notes found on server to sample)');
       }
     } else {
-      console.log('  E2EE: no e2eePassword configured — skipping ciphertext check');
+      console.log('  E2EE: disabled or no password — skipping ciphertext check');
     }
 
     console.log(failures === 0 ? '\n=== VERIFYCOUNT PASSED ✅ ===' : `\n=== VERIFYCOUNT FAILED ❌ (${failures}) ===`);

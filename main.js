@@ -118,6 +118,11 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Enable E2EE").setDesc("Encrypt notes and attachments before uploading to the server. Requires a password.").addToggle((t) => t.setValue(this.plugin.settings.e2eeEnabled).onChange(async (v) => {
       this.plugin.settings.e2eeEnabled = v;
       await this.plugin.saveSettings();
+      if (v) {
+        new import_obsidian.Notice("E2EE enabled. Set the password below, then run Force push to re-upload everything encrypted.", 8e3);
+      } else {
+        new import_obsidian.Notice("E2EE disabled. Run Force push to overwrite the server with plaintext (existing encrypted server data will be deleted). Other synced clients must also disable E2EE.", 1e4);
+      }
       this.display();
     }));
     const e2eeStatus = this.plugin.e2ee.hasLoadedKeys ? "Keys loaded (" + this.plugin.e2ee.availableMasterKeys.length + " master key(s))" : "No keys loaded";
@@ -1823,6 +1828,7 @@ var SyncEngine = class {
     }
     const e2ee = this.plugin.e2ee;
     const cachedId = this.plugin.mapping.e2eeMasterKeyId;
+    let cachedOk = false;
     if (cachedId) {
       try {
         const raw = await this.plugin.api.getItem(cachedId + ".md");
@@ -1831,9 +1837,8 @@ var SyncEngine = class {
           if (item.type_ === 9 /* MasterKey */) {
             e2ee.feedMasterKey(item);
             await e2ee.loadMasterKey(cachedId, pw);
-            this.e2eeActive = true;
-            console.log("[joplin-sync] E2EE active (cached key " + cachedId + ")");
-            return true;
+            cachedOk = true;
+            console.log("[joplin-sync] E2EE cached key " + cachedId + " loaded");
           }
         }
       } catch (e) {
@@ -1841,7 +1846,7 @@ var SyncEngine = class {
       }
     }
     const mkIds = await this.discoverMasterKeys();
-    let anyLoaded = false;
+    let anyLoaded = cachedOk;
     for (const id of mkIds) {
       try {
         await e2ee.loadMasterKey(id, pw);
@@ -1850,7 +1855,7 @@ var SyncEngine = class {
         console.warn("[joplin-sync] E2EE master key " + id + " failed to load: " + (e instanceof Error ? e.message : String(e)));
       }
     }
-    if (!anyLoaded) {
+    if (!anyLoaded && mkIds.length === 0) {
       const mkId = createJoplinId();
       const mk = await e2ee.generateMasterKey(pw, mkId);
       await this.plugin.api.putItem(mkId + ".md", this.serializer.serialize({
@@ -1871,13 +1876,13 @@ var SyncEngine = class {
         await this.plugin.api.putItem("info.json", JSON.stringify({ version: 3, e2ee: { value: true } }));
       } catch {
       }
-      console.log("[joplin-sync] E2EE: generated + uploaded new master key " + mkId);
+      console.log("[joplin-sync] E2EE: generated + uploaded first master key " + mkId);
+    } else if (!anyLoaded && mkIds.length > 0) {
+      new import_obsidian9.Notice("E2EE password is wrong \u2014 none of the " + mkIds.length + " server master keys could be decrypted. Check the password.");
     }
     this.e2eeActive = anyLoaded;
     if (anyLoaded)
       console.log("[joplin-sync] E2EE active with " + e2ee.availableMasterKeys.length + " master key(s)");
-    else
-      new import_obsidian9.Notice("E2EE enabled but master key could not be loaded \u2014 check E2EE password");
     return anyLoaded;
   }
   /** Find existing MasterKey items (type_=9) on the server. */
@@ -2418,6 +2423,18 @@ var SyncEngine = class {
       this.plugin.statusBar.setSyncing("force pull: clearing local...");
       await this.plugin.api.login();
       await this.enableE2EE();
+      if (!this.e2eeActive) {
+        const encCount = await this.countServerEncrypted();
+        if (encCount > 0) {
+          this.running = false;
+          await this.plugin.mapping.flush();
+          const msg = "Server has " + encCount + " E2EE-encrypted item(s) but E2EE is disabled. Enable E2EE + enter the password to pull, or Force Push to overwrite the server with plaintext.";
+          console.error("[joplin-sync] force pull blocked: " + msg);
+          this.plugin.statusBar.setError(msg);
+          new import_obsidian9.Notice(msg, 1e4);
+          return;
+        }
+      }
       const adapter = this.plugin.app.vault.adapter;
       const kept = [this.configDir];
       const isKept = (p) => kept.some((k) => p === k || p.startsWith(k + "/"));
@@ -2759,6 +2776,22 @@ var SyncEngine = class {
         break;
     }
     return out;
+  }
+  /** Count server items that carry E2EE ciphertext (encryption_applied=1). */
+  async countServerEncrypted() {
+    const remote = await this.listAllRemoteItems();
+    let count = 0;
+    for (const stat of remote) {
+      if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith(".resource/"))
+        continue;
+      try {
+        const raw = await this.plugin.api.getItem(stat.name);
+        if (raw && raw.includes("encryption_applied: 1"))
+          count++;
+      } catch {
+      }
+    }
+    return count;
   }
 };
 async function sha256(text) {

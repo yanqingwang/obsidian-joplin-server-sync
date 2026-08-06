@@ -57,9 +57,13 @@ export class SyncEngine {
 
     const e2ee = this.plugin.e2ee;
 
-    // Fast path: a known master-key id is cached locally — load just that one
-    // item instead of enumerating the whole server (which is one GET per item).
+    // Fast path: try the cached master-key id first (cheap single GET). If it
+    // loads, keep it active — but still enumerate below so that ALL server
+    // master keys are available for decrypting data encrypted with any of
+    // them. One account may accumulate several keys over time; a pull must be
+    // able to decrypt data regardless of which key a push used.
     const cachedId = this.plugin.mapping.e2eeMasterKeyId;
+    let cachedOk = false;
     if (cachedId) {
       try {
         const raw = await this.plugin.api.getItem(cachedId + '.md');
@@ -68,9 +72,8 @@ export class SyncEngine {
           if (item.type_ === ModelType.MasterKey) {
             e2ee.feedMasterKey(item);
             await e2ee.loadMasterKey(cachedId, pw);
-            this.e2eeActive = true;
-            console.log('[joplin-sync] E2EE active (cached key ' + cachedId + ')');
-            return true;
+            cachedOk = true;
+            console.log('[joplin-sync] E2EE cached key ' + cachedId + ' loaded');
           }
         }
       } catch (e: unknown) {
@@ -78,17 +81,22 @@ export class SyncEngine {
       }
     }
 
-    // Slow path: enumerate the server to discover any master keys.
+    // Slow path: enumerate the server and load EVERY master key that the
+    // password can decrypt. One account has ONE E2EE password — if master
+    // keys exist, we only VERIFY the password against them. Never mint a new
+    // key when any exist.
     const mkIds = await this.discoverMasterKeys();
-    let anyLoaded = false;
+    let anyLoaded = cachedOk;
     for (const id of mkIds) {
       try { await e2ee.loadMasterKey(id, pw); anyLoaded = true; }
       catch (e: unknown) {
         console.warn('[joplin-sync] E2EE master key ' + id + ' failed to load: ' + (e instanceof Error ? e.message : String(e)));
       }
     }
-    // If none loaded (none exist, or all stale/corrupt), provision a fresh one.
-    if (!anyLoaded) {
+    // Only when the server has NO master key at all do we provision the first
+    // one. If keys exist but none match the password, the password is wrong —
+    // surface that instead of silently creating a divergent key.
+    if (!anyLoaded && mkIds.length === 0) {
       const mkId = createJoplinId();
       const mk = await e2ee.generateMasterKey(pw, mkId);
       await this.plugin.api.putItem(mkId + '.md', this.serializer.serialize({
@@ -99,11 +107,12 @@ export class SyncEngine {
       this.plugin.mapping.setE2eeMasterKeyId(mkId);
       // Mark the sync target as E2EE-enabled for cross-client visibility.
       try { await this.plugin.api.putItem('info.json', JSON.stringify({ version: 3, e2ee: { value: true } })); } catch { /* best effort */ }
-      console.log('[joplin-sync] E2EE: generated + uploaded new master key ' + mkId);
+      console.log('[joplin-sync] E2EE: generated + uploaded first master key ' + mkId);
+    } else if (!anyLoaded && mkIds.length > 0) {
+      new Notice('E2EE password is wrong — none of the ' + mkIds.length + ' server master keys could be decrypted. Check the password.');
     }
     this.e2eeActive = anyLoaded;
     if (anyLoaded) console.log('[joplin-sync] E2EE active with ' + e2ee.availableMasterKeys.length + ' master key(s)');
-    else new Notice('E2EE enabled but master key could not be loaded — check E2EE password');
     return anyLoaded;
   }
 
@@ -605,6 +614,22 @@ export class SyncEngine {
       await this.plugin.api.login();
       await this.enableE2EE();
 
+      // Guard: if E2EE is OFF locally but the server holds encrypted items,
+      // pulling would fail for every one of them. Surface this before wiping
+      // the local vault instead of failing silently per-item.
+      if (!this.e2eeActive) {
+        const encCount = await this.countServerEncrypted();
+        if (encCount > 0) {
+          this.running = false;
+          await this.plugin.mapping.flush();
+          const msg = 'Server has ' + encCount + ' E2EE-encrypted item(s) but E2EE is disabled. Enable E2EE + enter the password to pull, or Force Push to overwrite the server with plaintext.';
+          console.error('[joplin-sync] force pull blocked: ' + msg);
+          this.plugin.statusBar.setError(msg);
+          new Notice(msg, 10000);
+          return;
+        }
+      }
+
       // Delete ALL files and folders except config directory
       const adapter = this.plugin.app.vault.adapter;
       const kept = [this.configDir];
@@ -905,6 +930,20 @@ export class SyncEngine {
       if (!cursor) break; // safety: no cursor but has_more = prevent infinite loop
     }
     return out;
+  }
+
+  /** Count server items that carry E2EE ciphertext (encryption_applied=1). */
+  private async countServerEncrypted(): Promise<number> {
+    const remote = await this.listAllRemoteItems();
+    let count = 0;
+    for (const stat of remote) {
+      if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith('.resource/')) continue;
+      try {
+        const raw = await this.plugin.api.getItem(stat.name);
+        if (raw && raw.includes('encryption_applied: 1')) count++;
+      } catch { /* skip unreadable */ }
+    }
+    return count;
   }
 }
 

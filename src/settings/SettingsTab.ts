@@ -135,6 +135,11 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
         .onChange(async v => {
           this.plugin.settings.e2eeEnabled = v;
           await this.plugin.saveSettings();
+          if (v) {
+            new Notice('E2EE enabled. Set the password below, then run Force push to re-upload everything encrypted.', 8000);
+          } else {
+            new Notice('E2EE disabled. Run Force push to overwrite the server with plaintext (existing encrypted server data will be deleted). Other synced clients must also disable E2EE.', 10000);
+          }
           this.display();
         }));
 

@@ -1575,6 +1575,7 @@ var init_SyncEngine = __esm({
         }
         const e2ee = this.plugin.e2ee;
         const cachedId = this.plugin.mapping.e2eeMasterKeyId;
+        let cachedOk = false;
         if (cachedId) {
           try {
             const raw = await this.plugin.api.getItem(cachedId + ".md");
@@ -1583,9 +1584,8 @@ var init_SyncEngine = __esm({
               if (item.type_ === 9 /* MasterKey */) {
                 e2ee.feedMasterKey(item);
                 await e2ee.loadMasterKey(cachedId, pw);
-                this.e2eeActive = true;
-                console.log("[joplin-sync] E2EE active (cached key " + cachedId + ")");
-                return true;
+                cachedOk = true;
+                console.log("[joplin-sync] E2EE cached key " + cachedId + " loaded");
               }
             }
           } catch (e) {
@@ -1593,7 +1593,7 @@ var init_SyncEngine = __esm({
           }
         }
         const mkIds = await this.discoverMasterKeys();
-        let anyLoaded = false;
+        let anyLoaded = cachedOk;
         for (const id of mkIds) {
           try {
             await e2ee.loadMasterKey(id, pw);
@@ -1602,7 +1602,7 @@ var init_SyncEngine = __esm({
             console.warn("[joplin-sync] E2EE master key " + id + " failed to load: " + (e instanceof Error ? e.message : String(e)));
           }
         }
-        if (!anyLoaded) {
+        if (!anyLoaded && mkIds.length === 0) {
           const mkId = createJoplinId();
           const mk = await e2ee.generateMasterKey(pw, mkId);
           await this.plugin.api.putItem(mkId + ".md", this.serializer.serialize({
@@ -1623,13 +1623,13 @@ var init_SyncEngine = __esm({
             await this.plugin.api.putItem("info.json", JSON.stringify({ version: 3, e2ee: { value: true } }));
           } catch {
           }
-          console.log("[joplin-sync] E2EE: generated + uploaded new master key " + mkId);
+          console.log("[joplin-sync] E2EE: generated + uploaded first master key " + mkId);
+        } else if (!anyLoaded && mkIds.length > 0) {
+          new Notice("E2EE password is wrong \u2014 none of the " + mkIds.length + " server master keys could be decrypted. Check the password.");
         }
         this.e2eeActive = anyLoaded;
         if (anyLoaded)
           console.log("[joplin-sync] E2EE active with " + e2ee.availableMasterKeys.length + " master key(s)");
-        else
-          new Notice("E2EE enabled but master key could not be loaded \u2014 check E2EE password");
         return anyLoaded;
       }
       /** Find existing MasterKey items (type_=9) on the server. */
@@ -2170,6 +2170,18 @@ var init_SyncEngine = __esm({
           this.plugin.statusBar.setSyncing("force pull: clearing local...");
           await this.plugin.api.login();
           await this.enableE2EE();
+          if (!this.e2eeActive) {
+            const encCount = await this.countServerEncrypted();
+            if (encCount > 0) {
+              this.running = false;
+              await this.plugin.mapping.flush();
+              const msg = "Server has " + encCount + " E2EE-encrypted item(s) but E2EE is disabled. Enable E2EE + enter the password to pull, or Force Push to overwrite the server with plaintext.";
+              console.error("[joplin-sync] force pull blocked: " + msg);
+              this.plugin.statusBar.setError(msg);
+              new Notice(msg, 1e4);
+              return;
+            }
+          }
           const adapter = this.plugin.app.vault.adapter;
           const kept = [this.configDir];
           const isKept = (p) => kept.some((k) => p === k || p.startsWith(k + "/"));
@@ -2511,6 +2523,22 @@ var init_SyncEngine = __esm({
             break;
         }
         return out;
+      }
+      /** Count server items that carry E2EE ciphertext (encryption_applied=1). */
+      async countServerEncrypted() {
+        const remote = await this.listAllRemoteItems();
+        let count = 0;
+        for (const stat of remote) {
+          if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith(".resource/"))
+            continue;
+          try {
+            const raw = await this.plugin.api.getItem(stat.name);
+            if (raw && raw.includes("encryption_applied: 1"))
+              count++;
+          } catch {
+          }
+        }
+        return count;
       }
     };
   }

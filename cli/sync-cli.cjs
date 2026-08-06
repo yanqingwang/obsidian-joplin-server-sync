@@ -1879,6 +1879,9 @@ var init_SyncEngine = __esm({
             const remote2 = await this.listAllRemoteItems();
             let wiped = 0, skipped = 0;
             console.debug("[joplin-sync] force push reset: scanning " + remote2.length + " remote items");
+            const masterKeyIds = new Set(this.plugin.e2ee.availableMasterKeys);
+            if (this.plugin.mapping.e2eeMasterKeyId)
+              masterKeyIds.add(this.plugin.mapping.e2eeMasterKeyId);
             for (const stat of remote2) {
               if (stat.name === "info.json") {
                 skipped++;
@@ -1886,8 +1889,9 @@ var init_SyncEngine = __esm({
               }
               const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
               if (noteMatch) {
-                const entry = this.plugin.mapping.getById(noteMatch[1]);
-                if (entry?.type === 9 /* MasterKey */) {
+                const id = noteMatch[1];
+                const entry = this.plugin.mapping.getById(id);
+                if (entry?.type === 9 /* MasterKey */ || masterKeyIds.has(id)) {
                   skipped++;
                   continue;
                 }
@@ -2074,12 +2078,17 @@ var init_SyncEngine = __esm({
               console.debug("[joplin-sync] force push files: " + rDone + " uploaded, " + rFail + " failed");
           }
           let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
+          const protectedMasterKeys = new Set(this.plugin.e2ee.availableMasterKeys);
+          if (this.plugin.mapping.e2eeMasterKeyId)
+            protectedMasterKeys.add(this.plugin.mapping.e2eeMasterKeyId);
           const remote = await this.listAllRemoteItems();
           console.debug("[joplin-sync] force push cleanup: scanning " + remote.length + " remote items");
           for (const stat of remote) {
             const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
             if (noteMatch) {
               const id = noteMatch[1];
+              if (protectedMasterKeys.has(id))
+                continue;
               const entry = this.plugin.mapping.getById(id);
               if (entry?.type === 2 /* Folder */) {
                 if (!pushedFolderIds.has(id)) {

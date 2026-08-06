@@ -346,14 +346,18 @@ export class SyncEngine {
         const remote = await this.listAllRemoteItems();
         let wiped = 0, skipped = 0;
         console.debug('[joplin-sync] force push reset: scanning ' + remote.length + ' remote items');
+        // Master keys are NOT in the mapping (enableE2EE only caches their id),
+        // so protect them explicitly — deleting them would break E2EE for all
+        // synced clients (they could no longer decrypt server-stored data).
+        const masterKeyIds = new Set(this.plugin.e2ee.availableMasterKeys);
+        if (this.plugin.mapping.e2eeMasterKeyId) masterKeyIds.add(this.plugin.mapping.e2eeMasterKeyId);
         for (const stat of remote) {
           if (stat.name === 'info.json') { skipped++; continue; }
           const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
           if (noteMatch) {
-            // Never delete master keys (type_=9) — they hold the E2EE key
-            // material and are provisioned/loaded by enableE2EE().
-            const entry = this.plugin.mapping.getById(noteMatch[1]);
-            if (entry?.type === ModelType.MasterKey) { skipped++; continue; }
+            const id = noteMatch[1];
+            const entry = this.plugin.mapping.getById(id);
+            if (entry?.type === ModelType.MasterKey || masterKeyIds.has(id)) { skipped++; continue; }
           }
           try { await this.plugin.api.deleteItem(stat.name); wiped++; }
           catch (e: unknown) {
@@ -537,12 +541,16 @@ export class SyncEngine {
       // Notes are only removed when we actually pushed notes this run
       // (in folders-only mode we must not wipe the server's notes).
       let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
+      // Master keys are never in the pushed sets — always preserve them.
+      const protectedMasterKeys = new Set(this.plugin.e2ee.availableMasterKeys);
+      if (this.plugin.mapping.e2eeMasterKeyId) protectedMasterKeys.add(this.plugin.mapping.e2eeMasterKeyId);
       const remote = await this.listAllRemoteItems();
       console.debug('[joplin-sync] force push cleanup: scanning ' + remote.length + ' remote items');
       for (const stat of remote) {
         const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
         if (noteMatch) {
           const id = noteMatch[1];
+          if (protectedMasterKeys.has(id)) continue;
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === ModelType.Folder) {
             if (!pushedFolderIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedFolders++; } catch { /* ignore */ } }

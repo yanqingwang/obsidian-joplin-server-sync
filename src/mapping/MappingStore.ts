@@ -84,6 +84,13 @@ export class MappingStore {
     this.dirty = true;
   }
 
+  clearAll(): void {
+    this.data.entries = [];
+    this.byId.clear();
+    this.byPath.clear();
+    this.dirty = true;
+  }
+
   get tombstones() { return this.data.tombstones; }
 
   addTombstone(joplinId: string, type: ModelType): void {

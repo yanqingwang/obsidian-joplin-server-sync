@@ -62,7 +62,7 @@ async function main() {
   const [mode, vaultPath] = process.argv.slice(2);
   const noVaultModes = ['e2eetest', 'deltaprobe', 'lsroot', 'rt', 'probe2', 'diag'];
   if (!mode || (!vaultPath && !noVaultModes.includes(mode))) {
-    console.log('Usage: node cli/sync-cli.cjs <push|pull|sync|e2eetest|e2eeserver|e2eesync|verifyenc|diag|deltaprobe|lsroot|rt|probe2> [vaultPath]');
+    console.log('Usage: node cli/sync-cli.cjs <push|pull|sync|e2eetest|e2eeserver|e2eesync|verifyenc|verifycount|diag|deltaprobe|lsroot|rt|probe2> [vaultPath]');
     process.exit(1);
   }
   let creds: any = { serverUrl: '', email: '', password: '', attachmentFolder: 'attachments', excludePatterns: [] };
@@ -71,6 +71,7 @@ async function main() {
   const plugin = makePlugin(vaultPath || process.cwd(), creds);
   if (vaultPath) await plugin.mapping.load();
   const engine = new SyncEngine(plugin);
+  plugin.engine = engine;
   console.log(`== ${mode} ==`);
   if (mode === 'push') await engine.forcePush();
   else if (mode === 'pull') await engine.forcePull();
@@ -382,14 +383,14 @@ async function main() {
     // 3. Encrypt a RESOURCE blob, push it, pull it back, decrypt
     const resId = createJoplinId();
     const blob = new Uint8Array([1, 2, 3, 255, 0, 128, 200, 9, 42, 7, 11, 3, 200, 1]);
-    const blobCipherHex = await enc.encryptBlob(blob.buffer as ArrayBuffer, mkId);
-    const blobCipherBytes = enc['hexToBytes'](blobCipherHex);
-    await plugin.api.putItem('.resource/' + resId, blobCipherBytes);
+    const blobCipherText = await enc.encryptBlob(blob.buffer as ArrayBuffer, mkId);
+    const blobCipherBytes = new TextEncoder().encode(blobCipherText);
+    await plugin.api.putItem('.resource/' + resId, blobCipherBytes.buffer as ArrayBuffer);
     await plugin.api.putItem(resId + '.md', ser.serialize({ id: resId, type_: ModelType.Resource, title: 'secret.png', mime: 'image/png', size: blob.length, filename: 'secret.png', encryption_applied: 1, encryption_cipher_text: await enc.encryptItem(ser.serialize({ id: resId, title: 'secret.png', mime: 'image/png', size: blob.length, filename: 'secret.png' } as any), mkId), } as any), true);
     ids.push(resId);
     const pulledBlob = await plugin.api.getItemBinary('.resource/' + resId);
-    const pulledBlobHex = enc['bytesToHex'](new Uint8Array(pulledBlob));
-    const decryptedBlob = new Uint8Array(await enc.decryptBlob(pulledBlobHex, mkId));
+    const pulledBlobText = new TextDecoder().decode(pulledBlob);
+    const decryptedBlob = new Uint8Array(await enc.decryptBlob(pulledBlobText, mkId));
     assert(decryptedBlob.length === blob.length && decryptedBlob.every((b, i) => b === blob[i]), 'pulled resource blob decrypts to original bytes (server round-trip)');
 
     // 4. Wrong password must NOT decrypt (auth fails) — verify on the pulled note
@@ -607,6 +608,125 @@ async function main() {
       try { fs.unlinkSync(path.join(vaultPath, 'e2ee-verify-tmp.md')); } catch { /* ignore */ }
     }
     console.log(failures === 0 ? '\n=== DEPLOYED E2EE ENCRYPTION VERIFIED ✅ ===' : `\n=== DEPLOYED E2EE ENCRYPTION FAILED ❌ (${failures}) ===`);
+    process.exit(failures === 0 ? 0 : 1);
+  } else if (mode === 'verifycount') {
+    // Compare LOCAL vault file count vs REMOTE server item count after a force
+    // push, and verify E2EE ciphertext status when e2eePassword is configured.
+    // Expectation: local files === remote notes+folders+resources (server may
+    // have extras: info.json + master key(s), which are infra, not content).
+    console.log('== verifycount ==');
+    const plugin: any = makePlugin(vaultPath, creds);
+    plugin.e2ee = new EncryptionService();
+    const eng = new SyncEngine(plugin);
+    plugin.engine = eng;
+    await plugin.mapping.load();
+    await plugin.api.login();
+    let failures = 0;
+    const assert = (c: boolean, m: string) => { console.log((c ? '  PASS: ' : '  FAIL: ') + m); if (!c) failures++; };
+
+    // Local counts — walk the filesystem directly (authoritative), applying
+    // the same exclude patterns the sync engine uses.
+    const excludes = creds.excludePatterns || [];
+    const isExcluded = (p: string) => excludes.some((e: string) => p.startsWith(e)) || p.startsWith('.obsidian/');
+    const localMd: string[] = [];
+    const localNonMd: string[] = [];
+    const fs = require('fs');
+    const pathMod = require('path');
+    const walkFs = (dir: string): void => {
+      let ents: any[];
+      try { ents = fs.readdirSync(pathMod.join(vaultPath, dir), { withFileTypes: true }); } catch { return; }
+      for (const e of ents) {
+        const rel = dir ? dir + '/' + e.name : e.name;
+        if (e.isDirectory()) {
+          if (e.name.startsWith('.') || excludes.some((x: string) => (rel + '/').startsWith(x))) continue;
+          walkFs(rel);
+        } else if (e.isFile()) {
+          if (isExcluded(rel)) continue;
+          if (rel.endsWith('.md')) localMd.push(rel); else localNonMd.push(rel);
+        }
+      }
+    };
+    walkFs('');
+    const localTotal = localMd.length + localNonMd.length;
+    // Local directory count (non-hidden, non-excluded)
+    const localDirs = new Set<string>();
+    for (const f of [...localMd, ...localNonMd]) {
+      if (!f.includes('/')) continue;
+      const parts = f.split('/').slice(0, -1);
+      for (let i = 1; i <= parts.length; i++) localDirs.add(parts.slice(0, i).join('/'));
+    }
+
+    // Remote counts (paginate everything)
+    let remoteNotes = 0, remoteFolders = 0, remoteResources = 0, remoteBlobs = 0, remoteMk = 0, remoteInfo = 0;
+    let cursor: string | undefined;
+    while (true) {
+      const page = await plugin.api.listChildrenOf('', cursor);
+      for (const it of page.items) {
+        if (it.name === 'info.json') { remoteInfo++; continue; }
+        if (it.name.startsWith('.resource/')) { remoteBlobs++; continue; }
+        const m = it.name.match(/^([0-9a-f]{32})\.md$/);
+        if (!m) continue;
+        try {
+          const raw = await plugin.api.getItem(it.name);
+          if (!raw) continue;
+          const item = new JoplinSerializer().unserialize(raw);
+          if (item.type_ === 1) remoteNotes++;
+          else if (item.type_ === 2) remoteFolders++;
+          else if (item.type_ === 4) remoteResources++;
+          else if (item.type_ === 9) remoteMk++;
+        } catch { /* skip unreadable */ }
+      }
+      cursor = page.cursor;
+      if (!page.has_more || !cursor) break;
+    }
+
+    console.log('  local:  ' + localTotal + ' files (' + localMd.length + ' md, ' + localNonMd.length + ' non-md) in ' + localDirs.size + ' dirs');
+    console.log('  remote: ' + (remoteNotes + remoteFolders + remoteResources + remoteBlobs) + ' content items');
+    console.log('         ' + remoteNotes + ' notes, ' + remoteFolders + ' folders, ' + remoteResources + ' resource-metas, ' + remoteBlobs + ' blobs');
+    console.log('  infra:  ' + remoteMk + ' master key(s), ' + remoteInfo + ' info.json');
+
+    // A folder is created for each dir containing files; resources have both a
+    // metadata item AND a blob. So remote content = notes + folders + resources.
+    const remoteContent = remoteNotes + remoteFolders + remoteResources + remoteBlobs;
+    assert(remoteNotes === localMd.length, 'note count matches (' + localMd.length + ' local vs ' + remoteNotes + ' remote)');
+    assert(remoteFolders === localDirs.size, 'folder count matches (' + localDirs.size + ' local dirs vs ' + remoteFolders + ' remote folders)');
+    assert(localNonMd.length === 0 ? true : remoteBlobs >= localNonMd.length, 'resource blobs cover non-md files (' + localNonMd.length + ' local vs ' + remoteBlobs + ' remote)');
+    assert(remoteContent <= localTotal + remoteMk + remoteFolders + 2, 'no runaway duplicates on server (remote ' + remoteContent + ' ≤ local ' + localTotal + ' + infra)');
+
+    // E2EE ciphertext check
+    if (creds.e2eePassword) {
+      console.log('  E2EE: e2eePassword configured — checking ciphertext...');
+      let sampleChecked = 0, sampleEncrypted = 0, plaintextLeak = 0;
+      cursor = undefined;
+      while (true) {
+        const page = await plugin.api.listChildrenOf('', cursor);
+        for (const it of page.items) {
+          if (!/^[0-9a-f]{32}\.md$/.test(it.name) || sampleChecked >= 10) continue;
+          try {
+            const raw = await plugin.api.getItem(it.name);
+            if (!raw) continue;
+            const item = new JoplinSerializer().unserialize(raw);
+            if (item.type_ !== 1 || item.encryption_applied === 0) continue;
+            sampleChecked++;
+            if (item.encryption_applied === 1 && (item.encryption_cipher_text || '').startsWith('JED01')) sampleEncrypted++;
+            // Ensure no plaintext body leaked
+            if ((item.body || '') !== '') plaintextLeak++;
+          } catch { /* skip */ }
+        }
+        cursor = page.cursor;
+        if (!page.has_more || !cursor || sampleChecked >= 10) break;
+      }
+      if (sampleChecked > 0) {
+        assert(sampleEncrypted === sampleChecked, 'sampled notes are JED01-encrypted (' + sampleEncrypted + '/' + sampleChecked + ')');
+        assert(plaintextLeak === 0, 'no plaintext body leaked on server');
+      } else {
+        console.log('  (no encrypted notes found on server to sample)');
+      }
+    } else {
+      console.log('  E2EE: no e2eePassword configured — skipping ciphertext check');
+    }
+
+    console.log(failures === 0 ? '\n=== VERIFYCOUNT PASSED ✅ ===' : `\n=== VERIFYCOUNT FAILED ❌ (${failures}) ===`);
     process.exit(failures === 0 ? 0 : 1);
   } else { console.log('Unknown mode: ' + mode); process.exit(1); }
   console.log(`== ${mode} done ==`);

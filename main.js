@@ -459,6 +459,12 @@ var MappingStore = class {
     this.byPath.delete(e.path);
     this.dirty = true;
   }
+  clearAll() {
+    this.data.entries = [];
+    this.byId.clear();
+    this.byPath.clear();
+    this.dirty = true;
+  }
   get tombstones() {
     return this.data.tombstones;
   }
@@ -2109,6 +2115,33 @@ var SyncEngine = class {
       await this.enableE2EE();
       const rootFolderId = "";
       const files = this.collectMarkdownFiles();
+      {
+        const remote2 = await this.listAllRemoteItems();
+        let wiped = 0, skipped = 0;
+        console.debug("[joplin-sync] force push reset: scanning " + remote2.length + " remote items");
+        for (const stat of remote2) {
+          if (stat.name === "info.json") {
+            skipped++;
+            continue;
+          }
+          const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
+          if (noteMatch) {
+            const entry = this.plugin.mapping.getById(noteMatch[1]);
+            if (entry?.type === 9 /* MasterKey */) {
+              skipped++;
+              continue;
+            }
+          }
+          try {
+            await this.plugin.api.deleteItem(stat.name);
+            wiped++;
+          } catch (e) {
+            console.warn("[joplin-sync] reset delete failed: " + stat.name + " - " + (e instanceof Error ? e.message : String(e)));
+          }
+        }
+        this.plugin.mapping.clearAll();
+        console.debug("[joplin-sync] force push reset: wiped " + wiped + " items, kept " + skipped + " (info.json/master keys)");
+      }
       const pushedNoteIds = /* @__PURE__ */ new Set();
       const pushedFolderIds = /* @__PURE__ */ new Set();
       const folderMap = /* @__PURE__ */ new Map();
@@ -2153,6 +2186,13 @@ var SyncEngine = class {
               if (folderName.startsWith("."))
                 continue;
               const rel = dir ? dir + "/" + folderName : folderName;
+              let hasFiles = listing.files.length > 0;
+              const subListing = await typedAdapter.list(sub).catch(() => null);
+              if (subListing && (subListing.files.length > 0 || subListing.folders.length > 0)) {
+                hasFiles = true;
+              }
+              if (!hasFiles)
+                continue;
               if (rel && !folderMap.has(rel)) {
                 const existing = this.plugin.mapping.getByPath(rel + "/");
                 if (existing) {

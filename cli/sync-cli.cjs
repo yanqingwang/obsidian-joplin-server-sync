@@ -1875,6 +1875,33 @@ var init_SyncEngine = __esm({
           await this.enableE2EE();
           const rootFolderId = "";
           const files = this.collectMarkdownFiles();
+          {
+            const remote2 = await this.listAllRemoteItems();
+            let wiped = 0, skipped = 0;
+            console.debug("[joplin-sync] force push reset: scanning " + remote2.length + " remote items");
+            for (const stat of remote2) {
+              if (stat.name === "info.json") {
+                skipped++;
+                continue;
+              }
+              const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
+              if (noteMatch) {
+                const entry = this.plugin.mapping.getById(noteMatch[1]);
+                if (entry?.type === 9 /* MasterKey */) {
+                  skipped++;
+                  continue;
+                }
+              }
+              try {
+                await this.plugin.api.deleteItem(stat.name);
+                wiped++;
+              } catch (e) {
+                console.warn("[joplin-sync] reset delete failed: " + stat.name + " - " + (e instanceof Error ? e.message : String(e)));
+              }
+            }
+            this.plugin.mapping.clearAll();
+            console.debug("[joplin-sync] force push reset: wiped " + wiped + " items, kept " + skipped + " (info.json/master keys)");
+          }
           const pushedNoteIds = /* @__PURE__ */ new Set();
           const pushedFolderIds = /* @__PURE__ */ new Set();
           const folderMap = /* @__PURE__ */ new Map();
@@ -1919,6 +1946,13 @@ var init_SyncEngine = __esm({
                   if (folderName.startsWith("."))
                     continue;
                   const rel = dir ? dir + "/" + folderName : folderName;
+                  let hasFiles = listing.files.length > 0;
+                  const subListing = await typedAdapter.list(sub).catch(() => null);
+                  if (subListing && (subListing.files.length > 0 || subListing.folders.length > 0)) {
+                    hasFiles = true;
+                  }
+                  if (!hasFiles)
+                    continue;
                   if (rel && !folderMap.has(rel)) {
                     const existing = this.plugin.mapping.getByPath(rel + "/");
                     if (existing) {
@@ -2463,33 +2497,50 @@ __export(EncryptionService_exports, {
   EncryptionService: () => EncryptionService,
   MasterKeyNotLoadedError: () => MasterKeyNotLoadedError
 });
-var EncryptionMethod, GCM_TAG_BITS, NONCE_BYTES, PBKDF2_ITERATIONS, KEY_BITS, SALT_BYTES, CHUNK_SIZE, EncryptionService, MasterKeyNotLoadedError;
+var EncryptionMethod, HEADER_IDENTIFIER, GCM_TAG_BITS, NONCE_BYTES, KEY_BYTES, SALT_BYTES, KEYV1_ITERATIONS, CHUNK_ITERATIONS, CHUNK_SIZES, EncryptionService, MasterKeyNotLoadedError;
 var init_EncryptionService = __esm({
   "src/e2ee/EncryptionService.ts"() {
     "use strict";
     init_models();
     EncryptionMethod = /* @__PURE__ */ ((EncryptionMethod2) => {
-      EncryptionMethod2[EncryptionMethod2["SJCL1a"] = 4] = "SJCL1a";
-      EncryptionMethod2[EncryptionMethod2["KeyV1"] = 7] = "KeyV1";
-      EncryptionMethod2[EncryptionMethod2["FileV1"] = 8] = "FileV1";
-      EncryptionMethod2[EncryptionMethod2["StringV1"] = 9] = "StringV1";
+      EncryptionMethod2[EncryptionMethod2["SJCL"] = 1] = "SJCL";
+      EncryptionMethod2[EncryptionMethod2["SJCL2"] = 2] = "SJCL2";
+      EncryptionMethod2[EncryptionMethod2["SJCL3"] = 3] = "SJCL3";
+      EncryptionMethod2[EncryptionMethod2["SJCL4"] = 4] = "SJCL4";
+      EncryptionMethod2[EncryptionMethod2["SJCL1a"] = 5] = "SJCL1a";
+      EncryptionMethod2[EncryptionMethod2["Custom"] = 6] = "Custom";
+      EncryptionMethod2[EncryptionMethod2["SJCL1b"] = 7] = "SJCL1b";
+      EncryptionMethod2[EncryptionMethod2["KeyV1"] = 8] = "KeyV1";
+      EncryptionMethod2[EncryptionMethod2["FileV1"] = 9] = "FileV1";
+      EncryptionMethod2[EncryptionMethod2["StringV1"] = 10] = "StringV1";
       return EncryptionMethod2;
     })(EncryptionMethod || {});
+    HEADER_IDENTIFIER = "JED01";
     GCM_TAG_BITS = 128;
     NONCE_BYTES = 12;
-    PBKDF2_ITERATIONS = 22e4;
-    KEY_BITS = 256;
+    KEY_BYTES = 32;
     SALT_BYTES = 16;
-    CHUNK_SIZE = 5e3;
+    KEYV1_ITERATIONS = 22e4;
+    CHUNK_ITERATIONS = 3;
+    CHUNK_SIZES = {
+      [1 /* SJCL */]: 5e3,
+      [2 /* SJCL2 */]: 5e3,
+      [3 /* SJCL3 */]: 5e3,
+      [4 /* SJCL4 */]: 5e3,
+      [5 /* SJCL1a */]: 5e3,
+      [7 /* SJCL1b */]: 5e3,
+      [8 /* KeyV1 */]: 5e3,
+      [9 /* FileV1 */]: 131072,
+      [10 /* StringV1 */]: 65536
+    };
     EncryptionService = class {
       constructor() {
-        this.loadedKeys = /* @__PURE__ */ new Map();
+        /** masterKeyId → decrypted master key plain text (512 hex chars) */
+        this.masterKeyPlainTexts = /* @__PURE__ */ new Map();
         this.masterKeyItems = /* @__PURE__ */ new Map();
         this.activeMasterKeyId = null;
       }
-      /** Feed a MasterKey item (type_=9) so it can be used for decryption.
-       *  The encrypted key blob lives in `content` on the server (NOT
-       *  `encryption_cipher_text`, which is for notes/resources). */
+      /** Feed a MasterKey item (type_=9) so it can be used for decryption. */
       feedMasterKey(item) {
         if (item.type_ !== 9 /* MasterKey */)
           return;
@@ -2504,7 +2555,7 @@ var init_EncryptionService = __esm({
             continue;
           try {
             const p = JSON.parse(c);
-            if (p && p.iv && p.ciphertext && p.salt) {
+            if (p && p.iv && p.ct && p.salt) {
               encryptedContent = c;
               break;
             }
@@ -2515,88 +2566,55 @@ var init_EncryptionService = __esm({
           encryptedContent = candidates.find((c) => !!c) ?? "";
         this.masterKeyItems.set(item.id, {
           id: item.id,
-          encryptionMethod: item.encryption_method ?? 7 /* KeyV1 */,
+          encryptionMethod: item.encryption_method ?? 8 /* KeyV1 */,
           checksum: item.checksum ?? "",
           encryptedContent
         });
       }
-      /** Generate a new master key (EncryptedMethod.KeyV1) from a password. */
+      /** Generate a fresh master key (KeyV1) from a password. Returns the wrapped key entity. */
       async generateMasterKey(password, id) {
         if (!password)
           throw new Error("Password required to generate a master key");
-        const keyBytes = crypto.getRandomValues(new Uint8Array(32));
+        const keyBytes = crypto.getRandomValues(new Uint8Array(256));
         const hexKey = this.bytesToHex(keyBytes);
-        const contentJson = JSON.stringify({ encryption_method: 9 /* StringV1 */, content: hexKey });
         const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
-        const wrappingKey = await this.deriveWrappingKey(password, salt);
-        const iv = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
-        const ctBuf = await crypto.subtle.encrypt(
-          { name: "AES-GCM", iv: this.buf(iv), tagLength: GCM_TAG_BITS },
-          wrappingKey,
-          this.buf(new TextEncoder().encode(contentJson))
-        );
-        const encryptedContent = JSON.stringify({
-          iv: this.bytesToHex(iv),
-          ciphertext: this.bytesToHex(new Uint8Array(ctBuf)),
-          salt: this.bytesToHex(salt)
-        });
+        const result = await this.encryptAesGcm(password, salt, this.buf(new TextEncoder().encode(hexKey)), KEYV1_ITERATIONS);
         return {
           id,
-          encryptionMethod: 7 /* KeyV1 */,
+          encryptionMethod: 8 /* KeyV1 */,
           checksum: "",
-          encryptedContent
+          encryptedContent: JSON.stringify(result)
         };
       }
-      /** Load a master key into memory by decrypting it with the user password. */
+      /** Load a master key into memory by decrypting its content with the user password. */
       async loadMasterKey(masterKeyId, password) {
         const mk = this.masterKeyItems.get(masterKeyId);
         if (!mk)
           throw new Error("Master key item not found: " + masterKeyId);
         if (!password)
           throw new Error("Password required");
-        const payload = this.parseJsonOrRaw(mk.encryptedContent);
-        const salt = this.hexToBytes(payload.salt || "");
-        const iv = this.hexToBytes(payload.iv || "");
-        const ct = this.hexToBytes(payload.ciphertext || payload.ct || payload.cipherText || "");
-        if (!salt.length || !iv.length || !ct.length) {
-          throw new Error("Master key " + masterKeyId + " has invalid encrypted content");
+        let result;
+        try {
+          result = JSON.parse(mk.encryptedContent);
+        } catch {
+          throw new Error("Master key " + masterKeyId + " has invalid encrypted content (not JSON)");
         }
-        const wrappingKey = await this.deriveWrappingKey(password, salt);
-        const plainBuf = await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: this.buf(iv), tagLength: GCM_TAG_BITS },
-          wrappingKey,
-          this.buf(ct)
+        if (!result.salt || !result.iv || !result.ct) {
+          throw new Error("Master key " + masterKeyId + " has invalid encrypted content (missing salt/iv/ct)");
+        }
+        const plainBuf = await this.decryptAesGcm(
+          password,
+          this.base64ToBytes(result.salt),
+          this.base64ToBytes(result.iv),
+          this.base64ToBytes(result.ct),
+          KEYV1_ITERATIONS
         );
-        const contentJson = new TextDecoder().decode(plainBuf);
-        const mkPayload = JSON.parse(contentJson);
-        if (!mkPayload.content)
-          throw new Error("Master key content missing `content`");
-        const rawKey = this.hexToBytes(mkPayload.content);
-        const aesKey = await crypto.subtle.importKey(
-          "raw",
-          this.buf(rawKey),
-          { name: "AES-GCM" },
-          false,
-          ["encrypt", "decrypt"]
-        );
-        this.loadedKeys.set(masterKeyId, aesKey);
+        const hexKey = new TextDecoder().decode(plainBuf).trim();
+        if (!/^[0-9a-f]+$/i.test(hexKey)) {
+          throw new Error("Master key " + masterKeyId + " decrypted to invalid key material (wrong password?)");
+        }
+        this.masterKeyPlainTexts.set(masterKeyId, hexKey);
         this.activeMasterKeyId = masterKeyId;
-      }
-      async deriveWrappingKey(password, salt) {
-        const baseKey = await crypto.subtle.importKey(
-          "raw",
-          this.buf(new TextEncoder().encode(password)),
-          { name: "PBKDF2" },
-          false,
-          ["deriveKey"]
-        );
-        return crypto.subtle.deriveKey(
-          { name: "PBKDF2", salt: this.buf(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-512" },
-          baseKey,
-          { name: "AES-GCM", length: KEY_BITS },
-          false,
-          ["encrypt", "decrypt"]
-        );
       }
       isEncrypted(item) {
         return item.encryption_applied === 1;
@@ -2611,161 +2629,213 @@ var init_EncryptionService = __esm({
         if (!this.isEncrypted(item))
           return item.body ?? "";
         const header = this.parseHeader(item.encryption_cipher_text);
-        const key = this.loadedKeys.get(header.masterKeyId);
-        if (!key)
+        if (header.method !== 10 /* StringV1 */) {
+          throw new Error("Item encryption method " + header.method + " not supported (only StringV1=10)");
+        }
+        const masterKeyHex = this.masterKeyPlainTexts.get(header.masterKeyId);
+        if (!masterKeyHex)
           throw new Error("Master key not loaded: " + header.masterKeyId + " \u2014 enter password");
-        const parts = [];
-        for (const chunk2 of header.chunks) {
-          parts.push(await this.decryptChunk(header.method, key, chunk2));
-        }
-        return parts.join("");
+        return this.decryptChunks(item.encryption_cipher_text, header.method, masterKeyHex, "utf16le");
       }
-      /** Encrypt a serialized item string → `encryption_cipher_text` (method StringV1). */
+      /** Encrypt a serialized item string → `encryption_cipher_text` (StringV1). */
       async encryptItem(serialized, masterKeyId) {
-        const key = this.loadedKeys.get(masterKeyId);
-        if (!key)
+        const masterKeyHex = this.masterKeyPlainTexts.get(masterKeyId);
+        if (!masterKeyHex)
           throw new Error("Master key not loaded: " + masterKeyId);
-        const chunks = [];
-        for (let i = 0; i < serialized.length; i += CHUNK_SIZE) {
-          chunks.push(await this.encryptChunk(key, serialized.slice(i, i + CHUNK_SIZE)));
-        }
-        return this.buildHeader(9 /* StringV1 */, masterKeyId, chunks);
+        const chunks = await this.encryptChunks(serialized, 10 /* StringV1 */, masterKeyHex, "utf16le");
+        return this.buildCipherText(10 /* StringV1 */, masterKeyId, chunks);
       }
-      /** Encrypt a binary resource blob (method FileV1) → hex cipher text. */
+      /** Encrypt binary resource data (FileV1) → hex cipher text string. */
       async encryptBlob(data, masterKeyId) {
-        const key = this.loadedKeys.get(masterKeyId);
-        if (!key)
+        const masterKeyHex = this.masterKeyPlainTexts.get(masterKeyId);
+        if (!masterKeyHex)
           throw new Error("Master key not loaded: " + masterKeyId);
-        const bytes = new Uint8Array(data);
-        const chunks = [];
-        const step = CHUNK_SIZE;
-        for (let i = 0; i < bytes.length; i += step) {
-          const slice = bytes.subarray(i, i + step);
-          chunks.push(await this.encryptChunkBytes(key, slice));
-        }
-        return this.buildHeader(8 /* FileV1 */, masterKeyId, chunks);
+        const b64 = this.arrayBufferToBase64(data);
+        const chunks = await this.encryptChunks(b64, 9 /* FileV1 */, masterKeyHex, "base64");
+        return this.buildCipherText(9 /* FileV1 */, masterKeyId, chunks);
       }
-      /** Decrypt a resource blob cipher text → binary. */
-      async decryptBlob(data, masterKeyId) {
+      /** Decrypt a resource blob cipher text (FileV1) → binary. */
+      async decryptBlob(data, _masterKeyId) {
         const header = this.parseHeader(data);
-        const key = this.loadedKeys.get(header.masterKeyId);
-        if (!key)
-          throw new Error("Master key not loaded: " + (masterKeyId ?? header.masterKeyId) + " \u2014 enter password");
-        const out = [];
-        for (const chunk2 of header.chunks) {
-          const part = await this.decryptChunkBytes(key, chunk2);
-          out.push(...part);
+        if (header.method !== 9 /* FileV1 */) {
+          throw new Error("Resource encryption method " + header.method + " not supported (only FileV1=9)");
         }
-        return new Uint8Array(out).buffer;
+        const masterKeyHex = this.masterKeyPlainTexts.get(header.masterKeyId);
+        if (!masterKeyHex)
+          throw new Error("Master key not loaded: " + header.masterKeyId + " \u2014 enter password");
+        const b64 = await this.decryptChunks(data, header.method, masterKeyHex, "base64");
+        return this.base64ToBytes(b64).buffer;
       }
-      /** Encrypt binary data → ArrayBuffer (for direct upload to the server). */
+      /** Encrypt binary data → ArrayBuffer (JED01 cipher text bytes, for direct upload). */
       async encryptBlobData(data, masterKeyId) {
-        return this.hexToBytes(await this.encryptBlob(data, masterKeyId)).buffer;
+        const hex = await this.encryptBlob(data, masterKeyId);
+        return new TextEncoder().encode(hex).buffer;
       }
-      /** Decrypt a binary blob (ArrayBuffer from the server) → plaintext ArrayBuffer. */
+      /** Decrypt a JED01 cipher text blob (ArrayBuffer from server) → plaintext ArrayBuffer. */
       async decryptBlobData(data, masterKeyId) {
-        const hex = this.bytesToHex(new Uint8Array(data));
+        const hex = new TextDecoder().decode(data);
         return this.decryptBlob(hex, masterKeyId);
       }
-      // === Chunk crypto ===
-      async encryptChunk(key, plain) {
-        const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
-        const encoded = new TextEncoder().encode(plain);
-        const encrypted = await crypto.subtle.encrypt(
-          { name: "AES-GCM", iv: this.buf(nonce), tagLength: GCM_TAG_BITS },
-          key,
-          this.buf(encoded)
-        );
-        return this.bytesToHex(this.concat(nonce, new Uint8Array(encrypted)));
-      }
-      async decryptChunk(method, key, chunkHex) {
-        if (method === 4 /* SJCL1a */) {
-          throw new Error("SJCL (method 4) encryption is not supported \u2014 only decrypt of AES-GCM (8/9)");
-        }
-        const data = this.hexToBytes(chunkHex);
-        const nonce = data.slice(0, NONCE_BYTES);
-        const ctWithTag = data.slice(NONCE_BYTES);
-        const plain = await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: this.buf(nonce), tagLength: GCM_TAG_BITS },
-          key,
-          this.buf(ctWithTag)
-        );
-        return new TextDecoder().decode(plain);
-      }
-      async encryptChunkBytes(key, plain) {
-        const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
-        const encrypted = await crypto.subtle.encrypt(
-          { name: "AES-GCM", iv: this.buf(nonce), tagLength: GCM_TAG_BITS },
-          key,
-          this.buf(plain)
-        );
-        return this.bytesToHex(this.concat(nonce, new Uint8Array(encrypted)));
-      }
-      async decryptChunkBytes(key, chunkHex) {
-        const data = this.hexToBytes(chunkHex);
-        const nonce = data.slice(0, NONCE_BYTES);
-        const ctWithTag = data.slice(NONCE_BYTES);
-        const plain = await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: this.buf(nonce), tagLength: GCM_TAG_BITS },
-          key,
-          this.buf(ctWithTag)
-        );
-        return new Uint8Array(plain);
-      }
-      // === Header parsing/building ===
-      parseHeader(ct) {
-        let pos = 0;
-        const headerLenHex = ct.slice(pos, pos + 6);
-        const headerLen = parseInt(headerLenHex, 16);
-        pos += 6;
-        if (isNaN(headerLen))
-          throw new Error("Invalid E2EE header length");
-        const headerHex = ct.slice(pos, pos + headerLen * 2);
-        pos += headerLen * 2;
-        const headerBytes = this.hexToBytes(headerHex);
-        let hp = 0;
-        const version = headerBytes[hp++];
-        const method = headerBytes[hp] << 8 | headerBytes[hp + 1];
-        hp += 2;
-        const masterKeyId = this.bytesToHex(headerBytes.slice(hp, hp + 16));
-        hp += 16;
+      // === Chunked encryption (StringV1 / FileV1) ===
+      async encryptChunks(plain, method, masterKeyHex, encoding) {
+        const chunkSize = CHUNK_SIZES[method] ?? 65536;
         const chunks = [];
-        while (pos < ct.length) {
-          const chunkLenHex = ct.slice(pos, pos + 6);
+        for (let i = 0; i < plain.length; i += chunkSize) {
+          const block = plain.slice(i, i + chunkSize);
+          chunks.push(await this.encryptBlock(block, masterKeyHex, encoding));
+        }
+        return chunks;
+      }
+      async decryptChunks(cipherText, method, masterKeyHex, encoding) {
+        const headerLenHex = cipherText.slice(HEADER_IDENTIFIER.length, HEADER_IDENTIFIER.length + 6);
+        const headerLen = parseInt(headerLenHex, 16);
+        let pos = HEADER_IDENTIFIER.length + 6 + headerLen;
+        const parts = [];
+        while (pos < cipherText.length) {
+          const chunkLenHex = cipherText.slice(pos, pos + 6);
           if (chunkLenHex.length < 6)
             break;
           const chunkLen = parseInt(chunkLenHex, 16);
           pos += 6;
           if (isNaN(chunkLen) || chunkLen <= 0)
             break;
-          chunks.push(ct.slice(pos, pos + chunkLen * 2));
-          pos += chunkLen * 2;
+          const block = cipherText.slice(pos, pos + chunkLen);
+          pos += chunkLen;
+          parts.push(await this.decryptBlock(block, masterKeyHex, encoding));
         }
-        return { version, method, masterKeyId, chunks };
+        return parts.join("");
       }
-      buildHeader(method, masterKeyId, chunks) {
-        const headerBytes = new Uint8Array(1 + 2 + 16);
-        let p = 0;
-        headerBytes[p++] = 1;
-        headerBytes[p++] = method >> 8 & 255;
-        headerBytes[p++] = method & 255;
-        headerBytes.set(this.hexToBytes(masterKeyId), p);
-        p += 32;
-        const headerHex = this.bytesToHex(headerBytes);
-        const hLenHex = headerBytes.length.toString(16).padStart(6, "0");
-        let out = hLenHex + headerHex;
+      /** Encrypt one block → JSON {salt, iv, ct} base64 */
+      async encryptBlock(plain, masterKeyHex, encoding) {
+        const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+        const data = encoding === "utf16le" ? this.utf16leEncode(plain) : this.base64ToBytes(plain);
+        const result = await this.encryptAesGcm(masterKeyHex, salt, this.buf(data), CHUNK_ITERATIONS);
+        return JSON.stringify(result);
+      }
+      /** Decrypt one JSON block → plain string */
+      async decryptBlock(block, masterKeyHex, encoding) {
+        let result;
+        try {
+          result = JSON.parse(block);
+        } catch {
+          throw new Error("Invalid encrypted block (not JSON): " + block.slice(0, 32) + "\u2026");
+        }
+        if (!result.salt || !result.iv || !result.ct) {
+          throw new Error("Invalid encrypted block (missing salt/iv/ct)");
+        }
+        const plainBuf = await this.decryptAesGcm(
+          masterKeyHex,
+          this.base64ToBytes(result.salt),
+          this.base64ToBytes(result.iv),
+          this.base64ToBytes(result.ct),
+          CHUNK_ITERATIONS
+        );
+        if (encoding === "utf16le")
+          return this.utf16leDecode(plainBuf);
+        return this.bytesToBase64(new Uint8Array(plainBuf));
+      }
+      // === AES-GCM + PBKDF2 (matches Joplin native crypto) ===
+      async deriveKey(password, salt, iterations, usage) {
+        const baseKey = await crypto.subtle.importKey(
+          "raw",
+          this.buf(new TextEncoder().encode(password)),
+          { name: "PBKDF2" },
+          false,
+          ["deriveKey"]
+        );
+        return crypto.subtle.deriveKey(
+          { name: "PBKDF2", salt: this.buf(salt), iterations, hash: "SHA-512" },
+          baseKey,
+          { name: "AES-GCM", length: KEY_BYTES * 8 },
+          false,
+          usage
+        );
+      }
+      async encryptAesGcm(password, salt, data, iterations) {
+        const key = await this.deriveKey(password, salt, iterations, ["encrypt"]);
+        const iv = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
+        const ct = await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv: this.buf(iv), tagLength: GCM_TAG_BITS },
+          key,
+          this.buf(data)
+        );
+        return {
+          salt: this.bytesToBase64(salt),
+          iv: this.bytesToBase64(iv),
+          ct: this.bytesToBase64(new Uint8Array(ct))
+        };
+      }
+      async decryptAesGcm(password, salt, iv, ct, iterations) {
+        const key = await this.deriveKey(password, salt, iterations, ["decrypt"]);
+        const plain = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: this.buf(iv), tagLength: GCM_TAG_BITS },
+          key,
+          this.buf(ct)
+        );
+        return new Uint8Array(plain);
+      }
+      // === Header parsing/building (JED01) ===
+      parseHeader(ct) {
+        if (!ct.startsWith(HEADER_IDENTIFIER)) {
+          throw new Error("Invalid E2EE header (missing JED01 identifier)");
+        }
+        const mdSizeHex = ct.slice(HEADER_IDENTIFIER.length, HEADER_IDENTIFIER.length + 6);
+        const mdSize = parseInt(mdSizeHex, 16);
+        if (isNaN(mdSize) || !mdSize)
+          throw new Error("Invalid E2EE header metadata size: " + mdSizeHex);
+        const md = ct.slice(HEADER_IDENTIFIER.length + 6, HEADER_IDENTIFIER.length + 6 + mdSize);
+        const method = parseInt(md.slice(0, 2), 16);
+        const masterKeyId = md.slice(2, 34);
+        if (masterKeyId.length !== 32)
+          throw new Error("Invalid E2EE header master key ID size");
+        return { version: 1, method, masterKeyId };
+      }
+      buildHeader(method, masterKeyId) {
+        if (masterKeyId.length !== 32)
+          throw new Error("Invalid master key ID size: " + masterKeyId);
+        const metadata = method.toString(16).padStart(2, "0") + masterKeyId;
+        const mdSizeHex = metadata.length.toString(16).padStart(6, "0");
+        return HEADER_IDENTIFIER + mdSizeHex + metadata;
+      }
+      buildCipherText(method, masterKeyId, chunks) {
+        let out = this.buildHeader(method, masterKeyId);
         for (const chunk2 of chunks) {
-          out += (chunk2.length / 2).toString(16).padStart(6, "0") + chunk2;
+          out += chunk2.length.toString(16).padStart(6, "0") + chunk2;
         }
         return out;
       }
-      // === Helpers ===
-      parseJsonOrRaw(s) {
-        try {
-          return JSON.parse(s);
-        } catch {
-          return { ct: s };
+      // === Encoding helpers ===
+      utf16leEncode(s) {
+        const out = new Uint8Array(s.length * 2);
+        for (let i = 0; i < s.length; i++) {
+          const code = s.charCodeAt(i);
+          out[i * 2] = code & 255;
+          out[i * 2 + 1] = code >> 8 & 255;
         }
+        return out;
+      }
+      utf16leDecode(bytes) {
+        const chars = [];
+        for (let i = 0; i + 1 < bytes.length; i += 2) {
+          chars.push(String.fromCharCode(bytes[i] | bytes[i + 1] << 8));
+        }
+        return chars.join("");
+      }
+      base64ToBytes(b64) {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++)
+          bytes[i] = bin.charCodeAt(i);
+        return new Uint8Array(bytes.buffer);
+      }
+      bytesToBase64(bytes) {
+        let bin = "";
+        for (let i = 0; i < bytes.length; i++)
+          bin += String.fromCharCode(bytes[i]);
+        return btoa(bin);
+      }
+      arrayBufferToBase64(data) {
+        return this.bytesToBase64(new Uint8Array(data));
       }
       hexToBytes(hex) {
         if (!hex)
@@ -2775,28 +2845,19 @@ var init_EncryptionService = __esm({
         for (let i = 0; i < bytes.length; i++) {
           bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
         }
-        return bytes;
+        return new Uint8Array(bytes.buffer);
       }
       bytesToHex(bytes) {
         return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
       }
-      // Copy into a fresh concrete ArrayBuffer. TS 5.7 types `u8.buffer` as
-      // ArrayBufferLike (which includes SharedArrayBuffer), which is NOT assignable
-      // to the BufferSource that crypto.subtle expects — so we re-wrap into a
-      // guaranteed ArrayBuffer-backed view.
+      /** Copy into a fresh concrete ArrayBuffer-backed view (BufferSource compat). */
       buf(u8) {
         const out = new Uint8Array(u8.byteLength);
         out.set(u8);
-        return out;
-      }
-      concat(a, b) {
-        const out = new Uint8Array(a.length + b.length);
-        out.set(a, 0);
-        out.set(b, a.length);
-        return out;
+        return new Uint8Array(out.buffer);
       }
       get hasLoadedKeys() {
-        return this.loadedKeys.size > 0;
+        return this.masterKeyPlainTexts.size > 0;
       }
       get availableMasterKeys() {
         return [...this.masterKeyItems.keys()];
@@ -2805,7 +2866,7 @@ var init_EncryptionService = __esm({
         return this.activeMasterKeyId;
       }
       get firstLoadedKeyId() {
-        return this.loadedKeys.keys().next().value ?? null;
+        return this.masterKeyPlainTexts.keys().next().value ?? null;
       }
     };
     MasterKeyNotLoadedError = class extends Error {
@@ -3104,6 +3165,12 @@ var MappingStore = class {
     this.data.entries = this.data.entries.filter((x) => x.joplinId !== joplinId);
     this.byId.delete(joplinId);
     this.byPath.delete(e.path);
+    this.dirty = true;
+  }
+  clearAll() {
+    this.data.entries = [];
+    this.byId.clear();
+    this.byPath.clear();
     this.dirty = true;
   }
   get tombstones() {
@@ -3416,7 +3483,7 @@ async function main() {
   const [mode, vaultPath] = process.argv.slice(2);
   const noVaultModes = ["e2eetest", "deltaprobe", "lsroot", "rt", "probe2", "diag"];
   if (!mode || !vaultPath && !noVaultModes.includes(mode)) {
-    console.log("Usage: node cli/sync-cli.cjs <push|pull|sync|e2eetest|e2eeserver|e2eesync|verifyenc|diag|deltaprobe|lsroot|rt|probe2> [vaultPath]");
+    console.log("Usage: node cli/sync-cli.cjs <push|pull|sync|e2eetest|e2eeserver|e2eesync|verifyenc|verifycount|diag|deltaprobe|lsroot|rt|probe2> [vaultPath]");
     process.exit(1);
   }
   let creds = { serverUrl: "", email: "", password: "", attachmentFolder: "attachments", excludePatterns: [] };
@@ -3427,6 +3494,7 @@ async function main() {
   if (vaultPath)
     await plugin.mapping.load();
   const engine = new SyncEngine(plugin);
+  plugin.engine = engine;
   console.log(`== ${mode} ==`);
   if (mode === "push")
     await engine.forcePush();
@@ -3802,14 +3870,14 @@ async function main() {
     assert(decryptedNote.body === originalBody, "pulled note decrypts to original body (server round-trip)");
     const resId = createJoplinId2();
     const blob = new Uint8Array([1, 2, 3, 255, 0, 128, 200, 9, 42, 7, 11, 3, 200, 1]);
-    const blobCipherHex = await enc.encryptBlob(blob.buffer, mkId);
-    const blobCipherBytes = enc["hexToBytes"](blobCipherHex);
-    await plugin.api.putItem(".resource/" + resId, blobCipherBytes);
+    const blobCipherText = await enc.encryptBlob(blob.buffer, mkId);
+    const blobCipherBytes = new TextEncoder().encode(blobCipherText);
+    await plugin.api.putItem(".resource/" + resId, blobCipherBytes.buffer);
     await plugin.api.putItem(resId + ".md", ser.serialize({ id: resId, type_: ModelType2.Resource, title: "secret.png", mime: "image/png", size: blob.length, filename: "secret.png", encryption_applied: 1, encryption_cipher_text: await enc.encryptItem(ser.serialize({ id: resId, title: "secret.png", mime: "image/png", size: blob.length, filename: "secret.png" }), mkId) }), true);
     ids.push(resId);
     const pulledBlob = await plugin.api.getItemBinary(".resource/" + resId);
-    const pulledBlobHex = enc["bytesToHex"](new Uint8Array(pulledBlob));
-    const decryptedBlob = new Uint8Array(await enc.decryptBlob(pulledBlobHex, mkId));
+    const pulledBlobText = new TextDecoder().decode(pulledBlob);
+    const decryptedBlob = new Uint8Array(await enc.decryptBlob(pulledBlobText, mkId));
     assert(decryptedBlob.length === blob.length && decryptedBlob.every((b, i) => b === blob[i]), "pulled resource blob decrypts to original bytes (server round-trip)");
     const encBad = new EncryptionService2();
     encBad.feedMasterKey({ id: mkId, type_: 9, encryption_cipher_text: mk.encryptedContent });
@@ -4050,6 +4118,144 @@ async function main() {
     }
     console.log(failures === 0 ? "\n=== DEPLOYED E2EE ENCRYPTION VERIFIED \u2705 ===" : `
 === DEPLOYED E2EE ENCRYPTION FAILED \u274C (${failures}) ===`);
+    process.exit(failures === 0 ? 0 : 1);
+  } else if (mode === "verifycount") {
+    console.log("== verifycount ==");
+    const plugin2 = makePlugin(vaultPath, creds);
+    plugin2.e2ee = new EncryptionService();
+    const eng = new SyncEngine(plugin2);
+    plugin2.engine = eng;
+    await plugin2.mapping.load();
+    await plugin2.api.login();
+    let failures = 0;
+    const assert = (c, m) => {
+      console.log((c ? "  PASS: " : "  FAIL: ") + m);
+      if (!c)
+        failures++;
+    };
+    const excludes = creds.excludePatterns || [];
+    const isExcluded = (p) => excludes.some((e) => p.startsWith(e)) || p.startsWith(".obsidian/");
+    const localMd = [];
+    const localNonMd = [];
+    const fs4 = require("fs");
+    const pathMod = require("path");
+    const walkFs = (dir) => {
+      let ents;
+      try {
+        ents = fs4.readdirSync(pathMod.join(vaultPath, dir), { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of ents) {
+        const rel = dir ? dir + "/" + e.name : e.name;
+        if (e.isDirectory()) {
+          if (e.name.startsWith(".") || excludes.some((x) => (rel + "/").startsWith(x)))
+            continue;
+          walkFs(rel);
+        } else if (e.isFile()) {
+          if (isExcluded(rel))
+            continue;
+          if (rel.endsWith(".md"))
+            localMd.push(rel);
+          else
+            localNonMd.push(rel);
+        }
+      }
+    };
+    walkFs("");
+    const localTotal = localMd.length + localNonMd.length;
+    const localDirs = /* @__PURE__ */ new Set();
+    for (const f of [...localMd, ...localNonMd]) {
+      if (!f.includes("/"))
+        continue;
+      const parts = f.split("/").slice(0, -1);
+      for (let i = 1; i <= parts.length; i++)
+        localDirs.add(parts.slice(0, i).join("/"));
+    }
+    let remoteNotes = 0, remoteFolders = 0, remoteResources = 0, remoteBlobs = 0, remoteMk = 0, remoteInfo = 0;
+    let cursor;
+    while (true) {
+      const page = await plugin2.api.listChildrenOf("", cursor);
+      for (const it of page.items) {
+        if (it.name === "info.json") {
+          remoteInfo++;
+          continue;
+        }
+        if (it.name.startsWith(".resource/")) {
+          remoteBlobs++;
+          continue;
+        }
+        const m = it.name.match(/^([0-9a-f]{32})\.md$/);
+        if (!m)
+          continue;
+        try {
+          const raw = await plugin2.api.getItem(it.name);
+          if (!raw)
+            continue;
+          const item = new JoplinSerializer().unserialize(raw);
+          if (item.type_ === 1)
+            remoteNotes++;
+          else if (item.type_ === 2)
+            remoteFolders++;
+          else if (item.type_ === 4)
+            remoteResources++;
+          else if (item.type_ === 9)
+            remoteMk++;
+        } catch {
+        }
+      }
+      cursor = page.cursor;
+      if (!page.has_more || !cursor)
+        break;
+    }
+    console.log("  local:  " + localTotal + " files (" + localMd.length + " md, " + localNonMd.length + " non-md) in " + localDirs.size + " dirs");
+    console.log("  remote: " + (remoteNotes + remoteFolders + remoteResources + remoteBlobs) + " content items");
+    console.log("         " + remoteNotes + " notes, " + remoteFolders + " folders, " + remoteResources + " resource-metas, " + remoteBlobs + " blobs");
+    console.log("  infra:  " + remoteMk + " master key(s), " + remoteInfo + " info.json");
+    const remoteContent = remoteNotes + remoteFolders + remoteResources + remoteBlobs;
+    assert(remoteNotes === localMd.length, "note count matches (" + localMd.length + " local vs " + remoteNotes + " remote)");
+    assert(remoteFolders === localDirs.size, "folder count matches (" + localDirs.size + " local dirs vs " + remoteFolders + " remote folders)");
+    assert(localNonMd.length === 0 ? true : remoteBlobs >= localNonMd.length, "resource blobs cover non-md files (" + localNonMd.length + " local vs " + remoteBlobs + " remote)");
+    assert(remoteContent <= localTotal + remoteMk + remoteFolders + 2, "no runaway duplicates on server (remote " + remoteContent + " \u2264 local " + localTotal + " + infra)");
+    if (creds.e2eePassword) {
+      console.log("  E2EE: e2eePassword configured \u2014 checking ciphertext...");
+      let sampleChecked = 0, sampleEncrypted = 0, plaintextLeak = 0;
+      cursor = void 0;
+      while (true) {
+        const page = await plugin2.api.listChildrenOf("", cursor);
+        for (const it of page.items) {
+          if (!/^[0-9a-f]{32}\.md$/.test(it.name) || sampleChecked >= 10)
+            continue;
+          try {
+            const raw = await plugin2.api.getItem(it.name);
+            if (!raw)
+              continue;
+            const item = new JoplinSerializer().unserialize(raw);
+            if (item.type_ !== 1 || item.encryption_applied === 0)
+              continue;
+            sampleChecked++;
+            if (item.encryption_applied === 1 && (item.encryption_cipher_text || "").startsWith("JED01"))
+              sampleEncrypted++;
+            if ((item.body || "") !== "")
+              plaintextLeak++;
+          } catch {
+          }
+        }
+        cursor = page.cursor;
+        if (!page.has_more || !cursor || sampleChecked >= 10)
+          break;
+      }
+      if (sampleChecked > 0) {
+        assert(sampleEncrypted === sampleChecked, "sampled notes are JED01-encrypted (" + sampleEncrypted + "/" + sampleChecked + ")");
+        assert(plaintextLeak === 0, "no plaintext body leaked on server");
+      } else {
+        console.log("  (no encrypted notes found on server to sample)");
+      }
+    } else {
+      console.log("  E2EE: no e2eePassword configured \u2014 skipping ciphertext check");
+    }
+    console.log(failures === 0 ? "\n=== VERIFYCOUNT PASSED \u2705 ===" : `
+=== VERIFYCOUNT FAILED \u274C (${failures}) ===`);
     process.exit(failures === 0 ? 0 : 1);
   } else {
     console.log("Unknown mode: " + mode);

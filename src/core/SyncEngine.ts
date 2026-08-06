@@ -337,6 +337,34 @@ export class SyncEngine {
       const rootFolderId = '';
       const files = this.collectMarkdownFiles();
 
+      // ---- True-overwrite reset: delete EVERYTHING on the server first ----
+      // (except info.json and master-key items, which are infra, not content).
+      // This guarantees a clean slate: no stale/orphan/duplicate items remain
+      // from previous partial syncs (which accumulated 2000+ items on the
+      // test server while the vault only had ~30 files).
+      {
+        const remote = await this.listAllRemoteItems();
+        let wiped = 0, skipped = 0;
+        console.debug('[joplin-sync] force push reset: scanning ' + remote.length + ' remote items');
+        for (const stat of remote) {
+          if (stat.name === 'info.json') { skipped++; continue; }
+          const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
+          if (noteMatch) {
+            // Never delete master keys (type_=9) — they hold the E2EE key
+            // material and are provisioned/loaded by enableE2EE().
+            const entry = this.plugin.mapping.getById(noteMatch[1]);
+            if (entry?.type === ModelType.MasterKey) { skipped++; continue; }
+          }
+          try { await this.plugin.api.deleteItem(stat.name); wiped++; }
+          catch (e: unknown) {
+            console.warn('[joplin-sync] reset delete failed: ' + stat.name + ' - ' + (e instanceof Error ? e.message : String(e)));
+          }
+        }
+        // Clear local mapping so re-upload creates fresh IDs for everything.
+        this.plugin.mapping.clearAll();
+        console.debug('[joplin-sync] force push reset: wiped ' + wiped + ' items, kept ' + skipped + ' (info.json/master keys)');
+      }
+
       // IDs we actually push this run. Anything left on the server that is
       // NOT in here is a stale/duplicate/orphan item and must be removed so
       // that "force push" is a true overwrite (otherwise the server keeps
@@ -378,9 +406,12 @@ export class SyncEngine {
         discoverParentDirs(f.path);
       }
 
-      // Also discover empty directories from the filesystem adapter
+      // Also discover empty directories from the filesystem adapter, but only
+      // inside directories that already contain (or are ancestors of) content
+      // files. This avoids importing stray system/duplicate trees (e.g. a
+      // `<vault>/home/<user>/...` nesting Obsidian may create) as folders.
       const adapter = this.plugin.app.vault.adapter;
-      const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ folders: string[] }> };
+      const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ files: string[]; folders: string[] }> };
       if (adapter && typedAdapter.list) {
         const walkDirs = async (dir: string): Promise<void> => {
           try {
@@ -389,6 +420,13 @@ export class SyncEngine {
               const folderName = sub.split('/').pop() || '';
               if (folderName.startsWith('.')) continue; // skip hidden dirs
               const rel = dir ? dir + '/' + folderName : folderName;
+              // Only materialize dirs that have files (directly or nested).
+              let hasFiles = listing.files.length > 0;
+              const subListing = await typedAdapter.list(sub).catch(() => null);
+              if (subListing && (subListing.files.length > 0 || subListing.folders.length > 0)) {
+                hasFiles = true;
+              }
+              if (!hasFiles) continue;
               if (rel && !folderMap.has(rel)) {
                 const existing = this.plugin.mapping.getByPath(rel + '/');
                 if (existing) {

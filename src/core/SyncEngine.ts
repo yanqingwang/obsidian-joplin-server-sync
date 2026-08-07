@@ -1,4 +1,4 @@
-import { Notice, TFile } from 'obsidian';
+import { Notice, TFile, TAbstractFile } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { SyncInfoHandler } from './SyncInfo';
@@ -439,7 +439,7 @@ export class SyncEngine {
       const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ files: string[]; folders: string[] }> };
       const excludes = this.plugin.settings.excludePatterns;
       const isExcludedDir = (rel: string) => excludes.some(e => (rel + '/').startsWith(e));
-      const SYSTEM_TOP_DIRS = new Set(['home', 'Library', 'node_modules']);
+      const SYSTEM_TOP_DIRS = new Set(['home', 'Library', 'node_modules', 'tmp', 'private', 'Users']);
       if (adapter && typedAdapter.list) {
         const walkDirs = async (dir: string): Promise<void> => {
           try {
@@ -637,7 +637,9 @@ export class SyncEngine {
       // Delete all non-kept files
       for (const f of this.plugin.app.vault.getFiles()) {
         if (!isKept(f.path)) {
-          await this.plugin.app.fileManager.trashFile(f).catch(() => {});
+          const fm = this.plugin.app.fileManager as unknown as { trashFile?: (f: TAbstractFile) => Promise<void> } | undefined;
+          if (fm?.trashFile) await fm.trashFile(f).catch(() => {});
+          else await (this.plugin.app.vault as unknown as { remove: (x: TAbstractFile) => Promise<void> }).remove(f).catch(() => {});
           delCount++;
         }
       }

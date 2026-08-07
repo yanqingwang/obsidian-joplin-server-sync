@@ -2323,7 +2323,7 @@ var SyncEngine = class {
       const typedAdapter = adapter;
       const excludes = this.plugin.settings.excludePatterns;
       const isExcludedDir = (rel) => excludes.some((e) => (rel + "/").startsWith(e));
-      const SYSTEM_TOP_DIRS = /* @__PURE__ */ new Set(["home", "Library", "node_modules"]);
+      const SYSTEM_TOP_DIRS = /* @__PURE__ */ new Set(["home", "Library", "node_modules", "tmp", "private", "Users"]);
       if (adapter && typedAdapter.list) {
         const walkDirs = async (dir) => {
           try {
@@ -2550,8 +2550,13 @@ var SyncEngine = class {
       let delCount = 0, delDirCount = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
         if (!isKept(f.path)) {
-          await this.plugin.app.fileManager.trashFile(f).catch(() => {
-          });
+          const fm = this.plugin.app.fileManager;
+          if (fm?.trashFile)
+            await fm.trashFile(f).catch(() => {
+            });
+          else
+            await this.plugin.app.vault.remove(f).catch(() => {
+            });
           delCount++;
         }
       }

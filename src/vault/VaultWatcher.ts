@@ -1,11 +1,17 @@
 import { TAbstractFile, TFile, TFolder } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
-import { ChangeQueue } from '../core/ChangeQueue';
+import { ChangeLogStore, ChangeOp } from '../core/ChangeLogStore';
+import { ModelType } from '../api/models';
 
+/**
+ * Watches Obsidian vault events and records them into the persistent
+ * ChangeLogStore (the "local change list"). Each change carries the file's
+ * stable fileId so multi-terminal sync can converge on the same server item.
+ */
 export class VaultWatcher {
   private suppressed = new Set<string>();
 
-  constructor(private plugin: JoplinSyncPlugin, private queue: ChangeQueue) {}
+  constructor(private plugin: JoplinSyncPlugin, private changeLog: ChangeLogStore) {}
 
   start(): void {
     const v = this.plugin.app.vault;
@@ -21,13 +27,39 @@ export class VaultWatcher {
   private onEvent(kind: 'create' | 'modify' | 'delete', f: TAbstractFile): void {
     if (this.suppressed.has(f.path)) return;
     if (!this.shouldTrack(f)) return;
-    this.queue.push({ kind, path: f.path, isFolder: f instanceof TFolder, time: Date.now() });
+    void this.record(kind, f.path, undefined, f instanceof TFolder, f instanceof TFile ? f : undefined);
   }
 
   private onRename(f: TAbstractFile, oldPath: string): void {
     if (this.suppressed.has(f.path)) return;
-    if (!this.shouldTrack(f)) return;
-    this.queue.push({ kind: 'rename', path: f.path, oldPath, isFolder: f instanceof TFolder, time: Date.now() });
+    if (!this.suppressed.has(oldPath)) {
+      if (!this.shouldTrack(f)) return;
+      void this.record('rename', f.path, oldPath, f instanceof TFolder, f instanceof TFile ? f : undefined);
+    }
+  }
+
+  private async record(
+    kind: 'create' | 'modify' | 'delete' | 'rename',
+    path: string,
+    oldPath: string | undefined,
+    isFolder: boolean,
+    file: TFile | undefined,
+  ): Promise<void> {
+    // Folders: no frontmatter id — use path-based identity.
+    if (isFolder) {
+      const folderId = 'dir:' + path.replace(/\/$/, '');
+      this.changeLog.push({ fileId: folderId, op: kind === 'modify' ? 'update' : kind, path, oldPath, type: ModelType.Folder });
+      return;
+    }
+    if (!file) return;
+    // Files: stable fileId from frontmatter (mints one on first touch).
+    const fileId = await this.plugin.identity.ensureId(file);
+    const op: ChangeOp = kind === 'modify' ? 'update' : kind;
+    let hash: string | undefined;
+    if (kind !== 'delete') {
+      try { hash = await this.plugin.engine.sha256Of(file); } catch { /* best effort */ }
+    }
+    this.changeLog.push({ fileId, op, path, oldPath, type: ModelType.Note, hash });
   }
 
   private shouldTrack(f: TAbstractFile): boolean {
@@ -35,10 +67,6 @@ export class VaultWatcher {
     if (f.path.startsWith(this.plugin.app.vault.configDir + '/')) return false;
     if (f.path.startsWith('_conflicts/')) return false;
     if (s.excludePatterns.some(p => f.path.startsWith(p))) return false;
-    // Track .md files and potential attachment files
-    if (f instanceof TFile && f.extension !== 'md') {
-      return true; // Phase 3: track attachments
-    }
     return true;
   }
 }

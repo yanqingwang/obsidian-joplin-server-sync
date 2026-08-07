@@ -22,6 +22,8 @@ import { DEFAULT_SETTINGS } from '../src/settings/PluginSettings';
 import { JoplinSerializer } from '../src/convert/JoplinSerializer';
 import { ModelType } from '../src/api/models';
 import { EncryptionService } from '../src/e2ee/EncryptionService';
+import { ChangeLogStore } from '../src/core/ChangeLogStore';
+import { FileIdentity } from '../src/core/FileIdentity';
 
 function loadCreds(vaultPath: string) {
   const p = path.join(vaultPath, '.obsidian/plugins/joplin-server-sync/data.json');
@@ -56,6 +58,8 @@ function makePlugin(vaultRoot: string, creds: any) {
     e2ee: new EncryptionService(),
   };
   plugin.mapping = new MappingStore(plugin);
+  plugin.changeLog = new ChangeLogStore(plugin);
+  plugin.identity = new FileIdentity(plugin);
   return plugin;
 }
 
@@ -70,7 +74,7 @@ async function main() {
   if (vaultPath) creds = loadCreds(vaultPath);
   setVaultRoot(vaultPath || '');
   const plugin = makePlugin(vaultPath || process.cwd(), creds);
-  if (vaultPath) await plugin.mapping.load();
+  if (vaultPath) { await plugin.mapping.load(); await plugin.changeLog.load(); }
   const engine = new SyncEngine(plugin);
   plugin.engine = engine;
   console.log(`== ${mode} ==`);

@@ -172,11 +172,15 @@ export class SyncEngine {
   }
 
   private async uploadNote(file: TFile, parentId: string, force = false): Promise<boolean> {
-    const content = await this.plugin.app.vault.read(file);
+    // Stable identity from frontmatter — forcePush also stamps files that
+    // predate the fileId feature so multi-terminal sync converges.
+    let content = await this.plugin.app.vault.read(file);
+    const fileId = await this.plugin.identity.ensureId(file);
+    content = await this.plugin.app.vault.read(file);
     const hash = await sha256(content);
-    const existing = this.plugin.mapping.getByPath(file.path);
+    const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(file.path);
     if (!force && existing && existing.localHash === hash) return false;
-    const id = existing?.joplinId ?? createJoplinId();
+    const id = existing?.joplinId ?? fileId;
     const item: JoplinItem = {
       id, parent_id: parentId, title: file.basename, body: content,
       created_time: file.stat.ctime, updated_time: file.stat.mtime,
@@ -240,24 +244,18 @@ export class SyncEngine {
 
   // ============ Phase 2: Watcher + Scheduler ============
   startWatching(): void {
-    this.queue = new ChangeQueue(this.plugin);
-    void this.queue.restore();
-    this.watcher = new VaultWatcher(this.plugin, this.queue);
+    this.watcher = new VaultWatcher(this.plugin, this.plugin.changeLog);
     this.watcher.start();
-    this.pusher = new LocalPusher(this.plugin, this.queue);
+    this.pusher = new LocalPusher(this.plugin, this.plugin.changeLog);
     this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
   }
 
   private ensureReady(): void {
-    if (!this.queue) {
-      this.queue = new ChangeQueue(this.plugin);
-      void this.queue.restore();
-    }
     if (!this.watcher) {
-      this.watcher = new VaultWatcher(this.plugin, this.queue);
+      this.watcher = new VaultWatcher(this.plugin, this.plugin.changeLog);
       this.watcher.start();
     }
-    if (!this.pusher) this.pusher = new LocalPusher(this.plugin, this.queue);
+    if (!this.pusher) this.pusher = new LocalPusher(this.plugin, this.plugin.changeLog);
     if (!this.deltaPuller) this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
   }
 
@@ -327,6 +325,12 @@ export class SyncEngine {
 
   async shutdown(): Promise<void> {
     if (this.timer) window.clearInterval(this.timer);
+  }
+
+  /** SHA-256 of a TFile's current content (used by the watcher). */
+  async sha256Of(file: TFile): Promise<string> {
+    const content = await this.plugin.app.vault.read(file);
+    return sha256(content);
   }
 
   // Phase 3: pre-assign note ID for link resolution

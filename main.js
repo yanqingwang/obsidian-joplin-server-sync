@@ -754,86 +754,12 @@ function createJoplinId() {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// src/core/ChangeQueue.ts
-var ChangeQueue = class {
-  constructor(plugin) {
-    this.plugin = plugin;
-    this.items = /* @__PURE__ */ new Map();
-    this.debounceMs = 3e3;
-    this.persistTimer = null;
-  }
-  push(change) {
-    const prev = this.items.get(change.oldPath ?? change.path);
-    if (change.kind === "rename" && prev) {
-      this.items.delete(change.oldPath);
-    }
-    const merged = this.merge(prev, change);
-    if (merged)
-      this.items.set(change.path, merged);
-    else
-      this.items.delete(change.path);
-    this.persist();
-  }
-  drain() {
-    const now = Date.now();
-    const ready = [];
-    for (const [path, c] of this.items) {
-      if (now - c.time >= this.debounceMs) {
-        ready.push(c);
-        this.items.delete(path);
-      }
-    }
-    this.persist();
-    return ready.sort((a, b) => Number(b.isFolder) - Number(a.isFolder) || a.time - b.time);
-  }
-  requeue(changes) {
-    for (const c of changes)
-      this.items.set(c.path, c);
-    this.persist();
-  }
-  get size() {
-    return this.items.size;
-  }
-  merge(prev, next) {
-    if (!prev)
-      return next;
-    if (prev.kind === "create" && next.kind === "delete")
-      return null;
-    if (prev.kind === "create" && next.kind === "modify")
-      return { ...next, kind: "create" };
-    if (next.kind === "rename" && prev.kind === "create")
-      return { ...next, kind: "create", oldPath: void 0 };
-    return next;
-  }
-  persist() {
-    if (this.persistTimer)
-      return;
-    this.persistTimer = window.setTimeout(async () => {
-      this.persistTimer = null;
-      const adapter = this.plugin.app.vault.adapter;
-      await adapter.write(
-        this.plugin.manifest.dir + "/data/queue.json",
-        JSON.stringify([...this.items.values()])
-      );
-    }, 500);
-  }
-  async restore() {
-    const adapter = this.plugin.app.vault.adapter;
-    const p = this.plugin.manifest.dir + "/data/queue.json";
-    if (await adapter.exists(p)) {
-      for (const c of JSON.parse(await adapter.read(p))) {
-        this.items.set(c.path, c);
-      }
-    }
-  }
-};
-
 // src/vault/VaultWatcher.ts
 var import_obsidian3 = require("obsidian");
 var VaultWatcher = class {
-  constructor(plugin, queue) {
+  constructor(plugin, changeLog) {
     this.plugin = plugin;
-    this.queue = queue;
+    this.changeLog = changeLog;
     this.suppressed = /* @__PURE__ */ new Set();
   }
   start() {
@@ -854,14 +780,35 @@ var VaultWatcher = class {
       return;
     if (!this.shouldTrack(f))
       return;
-    this.queue.push({ kind, path: f.path, isFolder: f instanceof import_obsidian3.TFolder, time: Date.now() });
+    void this.record(kind, f.path, void 0, f instanceof import_obsidian3.TFolder, f instanceof import_obsidian3.TFile ? f : void 0);
   }
   onRename(f, oldPath) {
     if (this.suppressed.has(f.path))
       return;
-    if (!this.shouldTrack(f))
+    if (!this.suppressed.has(oldPath)) {
+      if (!this.shouldTrack(f))
+        return;
+      void this.record("rename", f.path, oldPath, f instanceof import_obsidian3.TFolder, f instanceof import_obsidian3.TFile ? f : void 0);
+    }
+  }
+  async record(kind, path, oldPath, isFolder, file) {
+    if (isFolder) {
+      const folderId = "dir:" + path.replace(/\/$/, "");
+      this.changeLog.push({ fileId: folderId, op: kind === "modify" ? "update" : kind, path, oldPath, type: 2 /* Folder */ });
       return;
-    this.queue.push({ kind: "rename", path: f.path, oldPath, isFolder: f instanceof import_obsidian3.TFolder, time: Date.now() });
+    }
+    if (!file)
+      return;
+    const fileId = await this.plugin.identity.ensureId(file);
+    const op = kind === "modify" ? "update" : kind;
+    let hash;
+    if (kind !== "delete") {
+      try {
+        hash = await this.plugin.engine.sha256Of(file);
+      } catch {
+      }
+    }
+    this.changeLog.push({ fileId, op, path, oldPath, type: 1 /* Note */, hash });
   }
   shouldTrack(f) {
     const s = this.plugin.settings;
@@ -871,9 +818,6 @@ var VaultWatcher = class {
       return false;
     if (s.excludePatterns.some((p) => f.path.startsWith(p)))
       return false;
-    if (f instanceof import_obsidian3.TFile && f.extension !== "md") {
-      return true;
-    }
     return true;
   }
 };
@@ -1107,14 +1051,14 @@ var ResourceManager = class {
 
 // src/core/LocalPusher.ts
 var LocalPusher = class {
-  constructor(plugin, queue) {
+  constructor(plugin, changeLog) {
     this.plugin = plugin;
-    this.queue = queue;
+    this.changeLog = changeLog;
     this.serializer = new JoplinSerializer();
     this.resources = new ResourceManager(plugin);
   }
   async pushAll() {
-    const changes = this.queue.drain();
+    const changes = this.changeLog.pending();
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
     const failed = [];
     for (const change of changes) {
@@ -1126,29 +1070,28 @@ var LocalPusher = class {
           stats.updated++;
         else if (op === "delete")
           stats.deleted++;
+        this.changeLog.markSynced(change.fileId);
       } catch (e) {
         console.error("[joplin-sync] push failed: " + change.path, e);
         stats.fail++;
         failed.push(change);
       }
     }
-    if (failed.length)
-      this.queue.requeue(failed);
     return stats;
   }
   async pushOne(c) {
-    switch (c.kind) {
+    switch (c.op) {
       case "create":
-        return this.upsertItem(c.path);
-      case "modify":
-        return this.upsertItem(c.path);
+        return this.upsertItem(c.path, c.fileId);
+      case "update":
+        return this.upsertItem(c.path, c.fileId);
       case "delete":
-        return this.deleteItem(c.path, c.isFolder);
+        return this.deleteItem(c.path, c.fileId, c.type === 2 /* Folder */);
       case "rename":
-        return this.renameItem(c.oldPath, c.path, c.isFolder);
+        return this.renameItem(c.oldPath, c.path, c.fileId, c.type === 2 /* Folder */);
     }
   }
-  async upsertItem(path) {
+  async upsertItem(path, fileId) {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
     if (!af)
       return "none";
@@ -1162,15 +1105,15 @@ var LocalPusher = class {
       await this.resources.uploadResource(af);
       return "create";
     }
-    const parentPath = af.parent?.path === "/" ? "" : af.parent.path + "/";
+    const parentPath = af.parent && af.parent.path && af.parent.path !== "/" ? af.parent.path + "/" : path.includes("/") ? path.slice(0, path.lastIndexOf("/")) + "/" : "";
     const parentId = await this.ensureFolderChain(parentPath || "");
     const content = await this.plugin.app.vault.read(af);
     const hash = await sha256(content);
-    const existing = this.plugin.mapping.getByPath(path);
+    const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(path);
     if (existing?.localHash === hash)
       return "none";
     const isNew = !existing;
-    const id = existing?.joplinId ?? createJoplinId();
+    const id = existing?.joplinId ?? fileId;
     let base = {};
     if (existing) {
       const remote = await this.plugin.api.getItem(id + ".md");
@@ -1234,25 +1177,26 @@ var LocalPusher = class {
     });
     return isNew ? "create" : "update";
   }
-  async deleteItem(path, isFolder) {
+  async deleteItem(path, fileId, isFolder) {
     const key = isFolder ? path + "/" : path;
-    const entry = this.plugin.mapping.getByPath(key);
+    const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
     if (!entry)
       return "none";
     await this.plugin.api.deleteItem(entry.joplinId + ".md");
     this.plugin.mapping.remove(entry.joplinId);
+    this.plugin.mapping.addTombstone(entry.joplinId, entry.type);
     return "delete";
   }
-  async renameItem(oldPath, newPath, isFolder) {
+  async renameItem(oldPath, newPath, fileId, isFolder) {
     const key = isFolder ? oldPath + "/" : oldPath;
-    const entry = this.plugin.mapping.getByPath(key);
+    const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
     if (!entry)
-      return this.upsertItem(newPath);
+      return this.upsertItem(newPath, fileId);
     if (isFolder)
       this.plugin.mapping.renamePrefix(oldPath + "/", newPath + "/");
     else
       this.plugin.mapping.upsert({ ...entry, path: newPath });
-    return this.upsertItem(isFolder ? newPath : newPath);
+    return this.upsertItem(isFolder ? newPath : newPath, fileId);
   }
   async ensureFolderChain(folderPath) {
     if (!folderPath || folderPath === "/")
@@ -1304,12 +1248,85 @@ var ConflictResolver = class {
     this.watcher = watcher;
   }
   async resolve(mapping, remote, localContent, targetPath) {
+    const base = await this.readBase(mapping);
+    if (base !== null) {
+      const merged = this.tryMerge(base, localContent, remote.body ?? "");
+      if (merged) {
+        await this.applyMerged(mapping, remote, merged, targetPath);
+        return;
+      }
+    }
+    await this.resolveByStrategy(mapping, remote, localContent, targetPath);
+  }
+  /** Read base content if stored (mapping keeps only a hash — subclasses may persist full base). */
+  async readBase(mapping) {
+    const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
+    if (f instanceof import_obsidian6.TFile) {
+      const content = await this.plugin.app.vault.read(f);
+      const h = await sha256(content);
+      if (h === mapping.localHash)
+        return content;
+    }
+    return null;
+  }
+  /** Line-based merge: identical base lines are dropped; diverging hunks kept. */
+  tryMerge(base, local, remote) {
+    const b = base.split("\n"), l = local.split("\n"), r = remote.split("\n");
+    if (l.join("\n") === b.join("\n"))
+      return remote;
+    if (r.join("\n") === b.join("\n"))
+      return local;
+    const out = [];
+    let conflict = false;
+    const max = Math.max(b.length, l.length, r.length);
+    for (let i = 0; i < max; i++) {
+      const lb = b[i], ll = l[i], lr = r[i];
+      if (ll !== void 0 && ll === lb) {
+        if (lr !== void 0)
+          out.push(lr);
+      } else if (lr !== void 0 && lr === lb) {
+        if (ll !== void 0)
+          out.push(ll);
+      } else if (ll === lr) {
+        out.push(ll ?? "");
+      } else if (ll === void 0 && lr === void 0) {
+        continue;
+      } else {
+        conflict = true;
+        break;
+      }
+    }
+    if (conflict)
+      return null;
+    return out.join("\n");
+  }
+  async applyMerged(mapping, remote, merged, targetPath) {
+    const f = this.plugin.app.vault.getAbstractFileByPath(targetPath);
+    this.watcher.suppress(targetPath);
+    try {
+      if (f instanceof import_obsidian6.TFile)
+        await this.plugin.app.vault.modify(f, merged);
+      else
+        await this.plugin.app.vault.create(targetPath, merged);
+    } finally {
+      this.watcher.release(targetPath);
+    }
+    this.plugin.mapping.upsert({
+      ...mapping,
+      path: targetPath,
+      localHash: await sha256(merged),
+      remoteUpdatedTime: remote.updated_time,
+      syncedAt: Date.now()
+    });
+    new import_obsidian6.Notice("Sync: auto-merged changes for " + targetPath);
+  }
+  async resolveByStrategy(mapping, remote, localContent, targetPath) {
     switch (this.plugin.settings.conflictStrategy) {
       case "local-wins":
-        this.plugin.mapping.upsert({ ...mapping, remoteUpdatedTime: remote.updated_time });
+        this.plugin.mapping.upsert({ ...mapping, path: targetPath, remoteUpdatedTime: remote.updated_time });
         return;
       case "remote-wins":
-        return this.applyRemote(mapping, remote);
+        return this.applyRemote(mapping, remote, targetPath);
       case "duplicate":
       default: {
         const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "");
@@ -1322,24 +1339,25 @@ var ConflictResolver = class {
         this.watcher.suppress(conflictPath);
         await this.plugin.app.vault.create(conflictPath, localContent);
         this.watcher.release(conflictPath);
-        await this.applyRemote(mapping, remote);
+        await this.applyRemote(mapping, remote, targetPath);
         new import_obsidian6.Notice("Sync conflict: local copy saved to " + conflictPath);
       }
     }
   }
-  async applyRemote(mapping, remote) {
-    const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
-    this.watcher.suppress(mapping.path);
+  async applyRemote(mapping, remote, targetPath) {
+    const f = this.plugin.app.vault.getAbstractFileByPath(targetPath);
+    this.watcher.suppress(targetPath);
     try {
       if (f instanceof import_obsidian6.TFile)
         await this.plugin.app.vault.modify(f, remote.body ?? "");
       else
-        await this.plugin.app.vault.create(mapping.path, remote.body ?? "");
+        await this.plugin.app.vault.create(targetPath, remote.body ?? "");
     } finally {
-      this.watcher.release(mapping.path);
+      this.watcher.release(targetPath);
     }
     this.plugin.mapping.upsert({
       ...mapping,
+      path: targetPath,
       localHash: await sha256(remote.body ?? ""),
       remoteUpdatedTime: remote.updated_time,
       syncedAt: Date.now()
@@ -1417,8 +1435,8 @@ var DeltaPuller = class {
     }
     for (const id of deletes) {
       try {
-        await this.applyDelete(id);
-        stats.deleted++;
+        if (await this.applyDelete(id))
+          stats.deleted++;
       } catch (e) {
         stats.fail++;
         console.error("[joplin-sync] delta delete failed", id, e);
@@ -1515,7 +1533,7 @@ var DeltaPuller = class {
     const targetDir = this.resolveFolderPath(item.parent_id);
     const targetPath = this.uniquePath(targetDir, this.sanitize(item.title), item.id);
     if (!mapping) {
-      await this.writeFile(targetPath, item.body ?? "");
+      await this.writeNoteWithId(targetPath, item.body ?? "", item.id);
       await this.saveMapping(item, targetPath);
       return true;
     }
@@ -1535,9 +1553,28 @@ var DeltaPuller = class {
       this.watcher.release(mapping.path);
       this.watcher.release(targetPath);
     }
-    await this.writeFile(targetPath, item.body ?? "");
+    await this.writeNoteWithId(targetPath, item.body ?? "", item.id);
     await this.saveMapping(item, targetPath);
     return false;
+  }
+  /** Write a note, stamping the server item id as frontmatter fileId so other
+   *  terminals reading this file converge on the same identity. */
+  async writeNoteWithId(path, body, fileId) {
+    const stamped = this.stampFrontmatter(body, fileId);
+    await this.writeFile(path, stamped);
+  }
+  stampFrontmatter(body, fileId) {
+    const line = "joplin-file-id: " + fileId;
+    if (body.startsWith("---")) {
+      const end = body.indexOf("\n---", 4);
+      if (end >= 0) {
+        const fm = body.slice(0, end + 1);
+        const rest = body.slice(end + 1);
+        const re = /^joplin-file-id:.*$/m;
+        return re.test(fm) ? fm.replace(re, line) + rest : fm + "\n" + line + rest;
+      }
+    }
+    return "---\n" + line + "\n---\n" + body;
   }
   async applyFolder(item) {
     const parentPath = this.resolveFolderPath(item.parent_id);
@@ -1584,20 +1621,26 @@ var DeltaPuller = class {
   async applyDelete(id) {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping)
-      return;
+      return false;
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
     if (f) {
       this.watcher.suppress(f.path);
       if (f instanceof import_obsidian7.TFile) {
-        this.plugin.app.fileManager.trashFile(f).catch(() => {
-        });
+        const fm = this.plugin.app.fileManager;
+        if (fm?.trashFile)
+          await fm.trashFile(f).catch(() => {
+          });
+        else
+          await this.plugin.app.vault.remove(f).catch(() => {
+          });
       } else if ("remove" in this.plugin.app.vault) {
-        this.plugin.app.vault.remove(f).catch(() => {
+        await this.plugin.app.vault.remove(f).catch(() => {
         });
       }
       this.watcher.release(f.path);
     }
     this.plugin.mapping.remove(id);
+    return true;
   }
   async writeFile(path, content) {
     this.watcher.suppress(path);
@@ -1983,12 +2026,14 @@ var SyncEngine = class {
     }
   }
   async uploadNote(file, parentId, force = false) {
-    const content = await this.plugin.app.vault.read(file);
+    let content = await this.plugin.app.vault.read(file);
+    const fileId = await this.plugin.identity.ensureId(file);
+    content = await this.plugin.app.vault.read(file);
     const hash = await sha256(content);
-    const existing = this.plugin.mapping.getByPath(file.path);
+    const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(file.path);
     if (!force && existing && existing.localHash === hash)
       return false;
-    const id = existing?.joplinId ?? createJoplinId();
+    const id = existing?.joplinId ?? fileId;
     const item = {
       id,
       parent_id: parentId,
@@ -2062,24 +2107,18 @@ var SyncEngine = class {
   }
   // ============ Phase 2: Watcher + Scheduler ============
   startWatching() {
-    this.queue = new ChangeQueue(this.plugin);
-    void this.queue.restore();
-    this.watcher = new VaultWatcher(this.plugin, this.queue);
+    this.watcher = new VaultWatcher(this.plugin, this.plugin.changeLog);
     this.watcher.start();
-    this.pusher = new LocalPusher(this.plugin, this.queue);
+    this.pusher = new LocalPusher(this.plugin, this.plugin.changeLog);
     this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
   }
   ensureReady() {
-    if (!this.queue) {
-      this.queue = new ChangeQueue(this.plugin);
-      void this.queue.restore();
-    }
     if (!this.watcher) {
-      this.watcher = new VaultWatcher(this.plugin, this.queue);
+      this.watcher = new VaultWatcher(this.plugin, this.plugin.changeLog);
       this.watcher.start();
     }
     if (!this.pusher)
-      this.pusher = new LocalPusher(this.plugin, this.queue);
+      this.pusher = new LocalPusher(this.plugin, this.plugin.changeLog);
     if (!this.deltaPuller)
       this.deltaPuller = new DeltaPuller(this.plugin, this.watcher);
   }
@@ -2147,6 +2186,11 @@ var SyncEngine = class {
   async shutdown() {
     if (this.timer)
       window.clearInterval(this.timer);
+  }
+  /** SHA-256 of a TFile's current content (used by the watcher). */
+  async sha256Of(file) {
+    const content = await this.plugin.app.vault.read(file);
+    return sha256(content);
   }
   // Phase 3: pre-assign note ID for link resolution
   async preassignNoteId(file) {
@@ -3242,6 +3286,166 @@ var EncryptionService = class {
   }
 };
 
+// src/core/ChangeLogStore.ts
+var ChangeLogStore = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.data = { entries: [] };
+    this.dirty = false;
+    this.persistTimer = null;
+  }
+  get filePath() {
+    return this.plugin.manifest.dir + "/data/changelog.json";
+  }
+  async load() {
+    const adapter = this.plugin.app.vault.adapter;
+    if (adapter.exists && await adapter.exists(this.filePath)) {
+      try {
+        this.data = JSON.parse(await adapter.read(this.filePath));
+      } catch {
+        this.data = { entries: [] };
+      }
+    }
+  }
+  /** Append or merge a change for a fileId (coalesce rapid successive ops). */
+  push(entry) {
+    const now = Date.now();
+    const existingIdx = this.data.entries.findIndex((e) => e.fileId === entry.fileId && e.status === "pending");
+    if (existingIdx >= 0) {
+      const prev = this.data.entries[existingIdx];
+      if (prev.op === "create" && entry.op === "delete") {
+        this.data.entries.splice(existingIdx, 1);
+      } else if (prev.op === "create" && entry.op === "update") {
+        this.data.entries[existingIdx] = { ...prev, path: entry.path, hash: entry.hash, timestamp: now };
+      } else {
+        this.data.entries[existingIdx] = { ...prev, op: entry.op, path: entry.path, oldPath: entry.oldPath ?? prev.oldPath, hash: entry.hash ?? prev.hash, timestamp: now };
+      }
+    } else {
+      this.data.entries.push({ ...entry, timestamp: now, status: "pending" });
+    }
+    this.dirty = true;
+    void this.persist();
+  }
+  pending() {
+    return this.data.entries.filter((e) => e.status === "pending");
+  }
+  all() {
+    return this.data.entries;
+  }
+  markSynced(fileId) {
+    const e = this.data.entries.find((x) => x.fileId === fileId && x.status === "pending");
+    if (e) {
+      e.status = "synced";
+      this.dirty = true;
+      void this.persist();
+    }
+  }
+  /** Remove synced entries older than the retention window. */
+  prune(maxAgeMs = 7 * 24 * 3600 * 1e3) {
+    const cutoff = Date.now() - maxAgeMs;
+    const before = this.data.entries.length;
+    this.data.entries = this.data.entries.filter((e) => e.status === "pending" || e.timestamp >= cutoff);
+    if (this.data.entries.length !== before) {
+      this.dirty = true;
+      void this.persist();
+    }
+  }
+  async persist() {
+    if (this.persistTimer)
+      return;
+    this.persistTimer = window.setTimeout(async () => {
+      this.persistTimer = null;
+      try {
+        const adapter = this.plugin.app.vault.adapter;
+        const dir = this.plugin.manifest.dir + "/data";
+        if (!await adapter.exists(dir))
+          await adapter.mkdir(dir);
+        await adapter.write(this.filePath, JSON.stringify(this.data));
+        this.dirty = false;
+      } catch {
+      }
+    }, 500);
+  }
+  async flush() {
+    if (!this.dirty)
+      return;
+    const adapter = this.plugin.app.vault.adapter;
+    try {
+      const dir = this.plugin.manifest.dir + "/data";
+      if (!await adapter.exists(dir))
+        await adapter.mkdir(dir);
+      await adapter.write(this.filePath, JSON.stringify(this.data));
+      this.dirty = false;
+    } catch {
+    }
+  }
+};
+
+// src/core/FileIdentity.ts
+var FILE_ID_FIELD = "joplin-file-id";
+var FileIdentity = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+  /** Read the stable id from frontmatter, or mint + persist a new one. */
+  async ensureId(file) {
+    const content = await this.plugin.app.vault.read(file);
+    const existing = this.readFromFrontmatter(content);
+    if (existing)
+      return existing;
+    const mapped = this.plugin.mapping.getByPath(file.path);
+    if (mapped?.joplinId) {
+      await this.writeToFrontmatter(file, content, mapped.joplinId);
+      return mapped.joplinId;
+    }
+    const id = createJoplinId();
+    await this.writeToFrontmatter(file, content, id);
+    return id;
+  }
+  readFromFrontmatter(content) {
+    if (!content.startsWith("---"))
+      return null;
+    const end = content.indexOf("\n---", 4);
+    if (end < 0)
+      return null;
+    const fm = content.slice(4, end);
+    const m = fm.match(new RegExp("^" + FILE_ID_FIELD + ":\\s*(\\S+)", "m"));
+    return m ? m[1] : null;
+  }
+  /** Inject (or replace) the id in YAML frontmatter. */
+  async writeToFrontmatter(file, content, id) {
+    const watcher = this.plugin.engine?.watcher;
+    const write = async () => {
+      let newContent;
+      if (content.startsWith("---")) {
+        const end = content.indexOf("\n---", 4);
+        const rest = end >= 0 ? content.slice(end + 1) : content;
+        const fm = end >= 0 ? content.slice(0, end + 1) : content;
+        newContent = this.upsertFrontmatter(fm, id) + rest;
+      } else {
+        newContent = "---\n" + FILE_ID_FIELD + ": " + id + "\n---\n" + content;
+      }
+      if (newContent !== content)
+        await this.plugin.app.vault.modify(file, newContent);
+    };
+    if (watcher?.suppress) {
+      watcher.suppress(file.path);
+      try {
+        await write();
+      } finally {
+        watcher.release(file.path);
+      }
+    } else {
+      await write();
+    }
+  }
+  upsertFrontmatter(fm, id) {
+    const line = FILE_ID_FIELD + ": " + id;
+    const re = new RegExp("^" + FILE_ID_FIELD + ":.*$", "m");
+    return re.test(fm) ? fm.replace(re, line) : fm + "\n" + line;
+  }
+};
+
 // src/main.ts
 var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
   constructor() {
@@ -3257,8 +3461,11 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
     }));
     this.mapping = new MappingStore(this);
     await this.mapping.load();
+    this.changeLog = new ChangeLogStore(this);
+    await this.changeLog.load();
     this.statusBar = new StatusBar(this.addStatusBarItem());
     this.e2ee = new EncryptionService();
+    this.identity = new FileIdentity(this);
     this.engine = new SyncEngine(this);
     this.addSettingTab(new JoplinSyncSettingTab(this.app, this));
     this.addCommand({

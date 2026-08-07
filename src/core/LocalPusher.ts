@@ -1,6 +1,6 @@
 import { TFile, TFolder } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
-import { ChangeQueue, LocalChange } from './ChangeQueue';
+import { ChangeLogStore, ChangeLogEntry } from './ChangeLogStore';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { createJoplinId } from '../mapping/IdGenerator';
 import { ModelType, JoplinItem } from '../api/models';
@@ -11,40 +11,40 @@ export class LocalPusher {
   private serializer = new JoplinSerializer();
   private resources: ResourceManager;
 
-  constructor(private plugin: JoplinSyncPlugin, private queue: ChangeQueue) {
+  constructor(private plugin: JoplinSyncPlugin, private changeLog: ChangeLogStore) {
     this.resources = new ResourceManager(plugin);
   }
 
   async pushAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
-    const changes = this.queue.drain();
+    const changes = this.changeLog.pending();
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
-    const failed: LocalChange[] = [];
+    const failed: ChangeLogEntry[] = [];
     for (const change of changes) {
       try {
         const op = await this.pushOne(change);
         if (op === 'create') stats.created++;
         else if (op === 'update') stats.updated++;
         else if (op === 'delete') stats.deleted++;
+        this.changeLog.markSynced(change.fileId);
       } catch (e) {
         console.error('[joplin-sync] push failed: ' + change.path, e);
         stats.fail++;
         failed.push(change);
       }
     }
-    if (failed.length) this.queue.requeue(failed);
     return stats;
   }
 
-  private async pushOne(c: LocalChange): Promise<'create' | 'update' | 'delete' | 'none'> {
-    switch (c.kind) {
-      case 'create': return this.upsertItem(c.path);
-      case 'modify': return this.upsertItem(c.path);
-      case 'delete': return this.deleteItem(c.path, c.isFolder);
-      case 'rename': return this.renameItem(c.oldPath!, c.path, c.isFolder);
+  private async pushOne(c: ChangeLogEntry): Promise<'create' | 'update' | 'delete' | 'none'> {
+    switch (c.op) {
+      case 'create': return this.upsertItem(c.path, c.fileId);
+      case 'update': return this.upsertItem(c.path, c.fileId);
+      case 'delete': return this.deleteItem(c.path, c.fileId, c.type === ModelType.Folder);
+      case 'rename': return this.renameItem(c.oldPath!, c.path, c.fileId, c.type === ModelType.Folder);
     }
   }
 
-  private async upsertItem(path: string): Promise<'create' | 'update' | 'none'> {
+  private async upsertItem(path: string, fileId: string): Promise<'create' | 'update' | 'none'> {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
     if (!af) return 'none';
     if (af instanceof TFolder) { await this.ensureFolderChain(path + '/'); return 'create'; }
@@ -55,15 +55,17 @@ export class LocalPusher {
       return 'create';
     }
 
-    const parentPath = af.parent?.path === '/' ? '' : af.parent!.path + '/';
+    const parentPath = (af.parent && af.parent.path && af.parent.path !== '/') ? af.parent.path + '/' : (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) + '/' : '');
     const parentId = await this.ensureFolderChain(parentPath || '');
     const content = await this.plugin.app.vault.read(af);
     const hash = await sha256(content);
-    const existing = this.plugin.mapping.getByPath(path);
+    // Mapping keyed by the stable fileId — NOT the path — so a rename or a
+    // second terminal creating the same file converges on the same joplinId.
+    const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(path);
     if (existing?.localHash === hash) return 'none';
 
     const isNew = !existing;
-    const id = existing?.joplinId ?? createJoplinId();
+    const id = existing?.joplinId ?? fileId;
     let base: Partial<JoplinItem> = {};
     if (existing) {
       const remote = await this.plugin.api.getItem(id + '.md');
@@ -116,22 +118,23 @@ export class LocalPusher {
     return isNew ? 'create' : 'update';
   }
 
-  private async deleteItem(path: string, isFolder: boolean): Promise<'delete' | 'none'> {
+  private async deleteItem(path: string, fileId: string, isFolder: boolean): Promise<'delete' | 'none'> {
     const key = isFolder ? path + '/' : path;
-    const entry = this.plugin.mapping.getByPath(key);
+    const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
     if (!entry) return 'none';
     await this.plugin.api.deleteItem(entry.joplinId + '.md');
     this.plugin.mapping.remove(entry.joplinId);
+    this.plugin.mapping.addTombstone(entry.joplinId, entry.type);
     return 'delete';
   }
 
-  private async renameItem(oldPath: string, newPath: string, isFolder: boolean): Promise<'create' | 'update' | 'delete' | 'none'> {
+  private async renameItem(oldPath: string, newPath: string, fileId: string, isFolder: boolean): Promise<'create' | 'update' | 'delete' | 'none'> {
     const key = isFolder ? oldPath + '/' : oldPath;
-    const entry = this.plugin.mapping.getByPath(key);
-    if (!entry) return this.upsertItem(newPath);
+    const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
+    if (!entry) return this.upsertItem(newPath, fileId);
     if (isFolder) this.plugin.mapping.renamePrefix(oldPath + '/', newPath + '/');
     else this.plugin.mapping.upsert({ ...entry, path: newPath });
-    return this.upsertItem(isFolder ? newPath : newPath);
+    return this.upsertItem(isFolder ? newPath : newPath, fileId);
   }
 
   async ensureFolderChain(folderPath: string): Promise<string> {

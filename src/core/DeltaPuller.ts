@@ -70,7 +70,7 @@ export class DeltaPuller {
 
     // Apply deletes (folders first so children are removed after their parents)
     for (const id of deletes) {
-      try { await this.applyDelete(id); stats.deleted++; }
+      try { if (await this.applyDelete(id)) stats.deleted++; }
       catch (e) { stats.fail++; console.error('[joplin-sync] delta delete failed', id, e); }
     }
 
@@ -149,7 +149,7 @@ export class DeltaPuller {
     const targetPath = this.uniquePath(targetDir, this.sanitize(item.title), item.id);
 
     if (!mapping) {
-      await this.writeFile(targetPath, item.body ?? '');
+      await this.writeNoteWithId(targetPath, item.body ?? '', item.id);
       await this.saveMapping(item, targetPath);
       return true;
     }
@@ -169,9 +169,30 @@ export class DeltaPuller {
       await this.plugin.app.vault.rename(localFile, targetPath);
       this.watcher.release(mapping.path); this.watcher.release(targetPath);
     }
-    await this.writeFile(targetPath, item.body ?? '');
+    await this.writeNoteWithId(targetPath, item.body ?? '', item.id);
     await this.saveMapping(item, targetPath);
     return false;
+  }
+
+  /** Write a note, stamping the server item id as frontmatter fileId so other
+   *  terminals reading this file converge on the same identity. */
+  private async writeNoteWithId(path: string, body: string, fileId: string): Promise<void> {
+    const stamped = this.stampFrontmatter(body, fileId);
+    await this.writeFile(path, stamped);
+  }
+
+  private stampFrontmatter(body: string, fileId: string): string {
+    const line = 'joplin-file-id: ' + fileId;
+    if (body.startsWith('---')) {
+      const end = body.indexOf('\n---', 4);
+      if (end >= 0) {
+        const fm = body.slice(0, end + 1);
+        const rest = body.slice(end + 1);
+        const re = /^joplin-file-id:.*$/m;
+        return re.test(fm) ? fm.replace(re, line) + rest : fm + '\n' + line + rest;
+      }
+    }
+    return '---\n' + line + '\n---\n' + body;
   }
 
   private async applyFolder(item: JoplinItem): Promise<boolean> {
@@ -208,22 +229,23 @@ export class DeltaPuller {
     return isNew;
   }
 
-  private async applyDelete(id: string): Promise<void> {
+  private async applyDelete(id: string): Promise<boolean> {
     const mapping = this.plugin.mapping.getById(id);
-    if (!mapping) return;
+    if (!mapping) return false;
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
     if (f) {
       this.watcher.suppress(f.path);
-      // TFile has `stat`; TFolder does not — use instanceof so folders are
-      // actually removed, not just unmapped.
       if (f instanceof TFile) {
-        this.plugin.app.fileManager.trashFile(f).catch(() => {});
+        const fm = this.plugin.app.fileManager;
+        if (fm?.trashFile) await fm.trashFile(f).catch(() => {});
+        else await (this.plugin.app.vault as unknown as { remove: (x: TAbstractFile) => Promise<void> }).remove(f).catch(() => {});
       } else if ('remove' in this.plugin.app.vault) {
-        (this.plugin.app.vault as unknown as { remove: (file: TAbstractFile) => Promise<void> }).remove(f).catch(() => {});
+        await (this.plugin.app.vault as unknown as { remove: (file: TAbstractFile) => Promise<void> }).remove(f).catch(() => {});
       }
       this.watcher.release(f.path);
     }
     this.plugin.mapping.remove(id);
+    return true;
   }
 
   private async writeFile(path: string, content: string): Promise<void> {

@@ -1,5 +1,5 @@
 import type JoplinSyncPlugin from '../main';
-import { TFile } from 'obsidian';
+import { TFile, TAbstractFile } from 'obsidian';
 import { VaultWatcher } from '../vault/VaultWatcher';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { ConflictResolver } from './ConflictResolver';
@@ -191,8 +191,12 @@ export class DeltaPuller {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
     if (f) {
       this.watcher.suppress(f.path);
-      if ("stat" in f) {
+      // TFile has `stat`; TFolder does not — use instanceof so folders are
+      // actually removed, not just unmapped.
+      if (f instanceof TFile) {
         this.plugin.app.fileManager.trashFile(f).catch(() => {});
+      } else if ('remove' in this.plugin.app.vault) {
+        (this.plugin.app.vault as unknown as { remove: (file: TAbstractFile) => Promise<void> }).remove(f).catch(() => {});
       }
       this.watcher.release(f.path);
     }

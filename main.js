@@ -1555,8 +1555,11 @@ var DeltaPuller = class {
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
     if (f) {
       this.watcher.suppress(f.path);
-      if ("stat" in f) {
+      if (f instanceof import_obsidian7.TFile) {
         this.plugin.app.fileManager.trashFile(f).catch(() => {
+        });
+      } else if ("remove" in this.plugin.app.vault) {
+        this.plugin.app.vault.remove(f).catch(() => {
         });
       }
       this.watcher.release(f.path);
@@ -2466,8 +2469,11 @@ var SyncEngine = class {
         if (adapter.list) {
           const root = await adapter.list("");
           for (const d of root.folders) {
-            if (!isKept(d))
-              rootDirs.push(d);
+            if (d === "." || d === ".." || d.includes("/"))
+              continue;
+            if (isKept(d))
+              continue;
+            rootDirs.push(d);
           }
         }
       } catch {
@@ -2479,6 +2485,8 @@ var SyncEngine = class {
       }
       allDirs.sort((a, b) => b.split("/").length - a.split("/").length);
       for (const d of allDirs) {
+        if (isKept(d) || d === "")
+          continue;
         try {
           if (await adapter.exists(d)) {
             await adapter.rmdir(d, false).catch(() => {

@@ -659,13 +659,19 @@ export class SyncEngine {
         } catch {/* empty */}
         return result;
       };
-      // List all dirs at vault root (excluding .obsidian)
+      // List all dirs at vault root (excluding config dir)
       const rootDirs: string[] = [];
       try {
         if (adapter.list) {
           const root = await adapter.list('');
           for (const d of root.folders) {
-            if (!isKept(d)) rootDirs.push(d);
+            // adapter.list('') may return the vault's PARENT dir (e.g. `tmp`
+            // when the vault lives at /tmp/<vault>) — those are not children
+            // of the vault and must never be traversed or deleted, otherwise
+            // a bottom-up delete descends into .obsidian and wipes config.
+            if (d === '.' || d === '..' || d.includes('/')) continue;
+            if (isKept(d)) continue;
+            rootDirs.push(d);
           }
         }
       } catch {/* empty */}
@@ -675,9 +681,13 @@ export class SyncEngine {
         const subs = await listAll(d);
         allDirs.push(...subs);
       }
-      // Delete from deepest to shallowest
+      // Delete from deepest to shallowest, never touching the config dir
+      // (an adapter.list('') may return parent/ancestor dirs of the vault
+      // root when the vault lives under a shared parent — e.g. /tmp — so a
+      // naive bottom-up delete would descend into .obsidian and wipe config).
       allDirs.sort((a, b) => b.split('/').length - a.split('/').length);
       for (const d of allDirs) {
+        if (isKept(d) || d === '') continue;
         try {
           if (await adapter.exists(d)) {
             await adapter.rmdir(d, false).catch(() => {});

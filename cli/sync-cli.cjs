@@ -1248,8 +1248,11 @@ var init_DeltaPuller = __esm({
         const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
         if (f) {
           this.watcher.suppress(f.path);
-          if ("stat" in f) {
+          if (f instanceof TFile) {
             this.plugin.app.fileManager.trashFile(f).catch(() => {
+            });
+          } else if ("remove" in this.plugin.app.vault) {
+            this.plugin.app.vault.remove(f).catch(() => {
             });
           }
           this.watcher.release(f.path);
@@ -2213,8 +2216,11 @@ var init_SyncEngine = __esm({
             if (adapter.list) {
               const root = await adapter.list("");
               for (const d of root.folders) {
-                if (!isKept(d))
-                  rootDirs.push(d);
+                if (d === "." || d === ".." || d.includes("/"))
+                  continue;
+                if (isKept(d))
+                  continue;
+                rootDirs.push(d);
               }
             }
           } catch {
@@ -2226,6 +2232,8 @@ var init_SyncEngine = __esm({
           }
           allDirs.sort((a, b) => b.split("/").length - a.split("/").length);
           for (const d of allDirs) {
+            if (isKept(d) || d === "")
+              continue;
             try {
               if (await adapter.exists(d)) {
                 await adapter.rmdir(d, false).catch(() => {
@@ -3452,7 +3460,7 @@ var DiskAdapter = class {
   }
   async rmdir(p, recursive) {
     try {
-      fs2.rmSync(path2.join(this.root, p), { recursive, force: true });
+      fs2.rmdirSync(path2.join(this.root, p));
     } catch {
     }
   }

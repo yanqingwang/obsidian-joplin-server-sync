@@ -109,8 +109,8 @@ export default class JoplinSyncPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  logSync(type: string, ok: number, fail: number): void {
-    this.settings.syncLog.unshift({ time: Date.now(), type, ok, fail });
+  logSync(type: string, ok: number, fail: number, detail?: { created: number; updated: number; deleted: number }): void {
+    this.settings.syncLog.unshift({ time: Date.now(), type, ok, fail, ...detail });
     if (this.settings.syncLog.length > 5) this.settings.syncLog.length = 5;
     void this.saveSettings();
   }

@@ -1939,7 +1939,7 @@ var init_SyncEngine = __esm({
           const u = (pushResult?.updated ?? 0) + (pullResult?.updated ?? 0);
           const d = (pushResult?.deleted ?? 0) + (pullResult?.deleted ?? 0);
           const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
-          this.plugin.logSync("sync", c + u + d, totalFail);
+          this.plugin.logSync("sync", c + u + d, totalFail, { created: c, updated: u, deleted: d });
           const parts = ["\u65B0\u5EFA " + c, "\u66F4\u65B0 " + u, "\u5220\u9664 " + d];
           if (totalFail)
             parts.push("\u5931\u8D25 " + totalFail);

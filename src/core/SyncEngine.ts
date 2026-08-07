@@ -307,7 +307,7 @@ export class SyncEngine {
       const u = (pushResult?.updated ?? 0) + (pullResult?.updated ?? 0);
       const d = (pushResult?.deleted ?? 0) + (pullResult?.deleted ?? 0);
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
-      this.plugin.logSync('sync', c + u + d, totalFail);
+      this.plugin.logSync('sync', c + u + d, totalFail, { created: c, updated: u, deleted: d });
       const parts = ['新建 ' + c, '更新 ' + u, '删除 ' + d];
       if (totalFail) parts.push('失败 ' + totalFail);
       new Notice('Sync complete: ' + parts.join('，') + '。共 ' + totalMapped + ' 项已映射');

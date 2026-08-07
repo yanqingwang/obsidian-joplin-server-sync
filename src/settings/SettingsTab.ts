@@ -201,14 +201,18 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
       const hr = thead.createEl('tr');
       hr.createEl('th', { text: 'Time' });
       hr.createEl('th', { text: 'Type' });
-      hr.createEl('th', { text: 'OK' });
+      hr.createEl('th', { text: 'New' });
+      hr.createEl('th', { text: 'Updated' });
+      hr.createEl('th', { text: 'Deleted' });
       hr.createEl('th', { text: 'Fail' });
       const tbody = tbl.createEl('tbody');
       for (const e of log) {
         const tr = tbody.createEl('tr');
         tr.createEl('td', { text: new Date(e.time).toLocaleTimeString() });
         tr.createEl('td', { text: e.type });
-        tr.createEl('td', { text: String(e.ok) });
+        tr.createEl('td', { text: String(e.created ?? e.ok) });
+        tr.createEl('td', { text: String(e.updated ?? 0) });
+        tr.createEl('td', { text: String(e.deleted ?? 0) });
         tr.createEl('td', { text: String(e.fail) });
       }
     }

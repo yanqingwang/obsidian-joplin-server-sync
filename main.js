@@ -173,14 +173,18 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       const hr = thead.createEl("tr");
       hr.createEl("th", { text: "Time" });
       hr.createEl("th", { text: "Type" });
-      hr.createEl("th", { text: "OK" });
+      hr.createEl("th", { text: "New" });
+      hr.createEl("th", { text: "Updated" });
+      hr.createEl("th", { text: "Deleted" });
       hr.createEl("th", { text: "Fail" });
       const tbody = tbl.createEl("tbody");
       for (const e of log) {
         const tr = tbody.createEl("tr");
         tr.createEl("td", { text: new Date(e.time).toLocaleTimeString() });
         tr.createEl("td", { text: e.type });
-        tr.createEl("td", { text: String(e.ok) });
+        tr.createEl("td", { text: String(e.created ?? e.ok) });
+        tr.createEl("td", { text: String(e.updated ?? 0) });
+        tr.createEl("td", { text: String(e.deleted ?? 0) });
         tr.createEl("td", { text: String(e.fail) });
       }
     }
@@ -2198,7 +2202,7 @@ var SyncEngine = class {
       const u = (pushResult?.updated ?? 0) + (pullResult?.updated ?? 0);
       const d = (pushResult?.deleted ?? 0) + (pullResult?.deleted ?? 0);
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
-      this.plugin.logSync("sync", c + u + d, totalFail);
+      this.plugin.logSync("sync", c + u + d, totalFail, { created: c, updated: u, deleted: d });
       const parts = ["\u65B0\u5EFA " + c, "\u66F4\u65B0 " + u, "\u5220\u9664 " + d];
       if (totalFail)
         parts.push("\u5931\u8D25 " + totalFail);
@@ -3543,8 +3547,8 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
-  logSync(type, ok, fail) {
-    this.settings.syncLog.unshift({ time: Date.now(), type, ok, fail });
+  logSync(type, ok, fail, detail) {
+    this.settings.syncLog.unshift({ time: Date.now(), type, ok, fail, ...detail });
     if (this.settings.syncLog.length > 5)
       this.settings.syncLog.length = 5;
     void this.saveSettings();

@@ -5,6 +5,10 @@ export interface SyncLogEntry {
   type: string;
   ok: number;
   fail: number;
+  /** Detail counts: created/updated/deleted (0.3.68+) */
+  created?: number;
+  updated?: number;
+  deleted?: number;
 }
 
 export interface PluginSettings {

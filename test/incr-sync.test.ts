@@ -95,6 +95,7 @@ async function main() {
   await new DeltaPuller(tB, new VaultWatcher(tB, tB.changeLog)).pullAll();
 
   await folderTests();
+  await folderMoveTest();
 
   console.log('\n=== 结果: ' + passed + ' PASS, ' + failed + ' FAIL ===');
   process.exit(failed ? 1 : 0);
@@ -138,4 +139,45 @@ async function folderTests() {
   await new LocalPusher(tA, tA.changeLog).pushAll();
   await new DeltaPuller(tB, new VaultWatcher(tB, tB.changeLog)).pullAll();
   check(!fs.existsSync('/home/wang/文档/test1/增量测试目录X'), 'B: 文件夹删除同步');
+}
+
+// ==== 文件夹移动（到另一父目录）====
+async function folderMoveTest() {
+  const tA = await makeTerminal('/home/wang/文档/test');
+  const tB = await makeTerminal('/home/wang/文档/test1');
+  const W = '/home/wang/文档/test';
+
+  console.log('\n[5] 文件夹移动: 增量测试目录A → 增量测试目录B/增量测试目录A');
+  // 建两个目录，A 里有文件
+  fs.mkdirSync(W + '/增量测试目录A', { recursive: true });
+  fs.mkdirSync(W + '/增量测试目录B', { recursive: true });
+  fs.writeFileSync(W + '/增量测试目录A/笔记.md', '# 笔记\n内容\n');
+  const f5 = tA.app.vault.getAbstractFileByPath('增量测试目录A/笔记.md');
+  const id5 = f5 ? await tA.identity.ensureId(f5) : '';
+  await tA.changeLog.push({ fileId: id5, op: 'create', path: '增量测试目录A/笔记.md', type: ModelType.Note });
+  await tA.api.login();
+  await new LocalPusher(tA, tA.changeLog).pushAll();
+  await tB.api.login();
+  await new DeltaPuller(tB, new VaultWatcher(tB, tB.changeLog)).pullAll();
+  check(fs.existsSync('/home/wang/文档/test1/增量测试目录A/笔记.md'), '基线: B 拉到目录A');
+
+  // 移动目录A → 目录B/A
+  fs.renameSync(W + '/增量测试目录A', W + '/增量测试目录B/增量测试目录A');
+  // Obsidian 移动文件夹：文件夹 rename + 内部文件 rename
+  await tA.changeLog.push({ fileId: 'dir:增量测试目录B/增量测试目录A', op: 'rename', path: '增量测试目录B/增量测试目录A', oldPath: '增量测试目录A', type: ModelType.Folder });
+  const fMoved2 = tA.app.vault.getAbstractFileByPath('增量测试目录B/增量测试目录A/笔记.md');
+  const idMoved2 = fMoved2 ? await tA.identity.ensureId(fMoved2) : '';
+  await tA.changeLog.push({ fileId: idMoved2, op: 'rename', path: '增量测试目录B/增量测试目录A/笔记.md', oldPath: '增量测试目录A/笔记.md', type: ModelType.Note });
+  await new LocalPusher(tA, tA.changeLog).pushAll();
+  await new DeltaPuller(tB, new VaultWatcher(tB, tB.changeLog)).pullAll();
+  check(!fs.existsSync('/home/wang/文档/test1/增量测试目录A'), 'B: 旧目录移除');
+  check(fs.existsSync('/home/wang/文档/test1/增量测试目录B/增量测试目录A/笔记.md'), 'B: 新位置目录+文件存在');
+
+  // 清理
+  fs.rmSync(W + '/增量测试目录B', { recursive: true });
+  await tA.changeLog.push({ fileId: 'dir:增量测试目录B', op: 'delete', path: '增量测试目录B', type: ModelType.Folder });
+  await tA.changeLog.push({ fileId: idMoved2, op: 'delete', path: '增量测试目录B/增量测试目录A/笔记.md', type: ModelType.Note });
+  await new LocalPusher(tA, tA.changeLog).pushAll();
+  await new DeltaPuller(tB, new VaultWatcher(tB, tB.changeLog)).pullAll();
+  check(!fs.existsSync('/home/wang/文档/test1/增量测试目录B'), 'B: 移动+删除后清理');
 }

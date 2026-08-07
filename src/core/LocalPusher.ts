@@ -143,10 +143,12 @@ export class LocalPusher {
       // Folders: rename the server item's title, then remap local prefix.
       const newTitle = newPath.split('/').pop() || newPath;
       const parentDir = newPath.includes('/') ? newPath.slice(0, newPath.lastIndexOf('/')) + '/' : '';
-      const parentMap = parentDir ? this.plugin.mapping.getByPath(parentDir) : undefined;
+      // Ensure the new parent folder has a server mapping (like file moves do),
+      // otherwise the moved folder lands at root instead of its new parent.
+      const parentId = parentDir ? await this.ensureFolderChain(parentDir) : '';
       const now = Date.now();
       const folderItem: JoplinItem = {
-        id: entry.joplinId, parent_id: parentMap ? parentMap.joplinId : '',
+        id: entry.joplinId, parent_id: parentId,
         title: newTitle,
         created_time: now, updated_time: now,
         user_created_time: now, user_updated_time: now,

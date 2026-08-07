@@ -1197,11 +1197,11 @@ var LocalPusher = class {
     if (isFolder) {
       const newTitle = newPath.split("/").pop() || newPath;
       const parentDir = newPath.includes("/") ? newPath.slice(0, newPath.lastIndexOf("/")) + "/" : "";
-      const parentMap = parentDir ? this.plugin.mapping.getByPath(parentDir) : void 0;
+      const parentId = parentDir ? await this.ensureFolderChain(parentDir) : "";
       const now = Date.now();
       const folderItem = {
         id: entry.joplinId,
-        parent_id: parentMap ? parentMap.joplinId : "",
+        parent_id: parentId,
         title: newTitle,
         created_time: now,
         updated_time: now,

@@ -786,24 +786,31 @@ var init_LocalPusher = __esm({
       }
       async pushAll() {
         const changes = this.queue.drain();
-        let ok = 0;
+        const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
         const failed = [];
         for (const change of changes) {
           try {
-            await this.pushOne(change);
-            ok++;
+            const op = await this.pushOne(change);
+            if (op === "create")
+              stats.created++;
+            else if (op === "update")
+              stats.updated++;
+            else if (op === "delete")
+              stats.deleted++;
           } catch (e) {
             console.error("[joplin-sync] push failed: " + change.path, e);
+            stats.fail++;
             failed.push(change);
           }
         }
         if (failed.length)
           this.queue.requeue(failed);
-        return { ok, fail: failed.length };
+        return stats;
       }
       async pushOne(c) {
         switch (c.kind) {
           case "create":
+            return this.upsertItem(c.path);
           case "modify":
             return this.upsertItem(c.path);
           case "delete":
@@ -815,16 +822,16 @@ var init_LocalPusher = __esm({
       async upsertItem(path4) {
         const af = this.plugin.app.vault.getAbstractFileByPath(path4);
         if (!af)
-          return;
+          return "none";
         if (af instanceof TFolder) {
           await this.ensureFolderChain(path4 + "/");
-          return;
+          return "create";
         }
         if (!(af instanceof TFile))
-          return;
+          return "none";
         if (af.extension !== "md") {
           await this.resources.uploadResource(af);
-          return;
+          return "create";
         }
         const parentPath = af.parent?.path === "/" ? "" : af.parent.path + "/";
         const parentId = await this.ensureFolderChain(parentPath || "");
@@ -832,7 +839,8 @@ var init_LocalPusher = __esm({
         const hash = await sha256(content);
         const existing = this.plugin.mapping.getByPath(path4);
         if (existing?.localHash === hash)
-          return;
+          return "none";
+        const isNew = !existing;
         const id = existing?.joplinId ?? createJoplinId();
         let base = {};
         if (existing) {
@@ -884,7 +892,7 @@ var init_LocalPusher = __esm({
             remoteUpdatedTime: res2.updated_time,
             syncedAt: Date.now()
           });
-          return;
+          return isNew ? "create" : "update";
         }
         const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
         this.plugin.mapping.upsert({
@@ -895,14 +903,16 @@ var init_LocalPusher = __esm({
           remoteUpdatedTime: res.updated_time,
           syncedAt: Date.now()
         });
+        return isNew ? "create" : "update";
       }
       async deleteItem(path4, isFolder) {
         const key = isFolder ? path4 + "/" : path4;
         const entry = this.plugin.mapping.getByPath(key);
         if (!entry)
-          return;
+          return "none";
         await this.plugin.api.deleteItem(entry.joplinId + ".md");
         this.plugin.mapping.remove(entry.joplinId);
+        return "delete";
       }
       async renameItem(oldPath, newPath, isFolder) {
         const key = isFolder ? oldPath + "/" : oldPath;
@@ -913,7 +923,7 @@ var init_LocalPusher = __esm({
           this.plugin.mapping.renamePrefix(oldPath + "/", newPath + "/");
         else
           this.plugin.mapping.upsert({ ...entry, path: newPath });
-        await this.upsertItem(isFolder ? newPath : newPath);
+        return this.upsertItem(isFolder ? newPath : newPath);
       }
       async ensureFolderChain(folderPath) {
         if (!folderPath || folderPath === "/")
@@ -1075,17 +1085,21 @@ var init_DeltaPuller = __esm({
       async pullAll() {
         let cursor = this.plugin.mapping.getDeltaCursor();
         const allItems = [];
-        let ok = 0;
-        let fail = 0;
+        const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
+        const deletes = [];
         while (true) {
           const page = await this.plugin.api.delta(cursor || void 0);
           for (const d of page.items) {
             try {
+              if (d.type === 3 /* Delete */) {
+                const id = d.name.replace(/\.resource\//, "").replace(/\.md$/, "");
+                deletes.push(id);
+                continue;
+              }
               const items = await this.collectChange(d);
               allItems.push(...items);
-              ok++;
             } catch (e) {
-              fail++;
+              stats.fail++;
               console.error("[joplin-sync] collect delta failed", d.name, e);
             }
           }
@@ -1094,24 +1108,39 @@ var init_DeltaPuller = __esm({
           if (!page.has_more)
             break;
         }
+        for (const id of deletes) {
+          try {
+            await this.applyDelete(id);
+            stats.deleted++;
+          } catch (e) {
+            stats.fail++;
+            console.error("[joplin-sync] delta delete failed", id, e);
+          }
+        }
         const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
         const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
         const resources = allItems.filter((i) => i.type_ === 4 /* Resource */);
         this.buildFolderPaths(folders);
         for (const f of folders) {
           try {
-            await this.applyFolder(f);
+            if (await this.applyFolder(f))
+              stats.created++;
+            else
+              stats.updated++;
           } catch (e) {
-            fail++;
+            stats.fail++;
             console.error("[joplin-sync] folder apply failed", f.title, e);
           }
         }
         if (!this.plugin.settings.syncFoldersOnly) {
           for (const n of notes) {
             try {
-              await this.applyNote(n);
+              if (await this.applyNote(n))
+                stats.created++;
+              else
+                stats.updated++;
             } catch (e) {
-              fail++;
+              stats.fail++;
               console.error("[joplin-sync] note apply failed", n.title, e);
             }
           }
@@ -1119,13 +1148,14 @@ var init_DeltaPuller = __esm({
         for (const r of resources) {
           try {
             await this.applyResource(r);
+            stats.created++;
           } catch (e) {
-            fail++;
+            stats.fail++;
             console.error("[joplin-sync] resource apply failed", r.id, e);
           }
         }
         this.plugin.mapping.setDeltaCursor(cursor ?? "");
-        return { ok, fail };
+        return stats;
       }
       /** Download a delta item and return fully unserialized JoplinItems it contains */
       async collectChange(d) {
@@ -1180,16 +1210,16 @@ var init_DeltaPuller = __esm({
         if (!mapping) {
           await this.writeFile(targetPath, item.body ?? "");
           await this.saveMapping(item, targetPath);
-          return;
+          return true;
         }
         if (item.updated_time <= mapping.remoteUpdatedTime)
-          return;
+          return false;
         const localFile = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
         const localContent = localFile instanceof TFile ? await this.plugin.app.vault.read(localFile) : null;
         const localChanged = localContent !== null && await sha256(localContent) !== mapping.localHash;
         if (localChanged) {
           await this.conflicts.resolve(mapping, item, localContent, targetPath);
-          return;
+          return false;
         }
         if (mapping.path !== targetPath && localFile) {
           this.watcher.suppress(mapping.path);
@@ -1200,13 +1230,15 @@ var init_DeltaPuller = __esm({
         }
         await this.writeFile(targetPath, item.body ?? "");
         await this.saveMapping(item, targetPath);
+        return false;
       }
       async applyFolder(item) {
         const parentPath = this.resolveFolderPath(item.parent_id);
         const path4 = parentPath + this.sanitize(item.title) + "/";
         const mapping = this.plugin.mapping.getById(item.id);
         const dirPath = path4.replace(/\/$/, "");
-        if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+        const isNew = !this.plugin.app.vault.getAbstractFileByPath(dirPath);
+        if (isNew) {
           if (parentPath && !this.plugin.app.vault.getAbstractFileByPath(parentPath.replace(/\/$/, ""))) {
             this.watcher.suppress(parentPath.replace(/\/$/, ""));
             try {
@@ -1240,6 +1272,7 @@ var init_DeltaPuller = __esm({
           remoteUpdatedTime: item.updated_time,
           syncedAt: Date.now()
         });
+        return isNew;
       }
       async applyDelete(id) {
         const mapping = this.plugin.mapping.getById(id);
@@ -1826,11 +1859,11 @@ var init_SyncEngine = __esm({
           }
           this.state = 1 /* Pushing */;
           const pushResult = await this.pusher.pushAll();
-          this.plugin.statusBar.setProgress(pushResult.ok, Math.max(pushResult.ok, 1), "push");
+          this.plugin.statusBar.setProgress(pushResult.created + pushResult.updated + pushResult.deleted, Math.max(pushResult.created + pushResult.updated + pushResult.deleted, 1), "push");
           this.state = 2 /* Pulling */;
           this.plugin.statusBar.setSyncing("pulling...");
           const pullResult = await this.deltaPuller.pullAll();
-          this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), "pull");
+          this.plugin.statusBar.setProgress(pullResult.created + pullResult.updated + pullResult.deleted, Math.max(pullResult.created + pullResult.updated + pullResult.deleted, 1), "pull");
           this.state = 3 /* Resolving */;
           for (const t of [...this.plugin.mapping.tombstones]) {
             await this.plugin.api.deleteItem(t.joplinId + ".md");
@@ -1838,9 +1871,15 @@ var init_SyncEngine = __esm({
           }
           const totalMapped = this.plugin.mapping.all().length;
           this.plugin.statusBar.setOk(Date.now(), totalMapped);
+          const c = (pushResult?.created ?? 0) + (pullResult?.created ?? 0);
+          const u = (pushResult?.updated ?? 0) + (pullResult?.updated ?? 0);
+          const d = (pushResult?.deleted ?? 0) + (pullResult?.deleted ?? 0);
           const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
-          this.plugin.logSync("sync", totalMapped, totalFail);
-          new Notice("Sync complete: " + totalMapped + " items mapped, " + totalFail + " failed");
+          this.plugin.logSync("sync", c + u + d, totalFail);
+          const parts = ["\u65B0\u5EFA " + c, "\u66F4\u65B0 " + u, "\u5220\u9664 " + d];
+          if (totalFail)
+            parts.push("\u5931\u8D25 " + totalFail);
+          new Notice("Sync complete: " + parts.join("\uFF0C") + "\u3002\u5171 " + totalMapped + " \u9879\u5DF2\u6620\u5C04");
         } catch (e) {
           this.state = 4 /* Error */;
           const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");

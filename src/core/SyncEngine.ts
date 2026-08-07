@@ -290,12 +290,12 @@ export class SyncEngine {
 
       this.state = SyncState.Pushing;
       const pushResult = await this.pusher.pushAll();
-      this.plugin.statusBar.setProgress(pushResult.ok, Math.max(pushResult.ok, 1), 'push');
+      this.plugin.statusBar.setProgress(pushResult.created + pushResult.updated + pushResult.deleted, Math.max(pushResult.created + pushResult.updated + pushResult.deleted, 1), 'push');
 
       this.state = SyncState.Pulling;
       this.plugin.statusBar.setSyncing('pulling...');
       const pullResult = await this.deltaPuller.pullAll();
-      this.plugin.statusBar.setProgress(pullResult.ok, Math.max(pullResult.ok, 1), 'pull');
+      this.plugin.statusBar.setProgress(pullResult.created + pullResult.updated + pullResult.deleted, Math.max(pullResult.created + pullResult.updated + pullResult.deleted, 1), 'pull');
 
       this.state = SyncState.Resolving;
       for (const t of [...this.plugin.mapping.tombstones]) {
@@ -305,9 +305,14 @@ export class SyncEngine {
 
       const totalMapped = this.plugin.mapping.all().length;
       this.plugin.statusBar.setOk(Date.now(), totalMapped);
+      const c = (pushResult?.created ?? 0) + (pullResult?.created ?? 0);
+      const u = (pushResult?.updated ?? 0) + (pullResult?.updated ?? 0);
+      const d = (pushResult?.deleted ?? 0) + (pullResult?.deleted ?? 0);
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
-      this.plugin.logSync('sync', totalMapped, totalFail);
-      new Notice('Sync complete: ' + totalMapped + ' items mapped, ' + totalFail + ' failed');
+      this.plugin.logSync('sync', c + u + d, totalFail);
+      const parts = ['新建 ' + c, '更新 ' + u, '删除 ' + d];
+      if (totalFail) parts.push('失败 ' + totalFail);
+      new Notice('Sync complete: ' + parts.join('，') + '。共 ' + totalMapped + ' 项已映射');
     } catch (e: unknown) {
       this.state = SyncState.Error;
       const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');

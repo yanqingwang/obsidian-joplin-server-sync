@@ -41,26 +41,37 @@ export class DeltaPuller {
     return false;
   }
 
-  async pullAll(): Promise<{ ok: number; fail: number }> {
+  async pullAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
     let cursor = this.plugin.mapping.getDeltaCursor();
     const allItems: JoplinItem[] = [];
-    let ok = 0; let fail = 0;
+    const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
+    const deletes: string[] = [];
 
     // First pass: collect all items from delta stream
     while (true) {
       const page = await this.plugin.api.delta(cursor || undefined);
       for (const d of page.items) {
         try {
+          if (d.type === DeltaChangeType.Delete) {
+            const id = d.name.replace(/\.resource\//, '').replace(/\.md$/, '');
+            deletes.push(id);
+            continue;
+          }
           const items = await this.collectChange(d);
           allItems.push(...items);
-          ok++;
         } catch (e) {
-          fail++;
+          stats.fail++;
           console.error('[joplin-sync] collect delta failed', d.name, e);
         }
       }
       if (page.cursor) cursor = page.cursor;
       if (!page.has_more) break;
+    }
+
+    // Apply deletes (folders first so children are removed after their parents)
+    for (const id of deletes) {
+      try { await this.applyDelete(id); stats.deleted++; }
+      catch (e) { stats.fail++; console.error('[joplin-sync] delta delete failed', id, e); }
     }
 
     // Second pass: build folder path cache, then process folders then notes
@@ -71,15 +82,24 @@ export class DeltaPuller {
     // Pre-compute all folder paths from the collected items (no mapping dependency)
     this.buildFolderPaths(folders);
 
-    for (const f of folders) { try { await this.applyFolder(f); } catch (e) { fail++; console.error('[joplin-sync] folder apply failed', f.title, e); } }
+    for (const f of folders) {
+      try { if (await this.applyFolder(f)) stats.created++; else stats.updated++; }
+      catch (e) { stats.fail++; console.error('[joplin-sync] folder apply failed', f.title, e); }
+    }
 
     if (!this.plugin.settings.syncFoldersOnly) {
-      for (const n of notes) { try { await this.applyNote(n); } catch (e) { fail++; console.error('[joplin-sync] note apply failed', n.title, e); } }
+      for (const n of notes) {
+        try { if (await this.applyNote(n)) stats.created++; else stats.updated++; }
+        catch (e) { stats.fail++; console.error('[joplin-sync] note apply failed', n.title, e); }
+      }
     }
-    for (const r of resources) { try { await this.applyResource(r); } catch (e) { fail++; console.error('[joplin-sync] resource apply failed', r.id, e); } }
+    for (const r of resources) {
+      try { await this.applyResource(r); stats.created++; }
+      catch (e) { stats.fail++; console.error('[joplin-sync] resource apply failed', r.id, e); }
+    }
 
     this.plugin.mapping.setDeltaCursor(cursor ?? '');
-    return { ok, fail };
+    return stats;
   }
 
   /** Download a delta item and return fully unserialized JoplinItems it contains */
@@ -123,7 +143,7 @@ export class DeltaPuller {
     return [item];
   }
 
-  private async applyNote(item: JoplinItem): Promise<void> {
+  private async applyNote(item: JoplinItem): Promise<boolean> {
     const mapping = this.plugin.mapping.getById(item.id);
     const targetDir = this.resolveFolderPath(item.parent_id);
     const targetPath = this.uniquePath(targetDir, this.sanitize(item.title), item.id);
@@ -131,9 +151,9 @@ export class DeltaPuller {
     if (!mapping) {
       await this.writeFile(targetPath, item.body ?? '');
       await this.saveMapping(item, targetPath);
-      return;
+      return true;
     }
-    if (item.updated_time <= mapping.remoteUpdatedTime) return;
+    if (item.updated_time <= mapping.remoteUpdatedTime) return false;
 
     const localFile = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
     const localContent = localFile instanceof TFile ? await this.plugin.app.vault.read(localFile) : null;
@@ -141,7 +161,7 @@ export class DeltaPuller {
 
     if (localChanged) {
       await this.conflicts.resolve(mapping, item, localContent, targetPath);
-      return;
+      return false;
     }
 
     if (mapping.path !== targetPath && localFile) {
@@ -151,14 +171,16 @@ export class DeltaPuller {
     }
     await this.writeFile(targetPath, item.body ?? '');
     await this.saveMapping(item, targetPath);
+    return false;
   }
 
-  private async applyFolder(item: JoplinItem): Promise<void> {
+  private async applyFolder(item: JoplinItem): Promise<boolean> {
     const parentPath = this.resolveFolderPath(item.parent_id);
     const path = parentPath + this.sanitize(item.title) + '/';
     const mapping = this.plugin.mapping.getById(item.id);
     const dirPath = path.replace(/\/$/, '');
-    if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+    const isNew = !this.plugin.app.vault.getAbstractFileByPath(dirPath);
+    if (isNew) {
       // Ensure parent directory exists first
       if (parentPath && !this.plugin.app.vault.getAbstractFileByPath(parentPath.replace(/\/$/, ''))) {
         this.watcher.suppress(parentPath.replace(/\/$/, ''));
@@ -183,6 +205,7 @@ export class DeltaPuller {
       joplinId: item.id, path, type: ModelType.Folder,
       localHash: '', remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
     });
+    return isNew;
   }
 
   private async applyDelete(id: string): Promise<void> {

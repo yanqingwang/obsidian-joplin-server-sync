@@ -15,40 +15,44 @@ export class LocalPusher {
     this.resources = new ResourceManager(plugin);
   }
 
-  async pushAll(): Promise<{ ok: number; fail: number }> {
+  async pushAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
     const changes = this.queue.drain();
-    let ok = 0; const failed: LocalChange[] = [];
+    const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
+    const failed: LocalChange[] = [];
     for (const change of changes) {
       try {
-        await this.pushOne(change);
-        ok++;
+        const op = await this.pushOne(change);
+        if (op === 'create') stats.created++;
+        else if (op === 'update') stats.updated++;
+        else if (op === 'delete') stats.deleted++;
       } catch (e) {
         console.error('[joplin-sync] push failed: ' + change.path, e);
+        stats.fail++;
         failed.push(change);
       }
     }
     if (failed.length) this.queue.requeue(failed);
-    return { ok, fail: failed.length };
+    return stats;
   }
 
-  private async pushOne(c: LocalChange): Promise<void> {
+  private async pushOne(c: LocalChange): Promise<'create' | 'update' | 'delete' | 'none'> {
     switch (c.kind) {
-      case 'create':
+      case 'create': return this.upsertItem(c.path);
       case 'modify': return this.upsertItem(c.path);
       case 'delete': return this.deleteItem(c.path, c.isFolder);
       case 'rename': return this.renameItem(c.oldPath!, c.path, c.isFolder);
     }
   }
 
-  private async upsertItem(path: string): Promise<void> {
+  private async upsertItem(path: string): Promise<'create' | 'update' | 'none'> {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
-    if (!af) return;
-    if (af instanceof TFolder) { await this.ensureFolderChain(path + '/'); return; }
-    if (!(af instanceof TFile)) return;
+    if (!af) return 'none';
+    if (af instanceof TFolder) { await this.ensureFolderChain(path + '/'); return 'create'; }
+    if (!(af instanceof TFile)) return 'none';
     // Non-md file: upload as resource
     if (af.extension !== 'md') {
       await this.resources.uploadResource(af);
-      return;
+      return 'create';
     }
 
     const parentPath = af.parent?.path === '/' ? '' : af.parent!.path + '/';
@@ -56,8 +60,9 @@ export class LocalPusher {
     const content = await this.plugin.app.vault.read(af);
     const hash = await sha256(content);
     const existing = this.plugin.mapping.getByPath(path);
-    if (existing?.localHash === hash) return;
+    if (existing?.localHash === hash) return 'none';
 
+    const isNew = !existing;
     const id = existing?.joplinId ?? createJoplinId();
     let base: Partial<JoplinItem> = {};
     if (existing) {
@@ -100,7 +105,7 @@ export class LocalPusher {
         joplinId: id, path, type: ModelType.Note,
         localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
       });
-      return;
+      return isNew ? 'create' : 'update';
     }
 
     const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(item));
@@ -108,23 +113,25 @@ export class LocalPusher {
       joplinId: id, path, type: ModelType.Note,
       localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
     });
+    return isNew ? 'create' : 'update';
   }
 
-  private async deleteItem(path: string, isFolder: boolean): Promise<void> {
+  private async deleteItem(path: string, isFolder: boolean): Promise<'delete' | 'none'> {
     const key = isFolder ? path + '/' : path;
     const entry = this.plugin.mapping.getByPath(key);
-    if (!entry) return;
+    if (!entry) return 'none';
     await this.plugin.api.deleteItem(entry.joplinId + '.md');
     this.plugin.mapping.remove(entry.joplinId);
+    return 'delete';
   }
 
-  private async renameItem(oldPath: string, newPath: string, isFolder: boolean): Promise<void> {
+  private async renameItem(oldPath: string, newPath: string, isFolder: boolean): Promise<'create' | 'update' | 'delete' | 'none'> {
     const key = isFolder ? oldPath + '/' : oldPath;
     const entry = this.plugin.mapping.getByPath(key);
     if (!entry) return this.upsertItem(newPath);
     if (isFolder) this.plugin.mapping.renamePrefix(oldPath + '/', newPath + '/');
     else this.plugin.mapping.upsert({ ...entry, path: newPath });
-    await this.upsertItem(isFolder ? newPath : newPath);
+    return this.upsertItem(isFolder ? newPath : newPath);
   }
 
   async ensureFolderChain(folderPath: string): Promise<string> {

@@ -78,6 +78,13 @@ export class MockVault {
     const p = typeof file === 'string' ? file : file.path;
     fs.rmSync(this.abs(p), { recursive: true, force: true });
   }
+  async rename(file: TFile | TFolder, newPath: string): Promise<void> {
+    const oldAbs = this.abs(file.path);
+    const newAbs = this.abs(newPath);
+    fs.mkdirSync(path.dirname(newAbs), { recursive: true });
+    fs.renameSync(oldAbs, newAbs);
+    file.path = newPath;
+  }
   async createFolder(p: string): Promise<void> {
     fs.mkdirSync(this.abs(p), { recursive: true });
   }

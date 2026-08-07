@@ -430,49 +430,38 @@ export class SyncEngine {
         discoverParentDirs(f.path);
       }
 
-      // Also discover empty directories from the filesystem adapter, but ONLY
-      // materialize a directory when its subtree actually contains a syncable
-      // (non-hidden, non-excluded) file. This keeps remote folder count equal
-      // to the local directory count derived from file paths, and avoids
-      // importing stray system trees (e.g. `<vault>/home/<user>/...` nesting
-      // Obsidian may create, which only holds hidden config files).
+      // Also discover empty directories from the filesystem adapter. Materialize
+      // EVERY non-hidden, non-excluded directory (including genuinely empty
+      // user folders like AIReports/Charts), but skip known Obsidian/system
+      // trees (e.g. `<vault>/home/<user>/...` nesting) whose only content is
+      // hidden config.
       const adapter = this.plugin.app.vault.adapter;
       const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ files: string[]; folders: string[] }> };
       const excludes = this.plugin.settings.excludePatterns;
       const isExcludedDir = (rel: string) => excludes.some(e => (rel + '/').startsWith(e));
+      const SYSTEM_TOP_DIRS = new Set(['home', 'Library', 'node_modules']);
       if (adapter && typedAdapter.list) {
-        const walkDirs = async (dir: string): Promise<boolean> => {
+        const walkDirs = async (dir: string): Promise<void> => {
           try {
             const listing = await typedAdapter.list(dir);
-            let hasSyncable = false;
-            for (const f of listing.files) {
-              const base = f.split('/').pop() || '';
-              if (base.startsWith('.')) continue;
-              const rel = dir ? dir + '/' + base : base;
-              if (excludes.some(e => rel.startsWith(e))) continue;
-              hasSyncable = true;
-            }
             for (const sub of listing.folders) {
               const folderName = sub.split('/').pop() || '';
               if (folderName.startsWith('.')) continue;
               const rel = dir ? dir + '/' + folderName : folderName;
               if (isExcludedDir(rel)) continue;
-              const subHas = await walkDirs(sub);
-              if (subHas) {
-                hasSyncable = true;
-                if (!folderMap.has(rel)) {
-                  const existing = this.plugin.mapping.getByPath(rel + '/');
-                  if (existing) {
-                    folderMap.set(rel, existing.joplinId);
-                    pushedFolderIds.add(existing.joplinId);
-                  } else {
-                    dirs.add(rel);
-                  }
+              if (!dir && SYSTEM_TOP_DIRS.has(folderName)) continue;
+              if (rel && !folderMap.has(rel)) {
+                const existing = this.plugin.mapping.getByPath(rel + '/');
+                if (existing) {
+                  folderMap.set(rel, existing.joplinId);
+                  pushedFolderIds.add(existing.joplinId);
+                } else {
+                  dirs.add(rel);
                 }
               }
+              await walkDirs(sub);
             }
-            return hasSyncable;
-          } catch { return false; }
+          } catch { /* ignore unreadable */ }
         };
         await walkDirs('');
       }

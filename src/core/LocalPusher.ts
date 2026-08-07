@@ -44,7 +44,7 @@ export class LocalPusher {
     }
   }
 
-  private async upsertItem(path: string, fileId: string): Promise<'create' | 'update' | 'none'> {
+  private async upsertItem(path: string, fileId: string, force = false): Promise<'create' | 'update' | 'none'> {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
     if (!af) return 'none';
     if (af instanceof TFolder) { await this.ensureFolderChain(path + '/'); return 'create'; }
@@ -62,7 +62,11 @@ export class LocalPusher {
     // Mapping keyed by the stable fileId — NOT the path — so a rename or a
     // second terminal creating the same file converges on the same joplinId.
     const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(path);
-    if (existing?.localHash === hash) return 'none';
+    // Content unchanged AND same parent/title → nothing to push. A move or
+    // rename leaves content identical but changes parent_id/title, which the
+    // server must reflect — so only skip when the mapped path also matches.
+    if (!force && existing && existing.localHash === hash && existing.path === path) return 'none';
+    const moved = existing && existing.path !== path;
 
     const isNew = !existing;
     const id = existing?.joplinId ?? fileId;
@@ -131,10 +135,45 @@ export class LocalPusher {
   private async renameItem(oldPath: string, newPath: string, fileId: string, isFolder: boolean): Promise<'create' | 'update' | 'delete' | 'none'> {
     const key = isFolder ? oldPath + '/' : oldPath;
     const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
-    if (!entry) return this.upsertItem(newPath, fileId);
-    if (isFolder) this.plugin.mapping.renamePrefix(oldPath + '/', newPath + '/');
-    else this.plugin.mapping.upsert({ ...entry, path: newPath });
-    return this.upsertItem(isFolder ? newPath : newPath, fileId);
+    if (!entry) {
+      // Nothing mapped at the old path — treat as a fresh create at new path.
+      return this.upsertItem(newPath, fileId);
+    }
+    if (isFolder) {
+      // Folders: rename the server item's title, then remap local prefix.
+      const newTitle = newPath.split('/').pop() || newPath;
+      const parentDir = newPath.includes('/') ? newPath.slice(0, newPath.lastIndexOf('/')) + '/' : '';
+      const parentMap = parentDir ? this.plugin.mapping.getByPath(parentDir) : undefined;
+      const now = Date.now();
+      const folderItem: JoplinItem = {
+        id: entry.joplinId, parent_id: parentMap ? parentMap.joplinId : '',
+        title: newTitle,
+        created_time: now, updated_time: now,
+        user_created_time: now, user_updated_time: now,
+        type_: ModelType.Folder, encryption_applied: 0, encryption_cipher_text: '',
+      };
+      const res = await this.plugin.api.putItem(entry.joplinId + '.md', this.serializer.serialize(folderItem), true);
+      this.plugin.mapping.renamePrefix(oldPath + '/', newPath + '/');
+      const folderMapping = this.plugin.mapping.getById(entry.joplinId);
+      if (folderMapping) {
+        this.plugin.mapping.upsert({ ...folderMapping, path: newPath + '/', remoteUpdatedTime: res.updated_time ?? now });
+      }
+      return 'update';
+    }
+    // File move/rename: upload to the NEW path (upsertItem detects the path
+    // change and updates parent_id/title on the server). Do NOT pre-update
+    // the mapping path here, or the move is invisible to upsertItem.
+    const result = await this.upsertItem(newPath, fileId);
+    if (result === 'none') {
+      // Content identical but path changed — force an update so the server
+      // parent/title reflect the new location.
+      const af = this.plugin.app.vault.getAbstractFileByPath(newPath);
+      if (af instanceof TFile) {
+        return this.upsertItem(newPath, fileId, true);
+      }
+      return 'none';
+    }
+    return result;
   }
 
   async ensureFolderChain(folderPath: string): Promise<string> {

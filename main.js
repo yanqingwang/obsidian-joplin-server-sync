@@ -1091,7 +1091,7 @@ var LocalPusher = class {
         return this.renameItem(c.oldPath, c.path, c.fileId, c.type === 2 /* Folder */);
     }
   }
-  async upsertItem(path, fileId) {
+  async upsertItem(path, fileId, force = false) {
     const af = this.plugin.app.vault.getAbstractFileByPath(path);
     if (!af)
       return "none";
@@ -1110,8 +1110,9 @@ var LocalPusher = class {
     const content = await this.plugin.app.vault.read(af);
     const hash = await sha256(content);
     const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(path);
-    if (existing?.localHash === hash)
+    if (!force && existing && existing.localHash === hash && existing.path === path)
       return "none";
+    const moved = existing && existing.path !== path;
     const isNew = !existing;
     const id = existing?.joplinId ?? fileId;
     let base = {};
@@ -1190,13 +1191,43 @@ var LocalPusher = class {
   async renameItem(oldPath, newPath, fileId, isFolder) {
     const key = isFolder ? oldPath + "/" : oldPath;
     const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
-    if (!entry)
+    if (!entry) {
       return this.upsertItem(newPath, fileId);
-    if (isFolder)
+    }
+    if (isFolder) {
+      const newTitle = newPath.split("/").pop() || newPath;
+      const parentDir = newPath.includes("/") ? newPath.slice(0, newPath.lastIndexOf("/")) + "/" : "";
+      const parentMap = parentDir ? this.plugin.mapping.getByPath(parentDir) : void 0;
+      const now = Date.now();
+      const folderItem = {
+        id: entry.joplinId,
+        parent_id: parentMap ? parentMap.joplinId : "",
+        title: newTitle,
+        created_time: now,
+        updated_time: now,
+        user_created_time: now,
+        user_updated_time: now,
+        type_: 2 /* Folder */,
+        encryption_applied: 0,
+        encryption_cipher_text: ""
+      };
+      const res = await this.plugin.api.putItem(entry.joplinId + ".md", this.serializer.serialize(folderItem), true);
       this.plugin.mapping.renamePrefix(oldPath + "/", newPath + "/");
-    else
-      this.plugin.mapping.upsert({ ...entry, path: newPath });
-    return this.upsertItem(isFolder ? newPath : newPath, fileId);
+      const folderMapping = this.plugin.mapping.getById(entry.joplinId);
+      if (folderMapping) {
+        this.plugin.mapping.upsert({ ...folderMapping, path: newPath + "/", remoteUpdatedTime: res.updated_time ?? now });
+      }
+      return "update";
+    }
+    const result = await this.upsertItem(newPath, fileId);
+    if (result === "none") {
+      const af = this.plugin.app.vault.getAbstractFileByPath(newPath);
+      if (af instanceof import_obsidian5.TFile) {
+        return this.upsertItem(newPath, fileId, true);
+      }
+      return "none";
+    }
+    return result;
   }
   async ensureFolderChain(folderPath) {
     if (!folderPath || folderPath === "/")
@@ -2288,20 +2319,11 @@ var SyncEngine = class {
       const typedAdapter = adapter;
       const excludes = this.plugin.settings.excludePatterns;
       const isExcludedDir = (rel) => excludes.some((e) => (rel + "/").startsWith(e));
+      const SYSTEM_TOP_DIRS = /* @__PURE__ */ new Set(["home", "Library", "node_modules"]);
       if (adapter && typedAdapter.list) {
         const walkDirs = async (dir) => {
           try {
             const listing = await typedAdapter.list(dir);
-            let hasSyncable = false;
-            for (const f of listing.files) {
-              const base = f.split("/").pop() || "";
-              if (base.startsWith("."))
-                continue;
-              const rel = dir ? dir + "/" + base : base;
-              if (excludes.some((e) => rel.startsWith(e)))
-                continue;
-              hasSyncable = true;
-            }
             for (const sub of listing.folders) {
               const folderName = sub.split("/").pop() || "";
               if (folderName.startsWith("."))
@@ -2309,23 +2331,20 @@ var SyncEngine = class {
               const rel = dir ? dir + "/" + folderName : folderName;
               if (isExcludedDir(rel))
                 continue;
-              const subHas = await walkDirs(sub);
-              if (subHas) {
-                hasSyncable = true;
-                if (!folderMap.has(rel)) {
-                  const existing = this.plugin.mapping.getByPath(rel + "/");
-                  if (existing) {
-                    folderMap.set(rel, existing.joplinId);
-                    pushedFolderIds.add(existing.joplinId);
-                  } else {
-                    dirs.add(rel);
-                  }
+              if (!dir && SYSTEM_TOP_DIRS.has(folderName))
+                continue;
+              if (rel && !folderMap.has(rel)) {
+                const existing = this.plugin.mapping.getByPath(rel + "/");
+                if (existing) {
+                  folderMap.set(rel, existing.joplinId);
+                  pushedFolderIds.add(existing.joplinId);
+                } else {
+                  dirs.add(rel);
                 }
               }
+              await walkDirs(sub);
             }
-            return hasSyncable;
           } catch {
-            return false;
           }
         };
         await walkDirs("");

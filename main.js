@@ -2203,10 +2203,10 @@ var SyncEngine = class {
       const d = (pushResult?.deleted ?? 0) + (pullResult?.deleted ?? 0);
       const totalFail = (pushResult?.fail ?? 0) + (pullResult?.fail ?? 0);
       this.plugin.logSync("sync", c + u + d, totalFail, { created: c, updated: u, deleted: d });
-      const parts = ["\u65B0\u5EFA " + c, "\u66F4\u65B0 " + u, "\u5220\u9664 " + d];
+      const parts = ["Created " + c, "Updated " + u, "Deleted " + d];
       if (totalFail)
-        parts.push("\u5931\u8D25 " + totalFail);
-      new import_obsidian9.Notice("Sync complete: " + parts.join("\uFF0C") + "\u3002\u5171 " + totalMapped + " \u9879\u5DF2\u6620\u5C04");
+        parts.push("Failed " + totalFail);
+      new import_obsidian9.Notice("Sync complete: " + parts.join(", ") + ". " + totalMapped + " item(s) mapped");
     } catch (e) {
       this.state = 4 /* Error */;
       const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");

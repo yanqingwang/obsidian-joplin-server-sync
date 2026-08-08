@@ -1,9 +1,9 @@
 {
  "id": "joplin-server-sync",
  "name": "Joplin Server Sync",
- "version": "0.3.70",
+ "version": "0.3.71",
  "minAppVersion": "1.7.4",
- "description": "Sync vault with Joplin Server — bidirectional, attachments, tags, links.",
+ "description": "Bidirectional sync with Joplin Server: notes, folders, attachments, E2EE, multi-client merge.",
  "author": "rosswang",
  "authorUrl": "https://github.com/yanqingwang",
  "isDesktopOnly": false

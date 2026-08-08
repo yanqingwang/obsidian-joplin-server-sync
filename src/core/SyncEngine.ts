@@ -33,7 +33,7 @@ export class SyncEngine {
   }
 
   constructor(private plugin: JoplinSyncPlugin) {
-    this.syncInfo = new SyncInfoHandler(plugin.api);
+    this.syncInfo = new SyncInfoHandler(plugin.api, () => this.plugin.app.vault.getName());
     this.resources = new ResourceManager(plugin);
   }
 
@@ -232,10 +232,6 @@ export class SyncEngine {
     return true;
   }
 
-  private ensureRootFolder(): string {
-    return '';
-  }
-
   private collectMarkdownFiles(): TFile[] {
     const excludes = this.plugin.settings.excludePatterns;
     return this.plugin.app.vault.getMarkdownFiles()
@@ -283,7 +279,8 @@ export class SyncEngine {
 
       if (!this.plugin.mapping.getDeltaCursor()) {
         this.plugin.statusBar.setSyncing('initial sync...');
-        await new InitialSync(this.plugin).run();
+        const rootFolderId = await this.ensureRootFolder();
+        await new InitialSync(this.plugin).run(rootFolderId);
       }
 
       this.state = SyncState.Pushing;
@@ -344,6 +341,39 @@ export class SyncEngine {
   }
 
   // ============ Force Push: overwrite server with local ============
+
+  /** Create (or reuse) the vault's root folder on the server. Everything this
+   *  vault pushes is parented under it, so the delta-pull root filter
+   *  (`belongsToRoot`) can reject items belonging to other vaults that share
+   *  the same account/server — the root cause of cross-vault deletion. */
+  private async ensureRootFolder(): Promise<string> {
+    const existing = this.plugin.mapping.rootFolderId;
+    if (existing) {
+      try {
+        const raw = await this.plugin.api.getItem(existing + '.md');
+        if (raw !== null) return existing;
+      } catch { /* fall through and recreate */ }
+    }
+    const vaultName = this.plugin.app.vault.getName() || 'vault';
+    const title = '_vault_' + vaultName;
+    const id = createJoplinId();
+    const now = Date.now();
+    const item: JoplinItem = {
+      id, parent_id: '', title, type_: ModelType.Folder,
+      created_time: now, updated_time: now,
+      user_created_time: now, user_updated_time: now,
+      encryption_applied: 0, encryption_cipher_text: '',
+    };
+    await this.plugin.api.putItem(id + '.md', this.serializer.serialize(item), true);
+    this.plugin.mapping.setRootFolderId(id);
+    this.plugin.mapping.upsert({
+      joplinId: id, path: title + '/', type: ModelType.Folder,
+      localHash: '', remoteUpdatedTime: now, syncedAt: now,
+    });
+    console.log('[joplin-sync] root folder created: ' + title + ' (' + id + ')');
+    return id;
+  }
+
   async forcePush(): Promise<void> {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
@@ -354,7 +384,7 @@ export class SyncEngine {
       this.e2eeActive = this.syncInfo.e2eeEnabled;
       await this.enableE2EE();
 
-      const rootFolderId = '';
+      const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
 
       // ---- True-overwrite reset: delete EVERYTHING on the server first ----
@@ -371,11 +401,13 @@ export class SyncEngine {
         // synced clients (they could no longer decrypt server-stored data).
         const masterKeyIds = new Set(this.plugin.e2ee.availableMasterKeys);
         if (this.plugin.mapping.e2eeMasterKeyId) masterKeyIds.add(this.plugin.mapping.e2eeMasterKeyId);
+        const protectedRootId = this.plugin.mapping.rootFolderId;
         for (const stat of remote) {
           if (stat.name === 'info.json') { skipped++; continue; }
           const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
           if (noteMatch) {
             const id = noteMatch[1];
+            if (id === protectedRootId) { skipped++; continue; }
             const entry = this.plugin.mapping.getById(id);
             if (entry?.type === ModelType.MasterKey || masterKeyIds.has(id)) { skipped++; continue; }
           }

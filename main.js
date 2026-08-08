@@ -722,18 +722,24 @@ var JoplinSerializer = class {
 // src/core/SyncInfo.ts
 var SUPPORTED_SYNC_VERSION = 3;
 var SyncInfoHandler = class {
-  constructor(api) {
+  constructor(api, getVaultId) {
     this.api = api;
+    this.getVaultId = getVaultId;
     this._e2eeEnabled = false;
+    this._vaultId = "";
   }
   get e2eeEnabled() {
     return this._e2eeEnabled;
   }
+  get serverVaultId() {
+    return this._vaultId;
+  }
   async checkOrInit() {
     const raw = await this.api.getItem("info.json");
     if (raw === null) {
-      const info2 = { version: SUPPORTED_SYNC_VERSION };
+      const info2 = { version: SUPPORTED_SYNC_VERSION, vaultId: this.getVaultId() };
       await this.api.putItem("info.json", JSON.stringify(info2));
+      this._vaultId = info2.vaultId ?? "";
       return info2;
     }
     const info = JSON.parse(raw);
@@ -744,8 +750,13 @@ var SyncInfoHandler = class {
       throw new Error("Sync target needs upgrade (v" + info.version + "). Run sync in official Joplin client first.");
     }
     this._e2eeEnabled = info.e2ee?.value === true;
+    this._vaultId = info.vaultId ?? "";
     if (this._e2eeEnabled) {
       console.warn("[joplin-sync] E2EE target detected \u2014 read-only decryption mode");
+    }
+    const mine = this.getVaultId();
+    if (this._vaultId && mine && this._vaultId !== mine) {
+      console.warn('[joplin-sync] Server was first initialized by vault "' + this._vaultId + '" but this vault is "' + mine + '". Same account used by multiple vaults can cause data loss. Use a separate account per vault, or keep a single primary vault.');
     }
     return info;
   }
@@ -1425,20 +1436,20 @@ var DeltaPuller = class {
     const rootId = this.plugin.mapping.rootFolderId;
     if (!rootId)
       return true;
-    const hasFolders = this.plugin.mapping.all().some((e) => e.type === 2 /* Folder */);
-    if (!hasFolders)
-      return true;
     let pid = item.parent_id;
     const visited = /* @__PURE__ */ new Set();
-    while (pid && !visited.has(pid)) {
+    let depth = 0;
+    while (pid && !visited.has(pid) && depth < 64) {
       visited.add(pid);
       if (pid === rootId)
         return true;
       const parentMapping = this.plugin.mapping.getById(pid);
       if (!parentMapping)
         return false;
+      if (parentMapping.type !== 2 /* Folder */)
+        return false;
       pid = parentMapping.joplinId;
-      break;
+      depth++;
     }
     return false;
   }
@@ -1467,6 +1478,12 @@ var DeltaPuller = class {
         cursor = page.cursor;
       if (!page.has_more)
         break;
+    }
+    const totalMapped = this.plugin.mapping.all().length;
+    if (totalMapped > 20 && deletes.length > totalMapped / 2) {
+      console.error("[joplin-sync] refusing " + deletes.length + " delta deletes over " + totalMapped + " mapped items \u2014 possible stale cursor or foreign vault. Skipping this batch.");
+      stats.fail += deletes.length;
+      deletes.length = 0;
     }
     for (const id of deletes) {
       try {
@@ -1657,6 +1674,16 @@ var DeltaPuller = class {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping)
       return false;
+    try {
+      const stillThere = await this.plugin.api.getItem(id + ".md");
+      if (stillThere !== null) {
+        console.warn("[joplin-sync] skip local delete for " + mapping.path + ": server still has item " + id + " (stale cursor or foreign vault)");
+        return false;
+      }
+    } catch (e) {
+      console.warn("[joplin-sync] delete verification failed for " + id + ", skipping local delete: " + (e instanceof Error ? e.message : String(e)));
+      return false;
+    }
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
     if (f) {
       this.watcher.suppress(f.path);
@@ -1769,13 +1796,13 @@ var InitialSync = class {
     this.plugin = plugin;
     this.serializer = new JoplinSerializer();
   }
-  async run() {
+  async run(rootFolderId = "") {
     const files = this.collectMarkdownFiles();
     if (files.length === 0) {
       new import_obsidian8.Notice("No markdown files to sync");
       return;
     }
-    const folderMap = await this.createFolders(files);
+    const folderMap = await this.createFolders(files, rootFolderId);
     let done = 0;
     let fail = 0;
     if (this.plugin.settings.syncFoldersOnly) {
@@ -1785,7 +1812,7 @@ var InitialSync = class {
         await Promise.all(batch.map(async (file) => {
           try {
             const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
-            const parentId = folderMap.get(dir) || "";
+            const parentId = folderMap.get(dir) || rootFolderId;
             await this.uploadNote(file, parentId);
             done++;
           } catch (e) {
@@ -1807,9 +1834,9 @@ var InitialSync = class {
     await this.plugin.mapping.flush();
     new import_obsidian8.Notice("Initial sync: " + done + " uploaded" + (fail ? ", " + fail + " failed" : ""));
   }
-  async createFolders(files) {
+  async createFolders(files, rootFolderId) {
     const folderMap = /* @__PURE__ */ new Map();
-    folderMap.set("", "");
+    folderMap.set("", rootFolderId);
     const dirs = /* @__PURE__ */ new Set();
     for (const f of files) {
       const d = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
@@ -1830,7 +1857,7 @@ var InitialSync = class {
       }
     }
     for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
-      const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) || "" : "";
+      const parent = dp.includes("/") ? folderMap.get(dp.slice(0, dp.lastIndexOf("/"))) || rootFolderId : rootFolderId;
       const fid = createJoplinId();
       const title = dp.split("/").pop() || dp;
       const item = {
@@ -1909,7 +1936,7 @@ var SyncEngine = class {
     this.timer = null;
     this.e2eeActive = false;
     this.forcePullFolderPaths = /* @__PURE__ */ new Map();
-    this.syncInfo = new SyncInfoHandler(plugin.api);
+    this.syncInfo = new SyncInfoHandler(plugin.api, () => this.plugin.app.vault.getName());
     this.resources = new ResourceManager(plugin);
   }
   get configDir() {
@@ -2133,9 +2160,6 @@ var SyncEngine = class {
     });
     return true;
   }
-  ensureRootFolder() {
-    return "";
-  }
   collectMarkdownFiles() {
     const excludes = this.plugin.settings.excludePatterns;
     return this.plugin.app.vault.getMarkdownFiles().filter((f) => !excludes.some((p) => f.path.startsWith(p)));
@@ -2182,7 +2206,8 @@ var SyncEngine = class {
       await this.enableE2EE();
       if (!this.plugin.mapping.getDeltaCursor()) {
         this.plugin.statusBar.setSyncing("initial sync...");
-        await new InitialSync(this.plugin).run();
+        const rootFolderId = await this.ensureRootFolder();
+        await new InitialSync(this.plugin).run(rootFolderId);
       }
       this.state = 1 /* Pushing */;
       const pushResult = await this.pusher.pushAll();
@@ -2241,6 +2266,49 @@ var SyncEngine = class {
     return id;
   }
   // ============ Force Push: overwrite server with local ============
+  /** Create (or reuse) the vault's root folder on the server. Everything this
+   *  vault pushes is parented under it, so the delta-pull root filter
+   *  (`belongsToRoot`) can reject items belonging to other vaults that share
+   *  the same account/server — the root cause of cross-vault deletion. */
+  async ensureRootFolder() {
+    const existing = this.plugin.mapping.rootFolderId;
+    if (existing) {
+      try {
+        const raw = await this.plugin.api.getItem(existing + ".md");
+        if (raw !== null)
+          return existing;
+      } catch {
+      }
+    }
+    const vaultName = this.plugin.app.vault.getName() || "vault";
+    const title = "_vault_" + vaultName;
+    const id = createJoplinId();
+    const now = Date.now();
+    const item = {
+      id,
+      parent_id: "",
+      title,
+      type_: 2 /* Folder */,
+      created_time: now,
+      updated_time: now,
+      user_created_time: now,
+      user_updated_time: now,
+      encryption_applied: 0,
+      encryption_cipher_text: ""
+    };
+    await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item), true);
+    this.plugin.mapping.setRootFolderId(id);
+    this.plugin.mapping.upsert({
+      joplinId: id,
+      path: title + "/",
+      type: 2 /* Folder */,
+      localHash: "",
+      remoteUpdatedTime: now,
+      syncedAt: now
+    });
+    console.log("[joplin-sync] root folder created: " + title + " (" + id + ")");
+    return id;
+  }
   async forcePush() {
     if (this.running) {
       new import_obsidian9.Notice("Sync already in progress");
@@ -2253,7 +2321,7 @@ var SyncEngine = class {
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
       await this.enableE2EE();
-      const rootFolderId = "";
+      const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
       {
         const remote2 = await this.listAllRemoteItems();
@@ -2262,6 +2330,7 @@ var SyncEngine = class {
         const masterKeyIds = new Set(this.plugin.e2ee.availableMasterKeys);
         if (this.plugin.mapping.e2eeMasterKeyId)
           masterKeyIds.add(this.plugin.mapping.e2eeMasterKeyId);
+        const protectedRootId = this.plugin.mapping.rootFolderId;
         for (const stat of remote2) {
           if (stat.name === "info.json") {
             skipped++;
@@ -2270,6 +2339,10 @@ var SyncEngine = class {
           const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
           if (noteMatch) {
             const id = noteMatch[1];
+            if (id === protectedRootId) {
+              skipped++;
+              continue;
+            }
             const entry = this.plugin.mapping.getById(id);
             if (entry?.type === 9 /* MasterKey */ || masterKeyIds.has(id)) {
               skipped++;

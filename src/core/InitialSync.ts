@@ -10,12 +10,12 @@ export class InitialSync {
 
   constructor(private plugin: JoplinSyncPlugin) {}
 
-  async run(): Promise<void> {
+  async run(rootFolderId = ''): Promise<void> {
     const files = this.collectMarkdownFiles();
     if (files.length === 0) { new Notice('No markdown files to sync'); return; }
 
     // 1. Create folder hierarchy on server
-    const folderMap = await this.createFolders(files);
+    const folderMap = await this.createFolders(files, rootFolderId);
 
     // 2. Upload all notes with correct parent_ids (skip if folders-only mode)
     let done = 0; let fail = 0;
@@ -26,7 +26,7 @@ export class InitialSync {
       await Promise.all(batch.map(async (file) => {
         try {
           const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
-          const parentId = folderMap.get(dir) || '';
+          const parentId = folderMap.get(dir) || rootFolderId;
           await this.uploadNote(file, parentId);
           done++;
         } catch (e: unknown) {
@@ -51,9 +51,9 @@ export class InitialSync {
     new Notice('Initial sync: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
   }
 
-  private async createFolders(files: TFile[]): Promise<Map<string, string>> {
+  private async createFolders(files: TFile[], rootFolderId: string): Promise<Map<string, string>> {
     const folderMap = new Map<string, string>();
-    folderMap.set('', ''); // root = Joplin root
+    folderMap.set('', rootFolderId); // root = vault root folder
 
     const dirs = new Set<string>();
     for (const f of files) {
@@ -72,7 +72,7 @@ export class InitialSync {
     }
 
     for (const dp of [...dirs].sort((a, b) => a.split('/').length - b.split('/').length)) {
-      const parent = dp.includes('/') ? (folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) || '') : '';
+      const parent = dp.includes('/') ? (folderMap.get(dp.slice(0, dp.lastIndexOf('/'))) || rootFolderId) : rootFolderId;
       const fid = createJoplinId();
       const title = dp.split('/').pop() || dp;
       const item: JoplinItem = {

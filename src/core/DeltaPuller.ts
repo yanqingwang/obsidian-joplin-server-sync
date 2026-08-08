@@ -24,19 +24,22 @@ export class DeltaPuller {
   private belongsToRoot(item: JoplinItem): boolean {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
-    if (!rootId) return true; // no root folder → accept everything (cursor filters stale data)
-    const hasFolders = this.plugin.mapping.all().some(e => ((e as unknown as { type: number }).type as number) === (ModelType.Folder as number));
-    if (!hasFolders) return true;
+    if (!rootId) return true; // no root folder → accept everything (legacy data)
 
+    // Walk the parent chain to the root. The root folder of THIS vault is the
+    // only ancestor that makes an item ours; anything under another vault's
+    // root (or at the account root) is foreign and must not be pulled.
     let pid = item.parent_id;
     const visited = new Set<string>();
-    while (pid && !visited.has(pid)) {
+    let depth = 0;
+    while (pid && !visited.has(pid) && depth < 64) {
       visited.add(pid);
       if (pid === rootId) return true;
       const parentMapping = this.plugin.mapping.getById(pid);
-      if (!parentMapping) return false; // parent not in mapping = foreign
-      pid = parentMapping.joplinId; // walk up... but this is the same as pid for folder entries
-      break; // simplified: one level check
+      if (!parentMapping) return false; // parent unknown = foreign item
+      if (parentMapping.type !== ModelType.Folder) return false;
+      pid = parentMapping.joplinId;
+      depth++;
     }
     return false;
   }
@@ -68,7 +71,19 @@ export class DeltaPuller {
       if (!page.has_more) break;
     }
 
-    // Apply deletes (folders first so children are removed after their parents)
+    // Apply deletes (folders first so children are removed after their parents).
+    // Guard: a delta page that reports more deletes than half the local mapping
+    // is almost certainly a stale cursor or foreign-vault replay, not a real
+    // mass deletion. Refuse to act on it — individual deletes are still
+    // server-verified in applyDelete, but skipping the batch avoids hundreds
+    // of GET round-trips on a replay storm.
+    const totalMapped = this.plugin.mapping.all().length;
+    if (totalMapped > 20 && deletes.length > totalMapped / 2) {
+      console.error('[joplin-sync] refusing ' + deletes.length + ' delta deletes over ' + totalMapped
+        + ' mapped items — possible stale cursor or foreign vault. Skipping this batch.');
+      stats.fail += deletes.length;
+      deletes.length = 0;
+    }
     for (const id of deletes) {
       try { if (await this.applyDelete(id)) stats.deleted++; }
       catch (e) { stats.fail++; console.error('[joplin-sync] delta delete failed', id, e); }
@@ -232,6 +247,23 @@ export class DeltaPuller {
   private async applyDelete(id: string): Promise<boolean> {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping) return false;
+
+    // Stale delta cursors replay Delete events for items that still exist
+    // locally (account reset, or a second vault on the same account). Only
+    // delete locally when the server confirms the item is really gone.
+    try {
+      const stillThere = await this.plugin.api.getItem(id + '.md');
+      if (stillThere !== null) {
+        console.warn('[joplin-sync] skip local delete for ' + mapping.path
+          + ': server still has item ' + id + ' (stale cursor or foreign vault)');
+        return false;
+      }
+    } catch (e: unknown) {
+      console.warn('[joplin-sync] delete verification failed for ' + id + ', skipping local delete: '
+        + (e instanceof Error ? e.message : String(e)));
+      return false;
+    }
+
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
     if (f) {
       this.watcher.suppress(f.path);

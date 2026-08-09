@@ -734,29 +734,62 @@ export class SyncEngine {
       for (const f of this.plugin.app.vault.getFiles()) {
         if (!isKept(f.path)) {
           const fm = this.plugin.app.fileManager as unknown as { trashFile?: (f: TAbstractFile) => Promise<void> } | undefined;
-          if (fm?.trashFile) await fm.trashFile(f).catch(() => {});
-          else await (this.plugin.app.vault as unknown as { remove: (x: TAbstractFile) => Promise<void> }).remove(f).catch(() => {});
-          delCount++;
+          try {
+            if (fm?.trashFile) await fm.trashFile(f);
+            else await (this.plugin.app.vault as unknown as { remove: (x: TAbstractFile) => Promise<void> }).remove(f);
+            delCount++;
+          } catch (e: unknown) {
+            console.warn('[joplin-sync] force pull file delete failed: ' + f.path + ' - ' + (e instanceof Error ? e.message : String(e)));
+          }
         }
       }
 
-      // Delete ALL remaining folders bottom-up. Enumerate via the vault API
-      // (getAllLoadedFiles) instead of adapter.list(''): Obsidian's adapter
-      // may return directory names with a `./` prefix, which the old
-      // `d.includes('/')` guard silently filtered out — leaving orphan
-      // folders that exist locally but not on the server (B15).
-      const allLocalDirs = this.plugin.app.vault.getAllLoadedFiles()
-        .filter((x): x is TFolder => x instanceof TFolder)
-        .map(f => f.path.replace(/\/+$/, ''))
-        .filter(p => p && !isKept(p));
+      // Delete ALL remaining folders bottom-up, enumerating via the FILESYSTEM
+      // adapter — disk is authoritative, the Obsidian vault model can lag
+      // after hundreds of trashFile calls. adapter.list may return names
+      // with a `./` prefix in real Obsidian: normalize them instead of
+      // filtering on '/' (which silently skipped every folder — B15).
+      const normDir = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '');
+      const listAll = async (dir: string): Promise<string[]> => {
+        const result: string[] = [];
+        try {
+          if (adapter.list) {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const clean = normDir(sub);
+              if (!clean || clean === '.' || clean === '..') continue;
+              const children = await listAll(clean);
+              result.push(...children, clean);
+            }
+          }
+        } catch {/* ignore unreadable */}
+        return result;
+      };
+      let allLocalDirs: string[] = [];
+      try {
+        if (adapter.list) {
+          const root = await adapter.list('');
+          for (const d of root.folders) {
+            const clean = normDir(d);
+            if (!clean || clean === '.' || clean === '..') continue;
+            if (isKept(clean)) continue;
+            const subs = await listAll(clean);
+            allLocalDirs.push(...subs, clean);
+          }
+        }
+      } catch {/* ignore */}
+      allLocalDirs = [...new Set(allLocalDirs)];
       allLocalDirs.sort((a, b) => b.split('/').length - a.split('/').length);
       for (const d of allLocalDirs) {
+        if (isKept(d)) continue;
         try {
           if (await adapter.exists(d)) {
-            await adapter.rmdir(d, false).catch(() => {});
+            await adapter.rmdir(d, true);
             delDirCount++;
           }
-        } catch {/* empty */}
+        } catch (e: unknown) {
+          console.warn('[joplin-sync] force pull rmdir failed: ' + d + ' - ' + (e instanceof Error ? e.message : String(e)));
+        }
       }
 
       this.plugin.mapping.setDeltaCursor('');

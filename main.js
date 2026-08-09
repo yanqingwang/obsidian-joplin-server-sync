@@ -2925,25 +2925,63 @@ var SyncEngine = class {
       for (const f of this.plugin.app.vault.getFiles()) {
         if (!isKept(f.path)) {
           const fm = this.plugin.app.fileManager;
-          if (fm?.trashFile)
-            await fm.trashFile(f).catch(() => {
-            });
-          else
-            await this.plugin.app.vault.remove(f).catch(() => {
-            });
-          delCount++;
+          try {
+            if (fm?.trashFile)
+              await fm.trashFile(f);
+            else
+              await this.plugin.app.vault.remove(f);
+            delCount++;
+          } catch (e) {
+            console.warn("[joplin-sync] force pull file delete failed: " + f.path + " - " + (e instanceof Error ? e.message : String(e)));
+          }
         }
       }
-      const allLocalDirs = this.plugin.app.vault.getAllLoadedFiles().filter((x) => x instanceof import_obsidian9.TFolder).map((f) => f.path.replace(/\/+$/, "")).filter((p) => p && !isKept(p));
-      allLocalDirs.sort((a, b) => b.split("/").length - a.split("/").length);
-      for (const d of allLocalDirs) {
+      const normDir = (p) => p.replace(/^\.\//, "").replace(/\/+$/, "");
+      const listAll = async (dir) => {
+        const result = [];
         try {
-          if (await adapter.exists(d)) {
-            await adapter.rmdir(d, false).catch(() => {
-            });
-            delDirCount++;
+          if (adapter.list) {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const clean = normDir(sub);
+              if (!clean || clean === "." || clean === "..")
+                continue;
+              const children = await listAll(clean);
+              result.push(...children, clean);
+            }
           }
         } catch {
+        }
+        return result;
+      };
+      let allLocalDirs = [];
+      try {
+        if (adapter.list) {
+          const root = await adapter.list("");
+          for (const d of root.folders) {
+            const clean = normDir(d);
+            if (!clean || clean === "." || clean === "..")
+              continue;
+            if (isKept(clean))
+              continue;
+            const subs = await listAll(clean);
+            allLocalDirs.push(...subs, clean);
+          }
+        }
+      } catch {
+      }
+      allLocalDirs = [...new Set(allLocalDirs)];
+      allLocalDirs.sort((a, b) => b.split("/").length - a.split("/").length);
+      for (const d of allLocalDirs) {
+        if (isKept(d))
+          continue;
+        try {
+          if (await adapter.exists(d)) {
+            await adapter.rmdir(d, true);
+            delDirCount++;
+          }
+        } catch (e) {
+          console.warn("[joplin-sync] force pull rmdir failed: " + d + " - " + (e instanceof Error ? e.message : String(e)));
         }
       }
       this.plugin.mapping.setDeltaCursor("");

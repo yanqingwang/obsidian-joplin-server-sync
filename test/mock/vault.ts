@@ -175,6 +175,10 @@ export class DiskAdapter {
   }
   async remove(p: string): Promise<void> { fs.rmSync(path.join(this.root, p), { force: true }); }
   async rmdir(p: string, recursive: boolean): Promise<void> {
-    try { fs.rmdirSync(path.join(this.root, p)); } catch {}
+    if (recursive) {
+      fs.rmSync(path.join(this.root, p), { recursive: true, force: true });
+    } else {
+      try { fs.rmdirSync(path.join(this.root, p)); } catch {}
+    }
   }
 }

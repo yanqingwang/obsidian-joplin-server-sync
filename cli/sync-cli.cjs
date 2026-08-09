@@ -4107,9 +4107,13 @@ var DiskAdapter = class {
     fs2.rmSync(path2.join(this.root, p), { force: true });
   }
   async rmdir(p, recursive) {
-    try {
-      fs2.rmdirSync(path2.join(this.root, p));
-    } catch {
+    if (recursive) {
+      fs2.rmSync(path2.join(this.root, p), { recursive: true, force: true });
+    } else {
+      try {
+        fs2.rmdirSync(path2.join(this.root, p));
+      } catch {
+      }
     }
   }
 };

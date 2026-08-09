@@ -784,7 +784,10 @@ export class SyncEngine {
         if (isKept(d)) continue;
         try {
           if (await adapter.exists(d)) {
-            await adapter.rmdir(d, true);
+            // Non-recursive on purpose: files were already deleted above, so a
+            // dir that is still non-empty contains kept (excluded) files and
+            // must be preserved. Recursive rmdir would delete them (data loss).
+            await adapter.rmdir(d, false);
             delDirCount++;
           }
         } catch (e: unknown) {

@@ -2725,7 +2725,7 @@ var init_SyncEngine = __esm({
               continue;
             try {
               if (await adapter.exists(d)) {
-                await adapter.rmdir(d, true);
+                await adapter.rmdir(d, false);
                 delDirCount++;
               }
             } catch (e) {

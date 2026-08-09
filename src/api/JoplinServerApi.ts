@@ -6,25 +6,36 @@ interface ApiConfig { baseUrl: string; email: string; password: string; }
 export class JoplinServerApi {
   private sessionId: string | null = null;
   private getConfig: () => ApiConfig;
-  private callCount = 0;
-  private readonly REFRESH_INTERVAL = 200; // re-login every 200 API calls
+  private loginPromise: Promise<void> | null = null;
 
   constructor(getConfig: () => ApiConfig) {
     this.getConfig = getConfig;
   }
 
-  async login(): Promise<void> {
-    const { baseUrl, email, password } = this.getConfig();
-    const res = await requestUrl({
-      url: this.trimSlash(baseUrl) + '/api/sessions',
-      method: 'POST',
-      contentType: 'application/json',
-      body: JSON.stringify({ email, password }),
-      throw: false,
-    });
-    if (res.status !== 200) throw new Error('Login failed (' + res.status + '): ' + res.text);
-    const body = res.json as Record<string, unknown>;
-    this.sessionId = body.id as string;
+  async login(force = false): Promise<void> {
+    if (!force && this.sessionId) return; // reuse cached session; force only on 401
+    // Single-flight: concurrent 401s must not fire parallel logins that
+    // overwrite each other's sessionId (B32).
+    if (!force && this.loginPromise) return this.loginPromise;
+    const doLogin = async () => {
+      const { baseUrl, email, password } = this.getConfig();
+      const res = await requestUrl({
+        url: this.trimSlash(baseUrl) + '/api/sessions',
+        method: 'POST',
+        contentType: 'application/json',
+        body: JSON.stringify({ email, password }),
+        throw: false,
+      });
+      if (res.status !== 200) throw new Error('Login failed (' + res.status + '): ' + res.text);
+      const body = res.json as Record<string, unknown>;
+      this.sessionId = body.id as string;
+    };
+    if (force) {
+      await doLogin();
+    } else {
+      this.loginPromise = doLogin().finally(() => { this.loginPromise = null; });
+      return this.loginPromise;
+    }
   }
 
   private async rawRequest(method: string, path: string, opts: {
@@ -33,11 +44,6 @@ export class JoplinServerApi {
     retries?: number;
   } = {}): Promise<{ status: number; text: string; arrayBuffer: ArrayBuffer }> {
     if (!this.sessionId) await this.login();
-    this.callCount++;
-    if (this.callCount >= this.REFRESH_INTERVAL) {
-      this.callCount = 0;
-      try { await this.login(); } catch { /* refresh best-effort */ }
-    }
     const maxRetries = opts.retries ?? 3;
 
     for (let attempt = 0; ; attempt++) {
@@ -55,7 +61,12 @@ export class JoplinServerApi {
       });
 
       if (res.status === 401 && attempt === 0) {
-        await this.login();
+        this.sessionId = null;
+        await this.login(true);
+        continue;
+      }
+      if (res.status === 429 && attempt < maxRetries) {
+        await this.sleep(Math.pow(2, attempt) * 1000);
         continue;
       }
       if (res.status >= 500 && attempt < maxRetries) {
@@ -87,7 +98,10 @@ export class JoplinServerApi {
   }
 
   private itemPath(name: string, suffix = ''): string {
-    return '/api/items/root:/' + encodeURIComponent(name) + ':' + suffix;
+    // Encode each path segment but keep '/' — `.resource/<id>` must not
+    // become `.resource%2F<id>` (C13).
+    const encoded = name.split('/').map(encodeURIComponent).join('/');
+    return '/api/items/root:/' + encoded + ':' + suffix;
   }
 
   async getItem(name: string): Promise<string | null> {
@@ -189,7 +203,7 @@ export class JoplinServerApi {
     return res.json as unknown as Paginated<SyncLock>;
   }
 
-  private trimSlash(u: string) { return u.replace(/[/`]+$/, ''); }
+  private trimSlash(u: string) { return u.replace(/\/+$/, ''); }
   private sleep(ms: number) { return new Promise(r => window.setTimeout(r, ms)); }
 }
 

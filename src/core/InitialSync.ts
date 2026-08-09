@@ -4,56 +4,84 @@ import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { ModelType, JoplinItem } from '../api/models';
 import { createJoplinId } from '../mapping/IdGenerator';
 import { sha256, chunk } from './SyncEngine';
+import { stampFrontmatter } from './FileIdentity';
+import { safeFileName } from './pathUtil';
 
+/**
+ * First-sync = full bidirectional reconciliation, NOT "upload + jump cursor".
+ *
+ * A vault pointing at a server that already holds other vaults' data must
+ * (1) pull every in-scope remote item to disk, (2) upload local files that
+ * are not yet mapped, and only then (3) set the delta cursor. Skipping (1)
+ * made a brand-new vault permanently blind to existing server content (B4).
+ */
 export class InitialSync {
   private serializer = new JoplinSerializer();
 
   constructor(private plugin: JoplinSyncPlugin) {}
 
   async run(rootFolderId = ''): Promise<void> {
+    // 0. Pull pass: fetch every remote item and land it locally. Calls the
+    //    inner (guard-free) forcePull because syncCycle already holds the
+    //    running lock (C2).
+    await this.plugin.engine.forcePullInner();
+
+    // 1. Upload local files that are not yet mapped (they came from this
+    //    vault and were never pushed).
     const files = this.collectMarkdownFiles();
-    if (files.length === 0) { new Notice('No markdown files to sync'); return; }
+    const unmapped = files.filter(f => !this.plugin.mapping.getByPath(f.path));
 
-    // 1. Create folder hierarchy on server
-    const folderMap = await this.createFolders(files, rootFolderId);
-
-    // 2. Upload all notes with correct parent_ids (skip if folders-only mode)
-    let done = 0; let fail = 0;
-    if (this.plugin.settings.syncFoldersOnly) {
-      new Notice('Folders only mode: skipping note upload');
-    } else {
-    for (const batch of chunk(files, 5)) {
-      await Promise.all(batch.map(async (file) => {
-        try {
-          const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
-          const parentId = folderMap.get(dir) || rootFolderId;
-          await this.uploadNote(file, parentId);
-          done++;
-        } catch (e: unknown) {
-          fail++;
-          console.error('[joplin-sync] initial upload fail [' + fail + ']:', file.path, e instanceof Error ? e.message : String(e));
-        }
-      }));
+    // Always consume the delta stream so the cursor lands, even when there
+    // is nothing new to upload — otherwise every cycle re-runs InitialSync (C2).
+    const consumeDelta = async (): Promise<void> => {
+      let cursor: string | undefined;
+      while (true) {
+        const page = await this.plugin.api.delta(cursor);
+        if (page.has_more && !page.cursor) break;
+        cursor = page.cursor;
+        if (!page.has_more) break;
+      }
+      this.plugin.mapping.setDeltaCursor(cursor ?? '');
       await this.plugin.mapping.flush();
-    }
+    };
+
+    if (unmapped.length === 0) {
+      await consumeDelta();
+      new Notice('Initial sync: no new local files to upload');
+      return;
     }
 
-    // 3. Consume delta stream to set cursor
-    let cursor: string | undefined;
-    while (true) {
-      const page = await this.plugin.api.delta(cursor);
-      cursor = page.cursor;
-      if (!page.has_more) break;
+    // 1a. Create folder hierarchy on server
+    const folderMap = await this.createFolders(unmapped, rootFolderId);
+
+    // 1b. Upload notes with correct parent_ids
+    let done = 0; let fail = 0;
+    if (!this.plugin.settings.syncFoldersOnly) {
+      for (const batch of chunk(unmapped, 5)) {
+        await Promise.all(batch.map(async (file) => {
+          try {
+            const dir = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
+            const parentId = folderMap.get(dir) || rootFolderId;
+            await this.uploadNote(file, parentId);
+            done++;
+          } catch (e: unknown) {
+            fail++;
+            console.error('[joplin-sync] initial upload fail [' + fail + ']:', file.path, e instanceof Error ? e.message : String(e));
+          }
+        }));
+        await this.plugin.mapping.flush();
+      }
     }
-    this.plugin.mapping.setDeltaCursor(cursor ?? '');
-    await this.plugin.mapping.flush();
+
+    // 2. Consume delta stream to set cursor
+    await consumeDelta();
 
     new Notice('Initial sync: ' + done + ' uploaded' + (fail ? ', ' + fail + ' failed' : ''));
   }
 
   private async createFolders(files: TFile[], rootFolderId: string): Promise<Map<string, string>> {
     const folderMap = new Map<string, string>();
-    folderMap.set('', rootFolderId); // root = vault root folder
+    folderMap.set('', rootFolderId);
 
     const dirs = new Set<string>();
     for (const f of files) {
@@ -98,9 +126,11 @@ export class InitialSync {
   }
 
   private async uploadNote(file: TFile, parentId: string): Promise<void> {
+    // Stable id from frontmatter — two terminals converge on the SAME server
+    // item instead of minting duplicates (B16).
+    const id = await this.plugin.identity.ensureId(file);
     const content = await this.plugin.app.vault.read(file);
     const hash = await sha256(content);
-    const id = createJoplinId();
     const now = Date.now();
     const item: JoplinItem = {
       id, parent_id: parentId, title: file.basename, body: content,
@@ -116,8 +146,7 @@ export class InitialSync {
   }
 
   private collectMarkdownFiles(): TFile[] {
-    const excludes = this.plugin.settings.excludePatterns;
     return this.plugin.app.vault.getMarkdownFiles()
-      .filter(f => !excludes.some(p => f.path.startsWith(p)));
+      .filter(f => !this.plugin.engine.shouldExclude(f.path));
   }
 }

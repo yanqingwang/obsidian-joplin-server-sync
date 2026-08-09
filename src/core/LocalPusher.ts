@@ -6,6 +6,8 @@ import { createJoplinId } from '../mapping/IdGenerator';
 import { ModelType, JoplinItem } from '../api/models';
 import { sha256 } from './SyncEngine';
 import { ResourceManager } from '../resource/ResourceManager';
+import { ConflictResolver } from './ConflictResolver';
+import type { VaultWatcher } from '../vault/VaultWatcher';
 
 export class LocalPusher {
   private serializer = new JoplinSerializer();
@@ -74,6 +76,16 @@ export class LocalPusher {
     if (existing) {
       const remote = await this.plugin.api.getItem(id + '.md');
       if (remote) base = this.serializer.unserialize(remote);
+      // C7: the server copy is NEWER than our last sync AND our local content
+      // changed — both sides edited. Resolve instead of silently overwriting
+      // the remote (the old code made ConflictResolver unreachable).
+      const remoteTime = (base as JoplinItem).updated_time ?? 0;
+      if (!force && remoteTime > existing.remoteUpdatedTime && existing.localHash !== hash) {
+        const watcher = this.plugin.engine.watcher;
+        const resolver = new ConflictResolver(this.plugin, watcher);
+        await resolver.resolve(existing, base as JoplinItem, content, path);
+        return 'none';
+      }
     }
 
     const item: JoplinItem = {
@@ -90,9 +102,15 @@ export class LocalPusher {
       markup_language: 1,
     };
 
-    // E2EE: encrypt if keys are loaded and target has E2EE enabled
+    // E2EE: encrypt if keys are loaded and target has E2EE enabled.
+    // If E2EE is active but no key is loaded (password not entered yet),
+    // uploading plaintext would silently downgrade the sync target — fail
+    // hard instead (B24).
     const e2ee = this.plugin.e2ee;
     const mkId = e2ee.firstLoadedKeyId;
+    if (this.plugin.engine.e2eeActive && !mkId) {
+      throw new Error('E2EE is enabled but no master key is loaded. Enter the E2EE password in settings first.');
+    }
     if (mkId && this.plugin.engine.e2eeActive) {
       const serialized = this.serializer.serialize(item);
       const encryptedCt = await e2ee.encryptItem(serialized, mkId);
@@ -202,6 +220,11 @@ export class LocalPusher {
   }
 
   private async ensureRootFolderId(): Promise<string> {
-    return '';
+    // Root-level items must hang off the vault root folder (same as
+    // forcePush), NOT parent_id='' — otherwise a second terminal's
+    // belongsToRoot rejects them as foreign (B2).
+    const existing = this.plugin.mapping.rootFolderId;
+    if (existing) return existing;
+    return this.plugin.engine.ensureRootFolder();
   }
 }

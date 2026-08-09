@@ -1,5 +1,5 @@
 import { Plugin, Notice } from 'obsidian';
-import { PluginSettings, DEFAULT_SETTINGS } from './settings/PluginSettings';
+import { PluginSettings, DEFAULT_SETTINGS, SyncLogEntry } from './settings/PluginSettings';
 import { JoplinSyncSettingTab } from './settings/SettingsTab';
 import { JoplinServerApi } from './api/JoplinServerApi';
 import { MappingStore } from './mapping/MappingStore';
@@ -71,7 +71,7 @@ export default class JoplinSyncPlugin extends Plugin {
       name: 'Test Joplin Server connection',
       callback: async () => {
         try {
-          await this.api.login();
+          await this.api.login(true);
           new Notice('Joplin Server: connection OK');
         } catch (e: unknown) {
           new Notice('Connection failed: ' + (e instanceof Error ? e.message : String(e)));
@@ -88,10 +88,15 @@ export default class JoplinSyncPlugin extends Plugin {
       },
     });
 
-    // Phase 2: start watcher + scheduler after init
+    // Phase 2: start watcher + scheduler after init.
+    // Defer to onLayoutReady: Obsidian fires `create` for every file while
+    // loading the vault, so registering in onload would flood the changelog
+    // with a full-vault create storm on every startup (B21).
     if (this.settings.serverUrl) {
-      this.engine.startWatching();
-      this.engine.startScheduler();
+      this.app.workspace.onLayoutReady(() => {
+        this.engine.startWatching();
+        this.engine.startScheduler();
+      });
     }
   }
 
@@ -103,6 +108,10 @@ export default class JoplinSyncPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const data: Record<string, unknown> | null = await this.loadData() as Record<string, unknown> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
+    // Deep-copy array fields: if data.json lacks syncLog, the shallow assign
+    // leaves settings.syncLog sharing DEFAULT_SETTINGS.syncLog's array, and
+    // logSync()'s unshift would pollute the default object (B33).
+    this.settings.syncLog = [...((data?.syncLog as SyncLogEntry[] | undefined) ?? [])];
   }
 
   async saveSettings(): Promise<void> {

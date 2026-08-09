@@ -1,4 +1,4 @@
-import { Notice, TFile, TAbstractFile } from 'obsidian';
+import { Notice, Modal, TFile, TAbstractFile } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { SyncInfoHandler } from './SyncInfo';
@@ -10,6 +10,7 @@ import { LocalPusher } from './LocalPusher';
 import { DeltaPuller } from './DeltaPuller';
 import { InitialSync } from './InitialSync';
 import { safeFileName } from './pathUtil';
+import { stampFrontmatter } from './FileIdentity';
 import { ResourceManager } from '../resource/ResourceManager';
 
 export enum SyncState { Idle, Pushing, Pulling, Resolving, Error }
@@ -142,10 +143,17 @@ export class SyncEngine {
   async runFullUpload(): Promise<void> {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
+    this.ensureReady();
     try {
-      await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      this.invalidateServerEncryptedCache();
+      const uploadCompatErr = await this.checkEncryptionCompatibility('forcePush');
+      if (uploadCompatErr) {
+        this.plugin.statusBar.setError(uploadCompatErr);
+        new Notice('Upload blocked: ' + uploadCompatErr, 10000);
+        return;
+      }
       await this.enableE2EE();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
@@ -233,9 +241,20 @@ export class SyncEngine {
   }
 
   private collectMarkdownFiles(): TFile[] {
-    const excludes = this.plugin.settings.excludePatterns;
     return this.plugin.app.vault.getMarkdownFiles()
-      .filter(f => !excludes.some(p => f.path.startsWith(p)));
+      .filter(f => !this.shouldExclude(f.path));
+  }
+
+  /** Unified exclusion rule — every sync path (push/pull/watcher/force)
+   *  must consult this. Excludes: explicit excludePatterns, the config dir,
+   *  Obsidian conflict files, and ANY path segment starting with `.`
+   *  (hidden files/folders, Unix convention). */
+  shouldExclude(path: string): boolean {
+    if (this.plugin.settings.excludePatterns.some(p => path.startsWith(p))) return true;
+    if (path.startsWith(this.configDir + '/') || path === this.configDir) return true;
+    if (path.startsWith('_conflicts/')) return true;
+    const segments = path.split('/').filter(s => s.length > 0);
+    return segments.some(seg => seg.startsWith('.'));
   }
 
   // ============ Phase 2: Watcher + Scheduler ============
@@ -267,14 +286,21 @@ export class SyncEngine {
 
   // ============ Phase 2: Sync Cycle ============
   async syncCycle(): Promise<void> {
-    if (this.state !== SyncState.Idle) { new Notice('Sync already in progress'); return; }
+    if (this.running || this.state !== SyncState.Idle) { new Notice('Sync already in progress'); return; }
+    this.running = true;
     this.ensureReady();
     try {
       this.state = SyncState.Pushing;
       this.plugin.statusBar.setSyncing('pushing...');
-      await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      const compatErr = await this.checkEncryptionCompatibility('cycle');
+      if (compatErr) {
+        this.state = SyncState.Error;
+        this.plugin.statusBar.setError(compatErr);
+        new Notice('Sync blocked: ' + compatErr, 10000);
+        return;
+      }
       await this.enableE2EE();
 
       if (!this.plugin.mapping.getDeltaCursor()) {
@@ -294,7 +320,8 @@ export class SyncEngine {
 
       this.state = SyncState.Resolving;
       for (const t of [...this.plugin.mapping.tombstones]) {
-        await this.plugin.api.deleteItem(t.joplinId + '.md');
+        try { await this.plugin.api.deleteItem(t.joplinId + '.md'); }
+        catch { /* already deleted on server — tombstone is just a local marker */ }
         this.plugin.mapping.clearTombstone(t.joplinId);
       }
 
@@ -317,6 +344,7 @@ export class SyncEngine {
     } finally {
       await this.plugin.mapping.flush();
       this.state = SyncState.Idle;
+      this.running = false;
     }
   }
 
@@ -346,7 +374,7 @@ export class SyncEngine {
    *  vault pushes is parented under it, so the delta-pull root filter
    *  (`belongsToRoot`) can reject items belonging to other vaults that share
    *  the same account/server — the root cause of cross-vault deletion. */
-  private async ensureRootFolder(): Promise<string> {
+  async ensureRootFolder(): Promise<string> {
     const existing = this.plugin.mapping.rootFolderId;
     if (existing) {
       try {
@@ -377,15 +405,38 @@ export class SyncEngine {
   async forcePush(): Promise<void> {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
+    this.ensureReady();
+    this.watcher?.suspend();
     try {
       this.plugin.statusBar.setSyncing('force push: rebuilding server...');
-      await this.plugin.api.login();
       await this.syncInfo.checkOrInit();
       this.e2eeActive = this.syncInfo.e2eeEnabled;
+      this.invalidateServerEncryptedCache();
+      const pushCompatErr = await this.checkEncryptionCompatibility('forcePush');
+      if (pushCompatErr) {
+        this.plugin.statusBar.setError(pushCompatErr);
+        new Notice('Force push blocked: ' + pushCompatErr, 10000);
+        return;
+      }
+      const migratingToE2EE =
+        (this.plugin.settings.e2eeEnabled && !!this.plugin.settings.e2eePassword) &&
+        !(await this.serverIsEncrypted());
+      if (migratingToE2EE) {
+        const ok = await this.confirmMigration();
+        if (!ok) {
+          this.plugin.statusBar.setIdle();
+          new Notice('Force push cancelled — server stays plaintext.');
+          return;
+        }
+      }
       await this.enableE2EE();
 
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
+      // Items this vault owns (mapping BEFORE clearAll). reset and cleanup
+      // only ever delete these — other vaults sharing the server are
+      // preserved (C1).
+      const ownedIds = new Set(this.plugin.mapping.all().map(e => e.joplinId));
 
       // ---- True-overwrite reset: delete EVERYTHING on the server first ----
       // (except info.json and master-key items, which are infra, not content).
@@ -410,6 +461,10 @@ export class SyncEngine {
             if (id === protectedRootId) { skipped++; continue; }
             const entry = this.plugin.mapping.getById(id);
             if (entry?.type === ModelType.MasterKey || masterKeyIds.has(id)) { skipped++; continue; }
+            if (!ownedIds.has(id)) { skipped++; continue; } // foreign vault item
+          } else {
+            const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
+            if (resMatch && !ownedIds.has(resMatch[1])) { skipped++; continue; } // foreign blob
           }
           try { await this.plugin.api.deleteItem(stat.name); wiped++; }
           catch (e: unknown) {
@@ -418,7 +473,7 @@ export class SyncEngine {
         }
         // Clear local mapping so re-upload creates fresh IDs for everything.
         this.plugin.mapping.clearAll();
-        console.debug('[joplin-sync] force push reset: wiped ' + wiped + ' items, kept ' + skipped + ' (info.json/master keys)');
+        console.debug('[joplin-sync] force push reset: wiped ' + wiped + ' items, kept ' + skipped + ' (info.json/master keys/foreign items)');
       }
 
       // IDs we actually push this run. Anything left on the server that is
@@ -427,6 +482,11 @@ export class SyncEngine {
       // accumulating duplicates every run and the pull target diverges).
       const pushedNoteIds = new Set<string>();
       const pushedFolderIds = new Set<string>();
+      // The vault root folder must NEVER be cleaned: it is not in the mapping
+      // after clearAll() and would otherwise be deleted as an orphan at the
+      // end of every force push (B5.2). It is only ever created once by
+      // ensureRootFolder and reused across pushes.
+      pushedFolderIds.add(rootFolderId);
 
       // Create sub-folders on server (if not already existing)
       const folderMap = new Map<string, string>();
@@ -469,8 +529,6 @@ export class SyncEngine {
       // hidden config.
       const adapter = this.plugin.app.vault.adapter;
       const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ files: string[]; folders: string[] }> };
-      const excludes = this.plugin.settings.excludePatterns;
-      const isExcludedDir = (rel: string) => excludes.some(e => (rel + '/').startsWith(e));
       const SYSTEM_TOP_DIRS = new Set(['home', 'Library', 'node_modules', 'tmp', 'private', 'Users']);
       if (adapter && typedAdapter.list) {
         const walkDirs = async (dir: string): Promise<void> => {
@@ -480,7 +538,7 @@ export class SyncEngine {
               const folderName = sub.split('/').pop() || '';
               if (folderName.startsWith('.')) continue;
               const rel = dir ? dir + '/' + folderName : folderName;
-              if (isExcludedDir(rel)) continue;
+              if (this.shouldExclude(rel + '/')) continue;
               if (!dir && SYSTEM_TOP_DIRS.has(folderName)) continue;
               if (rel && !folderMap.has(rel)) {
                 const existing = this.plugin.mapping.getByPath(rel + '/');
@@ -561,10 +619,8 @@ export class SyncEngine {
       const pushedResourceIds = new Set<string>();
       let rDone = 0, rFail = 0;
       if (!this.plugin.settings.syncFoldersOnly) {
-        const excludes = this.plugin.settings.excludePatterns;
-        const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/' + this.configDir + '/') || p.startsWith(this.configDir + '/');
         const allFiles = this.plugin.app.vault.getFiles();
-        const resourceFiles = allFiles.filter(f => f.extension !== 'md' && !isExcluded(f.path));
+        const resourceFiles = allFiles.filter(f => f.extension !== 'md' && !this.shouldExclude(f.path));
         if (resourceFiles.length > 0) {
           for (const batch of chunk(resourceFiles, 5)) {
             await Promise.all(batch.map(async (f) => {
@@ -598,16 +654,18 @@ export class SyncEngine {
           } else if (entry?.type === ModelType.Resource) {
             if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedResources++; } catch { /* ignore */ } }
           } else {
-            // Delete any item not in our pushed sets (notes, stale, or unknown)
+            // Delete stale/unknown items ONLY if we owned them before this
+            // push. Items from other vaults sharing the server must stay (C1).
             const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
-            if (!inPushed && !this.plugin.settings.syncFoldersOnly) {
+            if (!inPushed && !this.plugin.settings.syncFoldersOnly && ownedIds.has(id)) {
               try { await this.plugin.api.deleteItem(stat.name); removed++; removedNotes++; } catch { /* ignore */ }
             }
           }
         } else {
-          // resource blob: cleanup orphans so the server stays in sync
+          // resource blob: cleanup orphans so the server stays in sync —
+          // but only blobs we owned before this push (C1).
           const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
-          if (resMatch && !this.plugin.settings.syncFoldersOnly) {
+          if (resMatch && !this.plugin.settings.syncFoldersOnly && ownedIds.has(resMatch[1])) {
             const id = resMatch[1];
             if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; } catch { /* ignore */ } }
           }
@@ -630,6 +688,8 @@ export class SyncEngine {
         this.plugin.statusBar.setOk(Date.now(), done + rDone);
       }
     } finally {
+      this.watcher?.resume();
+      this.plugin.changeLog.clear(); // C3: watcher events from the rebuild must not replay
       this.running = false;
       await this.plugin.mapping.flush();
     }
@@ -639,31 +699,43 @@ export class SyncEngine {
   async forcePull(): Promise<void> {
     if (this.running) { new Notice('Sync already in progress'); return; }
     this.running = true;
+    this.ensureReady();
+    this.watcher?.suspend();
+    try {
+      await this.forcePullInner();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');
+      console.error('[joplin-sync] force pull failed:', msg);
+      this.plugin.statusBar.setError(msg);
+      new Notice('Force pull failed: ' + msg, 8000);
+    } finally {
+      this.watcher?.resume();
+      this.plugin.changeLog.clear(); // C3: watcher events from the rebuild must not replay
+      this.running = false;
+      await this.plugin.mapping.flush();
+    }
+  }
+
+  /** forcePull body WITHOUT the running guard, so InitialSync can call it
+   *  inside syncCycle (which already holds the lock) (C2). */
+  async forcePullInner(): Promise<void> {
     try {
       this.plugin.statusBar.setSyncing('force pull: clearing local...');
-      await this.plugin.api.login();
-      await this.enableE2EE();
-
-      // Guard: if E2EE is OFF locally but the server holds encrypted items,
-      // pulling would fail for every one of them. Surface this before wiping
-      // the local vault instead of failing silently per-item.
-      if (!this.e2eeActive) {
-        const encCount = await this.countServerEncrypted();
-        if (encCount > 0) {
-          this.running = false;
-          await this.plugin.mapping.flush();
-          const msg = 'Server has ' + encCount + ' E2EE-encrypted item(s) but E2EE is disabled. Enable E2EE + enter the password to pull, or Force Push to overwrite the server with plaintext.';
-          console.error('[joplin-sync] force pull blocked: ' + msg);
-          this.plugin.statusBar.setError(msg);
-          new Notice(msg, 10000);
-          return;
-        }
+      await this.syncInfo.checkOrInit();
+      this.e2eeActive = this.syncInfo.e2eeEnabled;
+      this.invalidateServerEncryptedCache();
+      const pullCompatErr = await this.checkEncryptionCompatibility('forcePull');
+      if (pullCompatErr) {
+        this.plugin.statusBar.setError(pullCompatErr);
+        new Notice('Force pull blocked: ' + pullCompatErr, 10000);
+        return;
       }
+      await this.enableE2EE();
+      this.plugin.mapping.clearAll();
 
-      // Delete ALL files and folders except config directory
+      // Delete ALL files and folders except config + excluded dirs
       const adapter = this.plugin.app.vault.adapter;
-      const kept = [this.configDir];
-      const isKept = (p: string) => kept.some(k => p === k || p.startsWith(k + '/'));
+      const isKept = (p: string) => this.shouldExclude(p);
       let delCount = 0, delDirCount = 0;
 
       // Delete all non-kept files
@@ -747,6 +819,8 @@ export class SyncEngine {
           const raw = await this.plugin.api.getItem(stat.name);
           if (!raw) continue;
           const item = this.serializer.unserialize(raw);
+          const allowedPullTypes = new Set([ModelType.Note, ModelType.Folder, ModelType.Resource, ModelType.MasterKey]);
+          if (!allowedPullTypes.has(item.type_)) continue;
           if (item.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(item); continue; }
 
           if (e2ee.isEncrypted(item)) {
@@ -763,13 +837,31 @@ export class SyncEngine {
         }
       }
 
-      // Pre-compute folder paths from all items
+      // Pre-compute folder paths from all items.
+      // A mirror vault (fresh mapping) must learn the sync root from the
+      // server: the top-level `_vault_<name>` folder is THE root — map it to
+      // the local vault root (''), so the pulled tree has no `_vault_`
+      // prefix and matches the owner vault's layout (B3).
       const folders = allItems.filter(i => i.type_ === ModelType.Folder);
+      const serverRoot = folders.find(f => !f.parent_id && (f.title || '').startsWith('_vault_'));
+      if (serverRoot && !this.plugin.mapping.rootFolderId) {
+        this.plugin.mapping.setRootFolderId(serverRoot.id);
+      }
       this.buildForcePullFolderPaths(folders);
 
       // Create folders first
+      const pullRootId = this.plugin.mapping.rootFolderId;
       for (const f of folders) {
         if (!f.title) { skipped++; continue; }
+        // The sync root folder is virtual — it maps to the local vault root,
+        // never a real _vault_<name>/ directory (B3).
+        if (f.id === pullRootId) {
+          this.plugin.mapping.upsert({
+            joplinId: f.id, path: '', type: ModelType.Folder,
+            localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
+          });
+          continue;
+        }
         try {
           const parentPath = this.resolveForcePullFolderPath(f.parent_id);
           const dirName = safeFileName(f.title);
@@ -788,12 +880,19 @@ export class SyncEngine {
 
       // Then download notes to correct folders
       const notes = allItems.filter(i => i.type_ === ModelType.Note);
+      const usedPaths = new Set<string>();
       for (const item of notes) {
         if (!item.title) { skipped++; continue; }
         try {
           const dir = this.resolveForcePullFolderPath(item.parent_id);
           const sanitized = safeFileName(item.title);
-          const path = dir + sanitized + '.md';
+          let path = dir + sanitized + '.md';
+          // Same directory, same sanitized title: a second note must NOT
+          // overwrite the first — dedupe with an id suffix (B9).
+          if (usedPaths.has(path)) {
+            path = dir + sanitized + ' (' + item.id.slice(0, 7) + ').md';
+          }
+          usedPaths.add(path);
 
           let body = item.body ?? '';
           if (e2ee.isEncrypted(item)) {
@@ -809,12 +908,13 @@ export class SyncEngine {
           }
 
           const existing = this.plugin.app.vault.getAbstractFileByPath(path);
+          const stamped = stampFrontmatter(body || '', item.id);
           if (existing instanceof TFile) {
-            await this.plugin.app.vault.modify(existing, body || '');
+            await this.plugin.app.vault.modify(existing, stamped);
           } else if (!existing) {
-            await this.plugin.app.vault.create(path, body || '');
+            await this.plugin.app.vault.create(path, stamped);
           }
-          const hash = await sha256(body);
+          const hash = await sha256(stamped);
           this.plugin.mapping.upsert({
             joplinId: item.id, path, type: ModelType.Note,
             localHash: hash, remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
@@ -823,7 +923,7 @@ export class SyncEngine {
         } catch (e: unknown) {
           failed++;
           const msg = e instanceof Error ? e.message : String(e);
-          if (msg.includes('401')) try { await this.plugin.api.login(); } catch { void 0; }
+          if (msg.includes('401')) try { await this.plugin.api.login(true); } catch { void 0; }
           if (failed <= 3) console.error('[joplin-sync] force-pull:', item.title, msg);
         }
         this.plugin.statusBar.setProgress(done, notes.length, 'pull');
@@ -832,6 +932,7 @@ export class SyncEngine {
       let cursor: string | undefined;
       while (true) {
         const page = await this.plugin.api.delta(cursor);
+        if (page.has_more && !page.cursor) break;
         cursor = page.cursor;
         if (!page.has_more) break;
       }
@@ -862,12 +963,10 @@ export class SyncEngine {
       this.plugin.logSync('pull', totalSynced, totalFail);
 
       // Remove stale local non-md files (cleanup from previous syncs)
-      const excludes = this.plugin.settings.excludePatterns;
-      const isExcluded = (p: string) => excludes.some(e => p.startsWith(e)) || p.includes('/' + this.configDir + '/') || p.startsWith(this.configDir + '/');
       let localRemoved = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
         if (f.extension === 'md') continue;
-        if (isExcluded(f.path)) continue;
+        if (this.shouldExclude(f.path)) continue;
         if (downloadedPaths.has(f.path)) continue;
         try { await this.plugin.app.fileManager.trashFile(f); localRemoved++; } catch { /* ignore */ }
       }
@@ -879,7 +978,6 @@ export class SyncEngine {
       this.plugin.statusBar.setError(msg);
       new Notice('Force pull failed: ' + msg, 8000);
     } finally {
-      this.running = false;
       await this.plugin.mapping.flush();
     }
   }
@@ -913,18 +1011,25 @@ export class SyncEngine {
     this.forcePullFolderPaths.clear();
     const sanitize = (t: string) => safeFileName(t);
     const paths = new Map<string, string>();
+    const rootId = this.plugin.mapping.rootFolderId;
+    // The sync root folder maps to the local vault root (''), not to a
+    // real _vault_<name>/ directory (B3).
+    if (rootId) paths.set(rootId, '');
     let remaining = [...folders];
     while (remaining.length > 0) {
       const next: JoplinItem[] = [];
       for (const f of remaining) {
         let parentPath: string | undefined;
         if (f.parent_id) {
-          parentPath = paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id);
-          if (parentPath === undefined) {
-            // Parent not yet resolved — check mapping or defer
-            const m = this.plugin.mapping.getById(f.parent_id);
-            if (m) { paths.set(f.id, m.path); continue; }
-            next.push(f); continue;
+          if (f.parent_id === rootId) {
+            parentPath = '';
+          } else {
+            parentPath = paths.get(f.parent_id) ?? this.forcePullFolderPaths.get(f.parent_id);
+            if (parentPath === undefined) {
+              const m = this.plugin.mapping.getById(f.parent_id);
+              if (m) { paths.set(f.id, m.path); continue; }
+              next.push(f); continue;
+            }
           }
         } else {
           parentPath = '';
@@ -939,6 +1044,9 @@ export class SyncEngine {
 
   private resolveForcePullFolderPath(parentId: string): string {
     if (!parentId) return '';
+    // The vault's own root folder maps to the local vault root (''), so the
+    // owner vault never nests its own files under _vault_<name>/ (B3).
+    if (parentId === this.plugin.mapping.rootFolderId) return '';
     const cached = this.forcePullFolderPaths.get(parentId);
     if (cached !== undefined) return cached;
     const m = this.plugin.mapping.getById(parentId);
@@ -974,18 +1082,89 @@ export class SyncEngine {
     return out;
   }
 
-  /** Count server items that carry E2EE ciphertext (encryption_applied=1). */
-  private async countServerEncrypted(): Promise<number> {
+  private serverEncryptedCache: boolean | null = null;
+
+  /** Actual server E2EE state from item bodies — master key present or any
+   *  item carries encryption_applied: 1. Does NOT trust the info.json flag
+   *  (it can be stale: left `e2ee:true` from an earlier aborted migration
+   *  while the server holds no master key and only plaintext items).
+   *  Result is cached per session (C6): a full GET scan on every cycle is
+   *  O(n) requests. */
+  private async serverIsEncrypted(): Promise<boolean> {
+    if (this.serverEncryptedCache !== null) return this.serverEncryptedCache;
+    // Fast path: local E2EE fully off → the compatibility rule is trivially
+    // satisfied unless the server has ciphertext, which only matters when we
+    // are about to write plaintext. Cycle syncs are read-mostly; only force
+    // operations need the real answer. (C6)
+    const localEncrypted = this.plugin.settings.e2eeEnabled && !!this.plugin.settings.e2eePassword;
+    if (!localEncrypted) {
+      this.serverEncryptedCache = false;
+      return false;
+    }
     const remote = await this.listAllRemoteItems();
-    let count = 0;
     for (const stat of remote) {
-      if (!/^[0-9a-f]{32}\.md$/.test(stat.name) || stat.name.startsWith('.resource/')) continue;
+      if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
       try {
         const raw = await this.plugin.api.getItem(stat.name);
-        if (raw && raw.includes('encryption_applied: 1')) count++;
+        if (!raw) continue;
+        const item = this.serializer.unserialize(raw);
+        if (item.type_ === ModelType.MasterKey || item.encryption_applied === 1) {
+          this.serverEncryptedCache = true;
+          return true;
+        }
       } catch { /* skip unreadable */ }
     }
-    return count;
+    this.serverEncryptedCache = false;
+    return false;
+  }
+
+  /** Invalidate the cached server E2EE state (settings changed / force op). */
+  private invalidateServerEncryptedCache(): void {
+    this.serverEncryptedCache = null;
+  }
+
+  /**
+   * E2EE compatibility rule: an encrypted vault may only sync with an
+   * encrypted target, a plaintext vault only with a plaintext target.
+   * Mixing them corrupts or silently loses data. Returns null when states
+   * match (or the mismatch is allowed for the action), else an error
+   * message the caller should surface and abort with.
+   */
+  private async checkEncryptionCompatibility(action: 'cycle' | 'forcePush' | 'forcePull'): Promise<string | null> {
+    const localEncrypted = this.plugin.settings.e2eeEnabled && !!this.plugin.settings.e2eePassword;
+    const serverEncrypted = await this.serverIsEncrypted();
+
+    if (localEncrypted === serverEncrypted) return null;
+
+    if (localEncrypted && !serverEncrypted) {
+      if (action === 'forcePush') return null;
+      return 'Local vault has E2EE enabled but the server is a plaintext target. ' +
+        'Encrypted and unencrypted vaults cannot sync. Run Force Push to migrate the server to E2EE first.';
+    }
+
+    if (action === 'forcePush') {
+      return 'Server is E2EE-encrypted but this vault is not. Force Push would overwrite encrypted data with plaintext — aborted. ' +
+        'Enable E2EE + enter the password on this vault first.';
+    }
+    return 'Server is E2EE-encrypted but this vault is not. Encrypted and unencrypted vaults cannot sync. ' +
+      'Enable E2EE + enter the password, then sync.';
+  }
+
+  private confirmMigration(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const modal = new Modal(this.plugin.app);
+      modal.titleEl.setText('Migrate to E2EE');
+      modal.contentEl.createEl('p', {
+        text: 'This vault has E2EE enabled but the server is plaintext. Force Push will re-upload EVERYTHING as encrypted data and mark the server as E2EE — other plaintext clients will no longer be able to sync. Continue?',
+      });
+      const btns = modal.contentEl.createDiv();
+      const okBtn = btns.createEl('button', { text: 'Migrate (encrypt server)' });
+      okBtn.addClass('mod-cta');
+      okBtn.onclick = () => { modal.close(); resolve(true); };
+      const cancelBtn = btns.createEl('button', { text: 'Cancel' });
+      cancelBtn.onclick = () => { modal.close(); resolve(false); };
+      modal.open();
+    });
   }
 }
 

@@ -13,6 +13,21 @@ import { createJoplinId } from '../mapping/IdGenerator';
  */
 export const FILE_ID_FIELD = 'joplin-file-id';
 
+/** Inject (or replace) the file id in YAML frontmatter. Pure — no disk I/O. */
+export function stampFrontmatter(body: string, fileId: string): string {
+  const line = FILE_ID_FIELD + ': ' + fileId;
+  if (body.startsWith('---')) {
+    const end = body.indexOf('\n---', 4);
+    if (end >= 0) {
+      const fm = body.slice(0, end + 1);
+      const rest = body.slice(end + 1);
+      const re = /^joplin-file-id:.*$/m;
+      return re.test(fm) ? fm.replace(re, line) + rest : fm + '\n' + line + rest;
+    }
+  }
+  return '---\n' + line + '\n---\n' + body;
+}
+
 export class FileIdentity {
   constructor(private plugin: JoplinSyncPlugin) {}
 

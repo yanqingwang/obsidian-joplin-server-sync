@@ -1,5 +1,5 @@
 import type JoplinSyncPlugin from '../main';
-import { TFile, TAbstractFile } from 'obsidian';
+import { TFile, TAbstractFile, Notice } from 'obsidian';
 import { VaultWatcher } from '../vault/VaultWatcher';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { ConflictResolver } from './ConflictResolver';
@@ -7,6 +7,7 @@ import { DeltaChangeType, DeltaItem, ModelType, JoplinItem } from '../api/models
 import { sha256 } from './SyncEngine';
 import { ResourceManager } from '../resource/ResourceManager';
 import { safeFileName } from './pathUtil';
+import { stampFrontmatter } from './FileIdentity';
 
 export class DeltaPuller {
   private serializer = new JoplinSerializer();
@@ -21,38 +22,82 @@ export class DeltaPuller {
     this.resources = new ResourceManager(plugin);
   }
 
+  private parentIdMap = new Map<string, string>();
+
+  /** Seed the parent chain from the current delta batch so belongsToRoot can
+   *  walk it without relying on mapping (mapping has no parentId field). */
+  private buildParentMap(items: JoplinItem[]): void {
+    this.parentIdMap.clear();
+    this.rootAncestorCache.clear();
+    for (const it of items) if (it.parent_id) this.parentIdMap.set(it.id, it.parent_id);
+  }
+
   private belongsToRoot(item: JoplinItem): boolean {
     if (this.acceptAll) return true;
     const rootId = this.plugin.mapping.rootFolderId;
-    if (!rootId) return true; // no root folder → accept everything (legacy data)
+    if (!rootId) return true;
 
-    // Walk the parent chain to the root. The root folder of THIS vault is the
-    // only ancestor that makes an item ours; anything under another vault's
-    // root (or at the account root) is foreign and must not be pulled.
+    if (item.type_ === ModelType.Resource || item.type_ === ModelType.MasterKey) return true;
+
     let pid = item.parent_id;
+    if (!pid) return false;
     const visited = new Set<string>();
     let depth = 0;
     while (pid && !visited.has(pid) && depth < 64) {
       visited.add(pid);
-      if (pid === rootId) return true;
-      const parentMapping = this.plugin.mapping.getById(pid);
-      if (!parentMapping) return false; // parent unknown = foreign item
-      if (parentMapping.type !== ModelType.Folder) return false;
-      pid = parentMapping.joplinId;
+      if (pid === rootId) {
+        // Cache the whole chain as ours.
+        for (const v of visited) this.rootAncestorCache.set(v, true);
+        return true;
+      }
+      const cached = this.rootAncestorCache.get(pid);
+      if (cached !== undefined) {
+        for (const v of visited) this.rootAncestorCache.set(v, cached);
+        return cached;
+      }
+      // Prefer the batch's own parent graph; fall back to the local mapping
+      // for folders synced in earlier rounds — the delta may contain only a
+      // deep note, not its ancestors (C4).
+      const next = this.parentIdMap.get(pid) ?? this.plugin.mapping.getById(pid)?.joplinId;
+      if (next === undefined || next === pid) {
+        for (const v of visited) this.rootAncestorCache.set(v, false);
+        return false;
+      }
+      pid = next;
       depth++;
     }
     return false;
   }
 
   async pullAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
-    let cursor = this.plugin.mapping.getDeltaCursor();
-    const allItems: JoplinItem[] = [];
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
+    const allItems: JoplinItem[] = [];
     const deletes: string[] = [];
+    let cursor = this.plugin.mapping.getDeltaCursor();
 
-    // First pass: collect all items from delta stream
+    // First pass: collect all items from delta stream.
+    // A 400-class failure while paging with a saved cursor means the server
+    // dropped the change history (cursor invalidated). Recover by clearing the
+    // cursor and forcing a full reconciliation instead of erroring forever (B26).
     while (true) {
-      const page = await this.plugin.api.delta(cursor || undefined);
+      let page;
+      try {
+        page = await this.plugin.api.delta(cursor || undefined);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (cursor && /400|invalid.*cursor|cursor.*invalid|resync/i.test(msg)) {
+          console.warn('[joplin-sync] delta cursor invalidated — clearing cursor for full resync: ' + msg);
+          this.plugin.mapping.setDeltaCursor('');
+          cursor = '';
+          continue;
+        }
+        throw e;
+      }
+      if (page.has_more && !page.cursor) {
+        console.error('[joplin-sync] delta returned has_more without cursor — aborting pull to avoid a loop.');
+        stats.fail++;
+        break;
+      }
       for (const d of page.items) {
         try {
           if (d.type === DeltaChangeType.Delete) {
@@ -62,9 +107,17 @@ export class DeltaPuller {
           }
           const items = await this.collectChange(d);
           allItems.push(...items);
-        } catch (e) {
+        } catch (e: unknown) {
+          const isAbort = (e as Error & { __decryptAbort?: boolean })?.__decryptAbort === true;
           stats.fail++;
           console.error('[joplin-sync] collect delta failed', d.name, e);
+          if (isAbort) {
+            // C11: do not advance the cursor past an undecryptable item —
+            // keep the pre-batch cursor so the change replays next run.
+            console.error('[joplin-sync] aborting pull before cursor advance (decrypt failure)');
+            this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
+            return stats;
+          }
         }
       }
       if (page.cursor) cursor = page.cursor;
@@ -74,20 +127,28 @@ export class DeltaPuller {
     // Apply deletes (folders first so children are removed after their parents).
     // Guard: a delta page that reports more deletes than half the local mapping
     // is almost certainly a stale cursor or foreign-vault replay, not a real
-    // mass deletion. Refuse to act on it — individual deletes are still
-    // server-verified in applyDelete, but skipping the batch avoids hundreds
-    // of GET round-trips on a replay storm.
+    // mass deletion. Refuse to act on it — and keep the OLD cursor so the
+    // deletes replay next run instead of being permanently lost (B10).
     const totalMapped = this.plugin.mapping.all().length;
     if (totalMapped > 20 && deletes.length > totalMapped / 2) {
       console.error('[joplin-sync] refusing ' + deletes.length + ' delta deletes over ' + totalMapped
-        + ' mapped items — possible stale cursor or foreign vault. Skipping this batch.');
+        + ' mapped items — possible stale cursor or foreign vault. Skipping this batch (cursor NOT advanced).');
       stats.fail += deletes.length;
-      deletes.length = 0;
+      this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
+      // C5: give the user an exit — otherwise every cycle replays the same
+      // refused batch forever with only a console line.
+      new Notice('Sync blocked: ' + deletes.length + ' deletes detected (over half the vault). '
+        + 'This usually means the server was force-pushed from another vault. '
+        + 'Run "Force pull" to rebuild from the server, or "Force push" to overwrite it.', 15000);
+      return stats;
     }
     for (const id of deletes) {
       try { if (await this.applyDelete(id)) stats.deleted++; }
       catch (e) { stats.fail++; console.error('[joplin-sync] delta delete failed', id, e); }
     }
+
+    // Seed the parent chain for belongsToRoot before applying items.
+    this.buildParentMap(allItems);
 
     // Second pass: build folder path cache, then process folders then notes
     const folders = allItems.filter(i => i.type_ === ModelType.Folder);
@@ -133,6 +194,11 @@ export class DeltaPuller {
 
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
+    // Whitelist the item types this plugin understands. A shared server may
+    // carry Revision/Tag/NoteTag items from other clients — they must be
+    // skipped, never treated as notes (B28).
+    const allowed = new Set([ModelType.Note, ModelType.Folder, ModelType.Resource, ModelType.MasterKey]);
+    if (!allowed.has(probe.type_)) return [];
     if (probe.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(probe); return []; }
 
     const item = this.serializer.unserialize(raw);
@@ -150,7 +216,11 @@ export class DeltaPuller {
         }
       } catch (e: unknown) {
         console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + (e instanceof Error ? e.message : String(e)));
-        return [];
+        // C11: a decrypt failure must NOT let the cursor pass this item, or
+        // the change is lost forever. Signal abort via a tagged error.
+        const err = new Error('E2EE decrypt failed: ' + d.name) as Error & { __decryptAbort?: boolean };
+        err.__decryptAbort = true;
+        throw err;
       }
     }
 
@@ -192,22 +262,7 @@ export class DeltaPuller {
   /** Write a note, stamping the server item id as frontmatter fileId so other
    *  terminals reading this file converge on the same identity. */
   private async writeNoteWithId(path: string, body: string, fileId: string): Promise<void> {
-    const stamped = this.stampFrontmatter(body, fileId);
-    await this.writeFile(path, stamped);
-  }
-
-  private stampFrontmatter(body: string, fileId: string): string {
-    const line = 'joplin-file-id: ' + fileId;
-    if (body.startsWith('---')) {
-      const end = body.indexOf('\n---', 4);
-      if (end >= 0) {
-        const fm = body.slice(0, end + 1);
-        const rest = body.slice(end + 1);
-        const re = /^joplin-file-id:.*$/m;
-        return re.test(fm) ? fm.replace(re, line) + rest : fm + '\n' + line + rest;
-      }
-    }
-    return '---\n' + line + '\n---\n' + body;
+    await this.writeFile(path, stampFrontmatter(body, fileId));
   }
 
   private async applyFolder(item: JoplinItem): Promise<boolean> {
@@ -299,7 +354,7 @@ export class DeltaPuller {
   private async saveMapping(item: JoplinItem, path: string): Promise<void> {
     this.plugin.mapping.upsert({
       joplinId: item.id, path, type: ModelType.Note,
-      localHash: await sha256(item.body ?? ''),
+      localHash: await sha256(stampFrontmatter(item.body ?? '', item.id)),
       remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
     });
   }
@@ -355,7 +410,9 @@ export class DeltaPuller {
     let p = dir + name + '.md';
     const existing = this.plugin.app.vault.getAbstractFileByPath(p);
     const mapped = this.plugin.mapping.getByPath(p);
-    if (existing && mapped && mapped.joplinId !== id) {
+    // Dedupe when the path is taken by a file that is NOT this note —
+    // whether mapped to another id or a user-created unmapped file (C10).
+    if (existing && (!mapped || mapped.joplinId !== id)) {
       p = dir + name + ' (' + id.slice(0, 7) + ').md';
     }
     return p;

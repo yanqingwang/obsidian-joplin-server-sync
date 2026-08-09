@@ -57,7 +57,7 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
         .onClick(async () => {
           b.setDisabled(true).setButtonText('Testing\u2026');
           try {
-            await this.plugin.api.login();
+            await this.plugin.api.login(true);
             new Notice('\u2705 Connection OK');
           } catch (e: unknown) {
             new Notice('\u274c Connection failed: ' + (e instanceof Error ? e.message : String(e)), 8000);

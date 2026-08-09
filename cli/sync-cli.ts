@@ -48,7 +48,7 @@ function makePlugin(vaultRoot: string, creds: any) {
     app: { vault, fileManager: new MockFileManager(vault) },
     api,
     settings: { ...DEFAULT_SETTINGS, attachmentFolder: creds.attachmentFolder, excludePatterns: creds.excludePatterns, e2eeEnabled: creds.e2eeEnabled === true, e2eePassword: creds.e2eePassword || '' },
-    manifest: { dir: path.join(vaultRoot, '.obsidian/plugins/joplin-server-sync') },
+    manifest: { dir: '.obsidian/plugins/joplin-server-sync' },
     statusBar: {
       setSyncing(m: string) { console.log('  [status]', m); },
       setProgress() {}, setIdle() {}, setOk() {}, setError(e: string) { console.log('  [ERROR]', e); },

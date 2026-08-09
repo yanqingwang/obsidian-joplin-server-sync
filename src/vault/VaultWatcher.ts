@@ -9,9 +9,16 @@ import { ModelType } from '../api/models';
  * stable fileId so multi-terminal sync can converge on the same server item.
  */
 export class VaultWatcher {
-  private suppressed = new Set<string>();
+  private suppressed = new Map<string, number>(); // path → outstanding tokens
+  private suppressTimers = new Map<string, number>();
+  private suspended = false;
 
   constructor(private plugin: JoplinSyncPlugin, private changeLog: ChangeLogStore) {}
+
+  /** Ignore ALL vault events while suspended (force operations rebuild the
+   *  vault and would otherwise flood the changelog) (C3). */
+  suspend(): void { this.suspended = true; }
+  resume(): void { this.suspended = false; this.suppressed.clear(); }
 
   start(): void {
     const v = this.plugin.app.vault;
@@ -21,18 +28,44 @@ export class VaultWatcher {
     this.plugin.registerEvent(v.on('rename', (f, oldPath) => this.onRename(f, oldPath)));
   }
 
-  suppress(path: string): void { this.suppressed.add(path); }
-  release(path: string): void { window.setTimeout(() => this.suppressed.delete(path), 2000); }
+  /** Suppress ONE matching event for this path. The first matching event
+   *  consumes the token; a 5s fallback clears it if nothing arrives (B30). */
+  suppress(path: string): void {
+    this.suppressed.set(path, (this.suppressed.get(path) ?? 0) + 1);
+    if (!this.suppressTimers.has(path)) {
+      const timer = window.setTimeout(() => {
+        this.suppressed.delete(path);
+        this.suppressTimers.delete(path);
+      }, 5000);
+      this.suppressTimers.set(path, timer);
+    }
+  }
+  release(path: string): void { /* token consumed on first matching event */ }
+
+  private consume(path: string): boolean {
+    const n = this.suppressed.get(path);
+    if (n === undefined || n <= 0) return false;
+    if (n === 1) {
+      this.suppressed.delete(path);
+      const t = this.suppressTimers.get(path);
+      if (t) { window.clearTimeout(t); this.suppressTimers.delete(path); }
+    } else {
+      this.suppressed.set(path, n - 1);
+    }
+    return true;
+  }
 
   private onEvent(kind: 'create' | 'modify' | 'delete', f: TAbstractFile): void {
-    if (this.suppressed.has(f.path)) return;
+    if (this.suspended) return;
+    if (this.consume(f.path)) return;
     if (!this.shouldTrack(f)) return;
     void this.record(kind, f.path, undefined, f instanceof TFolder, f instanceof TFile ? f : undefined);
   }
 
   private onRename(f: TAbstractFile, oldPath: string): void {
-    if (this.suppressed.has(f.path)) return;
-    if (!this.suppressed.has(oldPath)) {
+    if (this.suspended) return;
+    if (this.consume(f.path)) return;
+    if (!this.consume(oldPath)) {
       if (!this.shouldTrack(f)) return;
       void this.record('rename', f.path, oldPath, f instanceof TFolder, f instanceof TFile ? f : undefined);
     }
@@ -52,7 +85,15 @@ export class VaultWatcher {
       return;
     }
     if (!file) return;
-    // Files: stable fileId from frontmatter (mints one on first touch).
+    // Binary files: resource identity comes from mapping/path, NEVER from
+    // frontmatter — writing a YAML header into a png/pdf would corrupt it (B22).
+    if (file.extension !== 'md') {
+      const mapped = this.plugin.mapping.getByPath(file.path);
+      const fileId = mapped?.joplinId ?? 'file:' + file.path;
+      this.changeLog.push({ fileId, op: kind === 'modify' ? 'update' : kind, path, oldPath, type: ModelType.Resource, hash: undefined });
+      return;
+    }
+    // Markdown: stable fileId from frontmatter (mints one on first touch).
     const fileId = await this.plugin.identity.ensureId(file);
     const op: ChangeOp = kind === 'modify' ? 'update' : kind;
     let hash: string | undefined;
@@ -63,10 +104,7 @@ export class VaultWatcher {
   }
 
   private shouldTrack(f: TAbstractFile): boolean {
-    const s = this.plugin.settings;
     if (f.path.startsWith(this.plugin.app.vault.configDir + '/')) return false;
-    if (f.path.startsWith('_conflicts/')) return false;
-    if (s.excludePatterns.some(p => f.path.startsWith(p))) return false;
-    return true;
+    return !this.plugin.engine.shouldExclude(f.path);
   }
 }

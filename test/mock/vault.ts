@@ -11,6 +11,9 @@ export class MockVault {
   }
 
   configDir = '.obsidian';
+  getName(): string {
+    return path.basename(this.root);
+  }
   on(_event: string, _cb: (...args: any[]) => any): { unload: () => void } {
     return { unload: () => {} };
   }

@@ -20,6 +20,20 @@ export class TFile { path: string; name: string; basename: string; extension: st
 export class TFolder { path: string; constructor(p:string){this.path=p;} }
 export class TAbstractFile { path: string; constructor(p:string){this.path=p;} }
 export class Notice { constructor(_m:string){} }
+export class Modal {
+  app: any; titleEl: HTMLElement; contentEl: HTMLElement;
+  constructor(app: any) {
+    this.app = app; this.titleEl = { setText(_t:string){} } as any;
+    const makeEl = (): any => ({
+      setText(_x:string){}, addClass(_c:string){}, onclick: undefined as any,
+      createEl(_t:string, _o?:any){ return makeEl(); },
+      createDiv(){ return makeEl(); },
+    });
+    this.contentEl = makeEl();
+  }
+  open() {}
+  close() {}
+}
 export function normalizePath(p:string){ return p; }
 
 (globalThis as any).window = (globalThis as any).window || globalThis;

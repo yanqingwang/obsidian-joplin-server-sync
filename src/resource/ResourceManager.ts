@@ -32,9 +32,10 @@ export class ResourceManager {
     const hash = await sha256(data);
     const existing = this.plugin.mapping.getByPath(file.path);
     if (!force && existing && existing.localHash === hash) return existing.joplinId;
-    // Every resource gets a unique ID — blob and metadata share the same ID.
-    // This keeps downloadResource (which fetches .resource/<meta.id>) in sync.
-    const metaId = force ? createJoplinId() : (existing?.joplinId ?? createJoplinId());
+    // Always reuse the mapped id — force only affects the hash-skip above.
+    // Minting a fresh id on every force push orphaned old blobs and broke
+    // `:/<id>` links in already-pushed note bodies (B20).
+    const metaId = existing?.joplinId ?? createJoplinId();
 
     const maxSize = (this.plugin.settings.maxAttachmentMB ?? 100) * 1024 * 1024;
     if (data.byteLength > maxSize) throw new Error('Attachment too large: ' + file.path);
@@ -64,6 +65,9 @@ export class ResourceManager {
     // E2EE: encrypt the blob AND the metadata item if a master key is loaded.
     const e2ee = this.plugin.e2ee;
     const mkId = e2ee.activeKeyId ?? e2ee.firstLoadedKeyId;
+    if (this.plugin.engine.e2eeActive && !mkId) {
+      throw new Error('E2EE is enabled but no master key is loaded. Enter the E2EE password in settings first.');
+    }
     const encrypt = this.plugin.engine.e2eeActive && !!mkId;
     if (encrypt) {
       const blobCipher = await e2ee.encryptBlobData(data, mkId);
@@ -101,17 +105,22 @@ export class ResourceManager {
       if (mapped) continue;
       const fid = createJoplinId();
       const now = Date.now();
+      const rootId = this.plugin.mapping.rootFolderId;
       const item: JoplinItem = {
         id: fid, parent_id: '', title: parts[i],
         created_time: now, updated_time: now,
         user_created_time: now, user_updated_time: now,
         type_: ModelType.Folder, encryption_applied: 0, encryption_cipher_text: '',
       };
-      // Set parent_id from previously created parent
+      // Set parent_id from previously created parent; top-level folders hang
+      // off the vault root folder (not parent_id='') so belongsToRoot accepts
+      // their contents on other terminals (B23).
       const parentPath = i > 0 ? parts.slice(0, i).join('/') : '';
       if (parentPath) {
         const parent = this.plugin.mapping.getByPath(parentPath + '/');
         if (parent) item.parent_id = parent.joplinId;
+      } else if (rootId) {
+        item.parent_id = rootId;
       }
       const res = await this.plugin.api.putItem(fid + '.md', this.serializer.serialize(item), true);
       this.plugin.mapping.upsert({
@@ -123,27 +132,26 @@ export class ResourceManager {
   }
 
   async downloadResource(meta: JoplinItem): Promise<string> {
+    // Decrypt the meta FIRST: under E2EE the passed-in meta is an encrypted
+    // stub whose blob_updated_time is absent (0), so a skip check before
+    // decryption would permanently skip every attachment update (B19).
+    const e2ee = this.plugin.e2ee;
+    let metaToUse = meta;
+    if (e2ee.isEncrypted(meta)) {
+      const ds = await e2ee.decryptItem(meta);
+      if (ds) metaToUse = this.serializer.unserialize(ds);
+    }
+
     const existing = this.plugin.mapping.getById(meta.id);
-    const correctPath = meta.filename ? normalizePath(meta.filename) : '';
+    const correctPath = metaToUse.filename ? normalizePath(metaToUse.filename) : '';
     // Skip only if mapped AND file exists on disk AT THE CORRECT PATH
-    if (existing && (meta.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
+    if (existing && (metaToUse.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
       if (correctPath && existing.path !== correctPath) {
         // Path changed (e.g. old version used attachments/) — re-download to correct path
         this.plugin.mapping.remove(existing.joplinId);
       } else if (this.plugin.app.vault.getAbstractFileByPath(existing.path)) {
         return existing.path;
       }
-    }
-    const e2ee = this.plugin.e2ee;
-    // The blob's own header decides encryption — the meta passed in may
-    // already be decrypted by the caller (forcePull decrypts collected items),
-    // so meta.encryption_applied is not a reliable signal. JED01 is the fixed
-    // prefix of every E2EE cipher text, so sniff the blob bytes directly.
-    const resourceIsEncrypted = e2ee.isEncrypted(meta);
-    let metaToUse = meta;
-    if (resourceIsEncrypted) {
-      const ds = await e2ee.decryptItem(meta);
-      if (ds) metaToUse = this.serializer.unserialize(ds);
     }
 
     const blob = await this.plugin.api.getItemBinary('.resource/' + meta.id);
@@ -161,14 +169,14 @@ export class ResourceManager {
     const dir = this.plugin.settings.attachmentFolder || 'attachments';
     const relName = metaToUse.filename ? metaToUse.filename : (dir + '/' + meta.id + '.' + (metaToUse.file_extension || 'bin'));
     let path = normalizePath(relName);
+    // Conflict rule mirrors notes: any file already at this path that is NOT
+    // this resource gets a suffix — check the DISK, not just the mapping, so
+    // an unmapped same-name file is never silently overwritten (B18).
+    const occupant = this.plugin.app.vault.getAbstractFileByPath(path);
     const clash = this.plugin.mapping.getByPath(path);
-    if (clash && clash.joplinId !== meta.id) {
-      // If the old file doesn't exist on disk, overwrite the mapping entry
-      if (!this.plugin.app.vault.getAbstractFileByPath(path)) {
-        this.plugin.mapping.remove(clash.joplinId);
-      } else {
-        path = normalizePath(dir + '/' + meta.id.slice(0, 7) + '_' + (metaToUse.filename || (meta.id + '.' + (metaToUse.file_extension || 'bin'))));
-      }
+    if (occupant && !(clash && clash.joplinId === meta.id)) {
+      const base = (metaToUse.filename ? metaToUse.filename.split('/').pop() : '') || (meta.id + '.' + (metaToUse.file_extension || 'bin'));
+      path = normalizePath(dir + '/' + meta.id.slice(0, 7) + '_' + base);
     }
 
     const watcher = (this.plugin.engine as unknown as { watcher?: { suppress: (path: string) => void; release: (path: string) => void } })?.watcher;

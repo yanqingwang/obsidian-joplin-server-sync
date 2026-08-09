@@ -42,8 +42,7 @@ export class ChangeLogStore {
 
   /** Append or merge a change for a fileId (coalesce rapid successive ops). */
   push(entry: Omit<ChangeLogEntry, 'timestamp' | 'status'>): void {
-    const now = Date.now();
-    const existingIdx = this.data.entries.findIndex(e => e.fileId === entry.fileId && e.status === 'pending');
+    const now = Date.now();    const existingIdx = this.data.entries.findIndex(e => e.fileId === entry.fileId && e.status === 'pending');
     if (existingIdx >= 0) {
       const prev = this.data.entries[existingIdx];
       // create + delete = no-op (file created then removed before sync)
@@ -71,7 +70,14 @@ export class ChangeLogStore {
 
   markSynced(fileId: string): void {
     const e = this.data.entries.find(x => x.fileId === fileId && x.status === 'pending');
-    if (e) { e.status = 'synced'; this.dirty = true; void this.persist(); }
+    if (e) { e.status = 'synced'; this.dirty = true; }
+  }
+
+  /** Drop every pending entry. Used after a force operation rebuilt the
+   *  vault — the deluge of watcher events it generated must not replay (C3). */
+  clear(): void {
+    this.data.entries = [];
+    this.dirty = true;
   }
 
   /** Remove synced entries older than the retention window. */

@@ -34,8 +34,23 @@ export class MappingStore {
   async load(): Promise<void> {
     const adapter = this.plugin.app.vault.adapter;
     if (adapter.exists) {
-      if (await adapter.exists(this.filePath)) {
-        this.data = JSON.parse(await adapter.read(this.filePath)) as MappingData;
+      try {
+        // A crash between remove() and rename() in flush() leaves only the
+        // .tmp — recover from it instead of starting empty (C14).
+        const tmpPath = this.filePath + '.tmp';
+        if (await adapter.exists(tmpPath)) {
+          this.data = JSON.parse(await adapter.read(tmpPath)) as MappingData;
+          await adapter.remove(this.filePath).catch(() => {});
+          await adapter.rename(tmpPath, this.filePath);
+        } else if (await adapter.exists(this.filePath)) {
+          this.data = JSON.parse(await adapter.read(this.filePath)) as MappingData;
+        }
+      } catch (e: unknown) {
+        // Corrupt mapping.json — back it up and start empty; forcePull can
+        // rebuild everything (C14).
+        console.error('[joplin-sync] mapping.json corrupt, rebuilding from empty:', e);
+        try { await adapter.rename(this.filePath, this.filePath + '.corrupt'); } catch { /* ignore */ }
+        this.data = { version: 1, deltaCursor: '', rootFolderId: '', entries: [], tombstones: [] };
       }
     }
     this.rebuildIndexes();

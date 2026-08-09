@@ -15,6 +15,10 @@ import { ResourceManager } from '../resource/ResourceManager';
 
 export enum SyncState { Idle, Pushing, Pulling, Resolving, Error }
 
+/** Normalize a path returned by adapter.list(): strip `./` prefixes and
+ *  trailing slashes (real Obsidian may return either form). */
+const normDir = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '');
+
 export class SyncEngine {
   private serializer = new JoplinSerializer();
   private syncInfo: SyncInfoHandler;
@@ -525,27 +529,36 @@ export class SyncEngine {
       // Also discover empty directories. Materialize EVERY non-hidden,
       // non-excluded directory (including genuinely empty user folders like
       // AIReports/Charts), but skip known Obsidian/system trees. Uses the
-      // vault API (getAllLoadedFiles) — adapter.list('') paths are unreliable
-      // across environments (B15).
+      // FILESYSTEM adapter — disk is authoritative; the Obsidian vault model
+      // (getAllLoadedFiles) can lag or omit dirs (B15).
       const SYSTEM_TOP_DIRS = new Set(['home', 'Library', 'node_modules', 'tmp', 'private', 'Users']);
-      for (const f of this.plugin.app.vault.getAllLoadedFiles()) {
-        if (!(f instanceof TFolder)) continue;
-        const rel = f.path.replace(/\/+$/, '');
-        if (!rel) continue;
-        const folderName = rel.split('/').pop() || '';
-        if (folderName.startsWith('.')) continue;
-        if (this.shouldExclude(rel + '/')) continue;
-        const top = rel.split('/')[0];
-        if (!rel.includes('/') && SYSTEM_TOP_DIRS.has(top)) continue;
-        if (!folderMap.has(rel)) {
-          const existing = this.plugin.mapping.getByPath(rel + '/');
-          if (existing) {
-            folderMap.set(rel, existing.joplinId);
-            pushedFolderIds.add(existing.joplinId);
-          } else {
-            dirs.add(rel);
-          }
-        }
+      const adapter = this.plugin.app.vault.adapter;
+      if (adapter && adapter.list) {
+        const walkDirs = async (dir: string): Promise<void> => {
+          try {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const clean = normDir(sub);
+              if (!clean || clean === '.' || clean === '..') continue;
+              const folderName = clean.split('/').pop() || '';
+              if (folderName.startsWith('.')) continue;
+              if (this.shouldExclude(clean + '/')) continue;
+              const top = clean.split('/')[0];
+              if (!clean.includes('/') && SYSTEM_TOP_DIRS.has(top)) continue;
+              if (!folderMap.has(clean)) {
+                const existing = this.plugin.mapping.getByPath(clean + '/');
+                if (existing) {
+                  folderMap.set(clean, existing.joplinId);
+                  pushedFolderIds.add(existing.joplinId);
+                } else {
+                  dirs.add(clean);
+                }
+              }
+              await walkDirs(clean);
+            }
+          } catch { /* ignore unreadable */ }
+        };
+        await walkDirs('');
       }
       let folderCount = 0; void folderCount;
       for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
@@ -749,7 +762,6 @@ export class SyncEngine {
       // after hundreds of trashFile calls. adapter.list may return names
       // with a `./` prefix in real Obsidian: normalize them instead of
       // filtering on '/' (which silently skipped every folder — B15).
-      const normDir = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '');
       const listAll = async (dir: string): Promise<string[]> => {
         const result: string[] = [];
         try {

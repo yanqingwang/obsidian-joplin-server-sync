@@ -2161,6 +2161,7 @@ var InitialSync = class {
 };
 
 // src/core/SyncEngine.ts
+var normDir = (p) => p.replace(/^\.\//, "").replace(/\/+$/, "");
 var SyncEngine = class {
   constructor(plugin) {
     this.plugin = plugin;
@@ -2688,29 +2689,38 @@ var SyncEngine = class {
         discoverParentDirs(f.path);
       }
       const SYSTEM_TOP_DIRS = /* @__PURE__ */ new Set(["home", "Library", "node_modules", "tmp", "private", "Users"]);
-      for (const f of this.plugin.app.vault.getAllLoadedFiles()) {
-        if (!(f instanceof import_obsidian9.TFolder))
-          continue;
-        const rel = f.path.replace(/\/+$/, "");
-        if (!rel)
-          continue;
-        const folderName = rel.split("/").pop() || "";
-        if (folderName.startsWith("."))
-          continue;
-        if (this.shouldExclude(rel + "/"))
-          continue;
-        const top = rel.split("/")[0];
-        if (!rel.includes("/") && SYSTEM_TOP_DIRS.has(top))
-          continue;
-        if (!folderMap.has(rel)) {
-          const existing = this.plugin.mapping.getByPath(rel + "/");
-          if (existing) {
-            folderMap.set(rel, existing.joplinId);
-            pushedFolderIds.add(existing.joplinId);
-          } else {
-            dirs.add(rel);
+      const adapter = this.plugin.app.vault.adapter;
+      if (adapter && adapter.list) {
+        const walkDirs = async (dir) => {
+          try {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const clean = normDir(sub);
+              if (!clean || clean === "." || clean === "..")
+                continue;
+              const folderName = clean.split("/").pop() || "";
+              if (folderName.startsWith("."))
+                continue;
+              if (this.shouldExclude(clean + "/"))
+                continue;
+              const top = clean.split("/")[0];
+              if (!clean.includes("/") && SYSTEM_TOP_DIRS.has(top))
+                continue;
+              if (!folderMap.has(clean)) {
+                const existing = this.plugin.mapping.getByPath(clean + "/");
+                if (existing) {
+                  folderMap.set(clean, existing.joplinId);
+                  pushedFolderIds.add(existing.joplinId);
+                } else {
+                  dirs.add(clean);
+                }
+              }
+              await walkDirs(clean);
+            }
+          } catch {
           }
-        }
+        };
+        await walkDirs("");
       }
       let folderCount = 0;
       for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
@@ -2936,7 +2946,6 @@ var SyncEngine = class {
           }
         }
       }
-      const normDir = (p) => p.replace(/^\.\//, "").replace(/\/+$/, "");
       const listAll = async (dir) => {
         const result = [];
         try {

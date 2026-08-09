@@ -32,6 +32,21 @@ export class MockVault {
       return ext.length > 0 && ext !== 'md' ? true : f.endsWith('.md');
     }).map(f => new TFile(f));
   }
+  getAllLoadedFiles(): TAbstractFile[] {
+    const out: TAbstractFile[] = [];
+    const rec = (dir: string) => {
+      let ents: fs.Dirent[];
+      try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of ents) {
+        const full = path.join(dir, e.name);
+        const rel = path.relative(this.root, full).split(path.sep).join('/');
+        if (e.isDirectory()) { out.push(new TFolder(rel + '/')); rec(full); }
+        else out.push(new TFile(rel));
+      }
+    };
+    rec(this.root);
+    return out;
+  }
   private walk(): string[] {
     const out: string[] = [];
     const rec = (dir: string) => {

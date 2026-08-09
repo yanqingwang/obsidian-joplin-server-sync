@@ -2687,37 +2687,30 @@ var SyncEngine = class {
           continue;
         discoverParentDirs(f.path);
       }
-      const adapter = this.plugin.app.vault.adapter;
-      const typedAdapter = adapter;
       const SYSTEM_TOP_DIRS = /* @__PURE__ */ new Set(["home", "Library", "node_modules", "tmp", "private", "Users"]);
-      if (adapter && typedAdapter.list) {
-        const walkDirs = async (dir) => {
-          try {
-            const listing = await typedAdapter.list(dir);
-            for (const sub of listing.folders) {
-              const folderName = sub.split("/").pop() || "";
-              if (folderName.startsWith("."))
-                continue;
-              const rel = dir ? dir + "/" + folderName : folderName;
-              if (this.shouldExclude(rel + "/"))
-                continue;
-              if (!dir && SYSTEM_TOP_DIRS.has(folderName))
-                continue;
-              if (rel && !folderMap.has(rel)) {
-                const existing = this.plugin.mapping.getByPath(rel + "/");
-                if (existing) {
-                  folderMap.set(rel, existing.joplinId);
-                  pushedFolderIds.add(existing.joplinId);
-                } else {
-                  dirs.add(rel);
-                }
-              }
-              await walkDirs(sub);
-            }
-          } catch {
+      for (const f of this.plugin.app.vault.getAllLoadedFiles()) {
+        if (!(f instanceof import_obsidian9.TFolder))
+          continue;
+        const rel = f.path.replace(/\/+$/, "");
+        if (!rel)
+          continue;
+        const folderName = rel.split("/").pop() || "";
+        if (folderName.startsWith("."))
+          continue;
+        if (this.shouldExclude(rel + "/"))
+          continue;
+        const top = rel.split("/")[0];
+        if (!rel.includes("/") && SYSTEM_TOP_DIRS.has(top))
+          continue;
+        if (!folderMap.has(rel)) {
+          const existing = this.plugin.mapping.getByPath(rel + "/");
+          if (existing) {
+            folderMap.set(rel, existing.joplinId);
+            pushedFolderIds.add(existing.joplinId);
+          } else {
+            dirs.add(rel);
           }
-        };
-        await walkDirs("");
+        }
       }
       let folderCount = 0;
       for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
@@ -2941,44 +2934,9 @@ var SyncEngine = class {
           delCount++;
         }
       }
-      const listAll = async (dir) => {
-        const result = [];
-        try {
-          if (adapter.list) {
-            const listing = await adapter.list(dir);
-            for (const sub of listing.folders) {
-              const children = await listAll(sub);
-              result.push(...children);
-            }
-            result.push(dir);
-          }
-        } catch {
-        }
-        return result;
-      };
-      const rootDirs = [];
-      try {
-        if (adapter.list) {
-          const root = await adapter.list("");
-          for (const d of root.folders) {
-            if (d === "." || d === ".." || d.includes("/"))
-              continue;
-            if (isKept(d))
-              continue;
-            rootDirs.push(d);
-          }
-        }
-      } catch {
-      }
-      const allDirs = [];
-      for (const d of rootDirs) {
-        const subs = await listAll(d);
-        allDirs.push(...subs);
-      }
-      allDirs.sort((a, b) => b.split("/").length - a.split("/").length);
-      for (const d of allDirs) {
-        if (isKept(d) || d === "")
-          continue;
+      const allLocalDirs = this.plugin.app.vault.getAllLoadedFiles().filter((x) => x instanceof import_obsidian9.TFolder).map((f) => f.path.replace(/\/+$/, "")).filter((p) => p && !isKept(p));
+      allLocalDirs.sort((a, b) => b.split("/").length - a.split("/").length);
+      for (const d of allLocalDirs) {
         try {
           if (await adapter.exists(d)) {
             await adapter.rmdir(d, false).catch(() => {

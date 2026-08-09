@@ -2435,37 +2435,30 @@ var init_SyncEngine = __esm({
               continue;
             discoverParentDirs(f.path);
           }
-          const adapter = this.plugin.app.vault.adapter;
-          const typedAdapter = adapter;
           const SYSTEM_TOP_DIRS = /* @__PURE__ */ new Set(["home", "Library", "node_modules", "tmp", "private", "Users"]);
-          if (adapter && typedAdapter.list) {
-            const walkDirs = async (dir) => {
-              try {
-                const listing = await typedAdapter.list(dir);
-                for (const sub of listing.folders) {
-                  const folderName = sub.split("/").pop() || "";
-                  if (folderName.startsWith("."))
-                    continue;
-                  const rel = dir ? dir + "/" + folderName : folderName;
-                  if (this.shouldExclude(rel + "/"))
-                    continue;
-                  if (!dir && SYSTEM_TOP_DIRS.has(folderName))
-                    continue;
-                  if (rel && !folderMap.has(rel)) {
-                    const existing = this.plugin.mapping.getByPath(rel + "/");
-                    if (existing) {
-                      folderMap.set(rel, existing.joplinId);
-                      pushedFolderIds.add(existing.joplinId);
-                    } else {
-                      dirs.add(rel);
-                    }
-                  }
-                  await walkDirs(sub);
-                }
-              } catch {
+          for (const f of this.plugin.app.vault.getAllLoadedFiles()) {
+            if (!(f instanceof TFolder))
+              continue;
+            const rel = f.path.replace(/\/+$/, "");
+            if (!rel)
+              continue;
+            const folderName = rel.split("/").pop() || "";
+            if (folderName.startsWith("."))
+              continue;
+            if (this.shouldExclude(rel + "/"))
+              continue;
+            const top = rel.split("/")[0];
+            if (!rel.includes("/") && SYSTEM_TOP_DIRS.has(top))
+              continue;
+            if (!folderMap.has(rel)) {
+              const existing = this.plugin.mapping.getByPath(rel + "/");
+              if (existing) {
+                folderMap.set(rel, existing.joplinId);
+                pushedFolderIds.add(existing.joplinId);
+              } else {
+                dirs.add(rel);
               }
-            };
-            await walkDirs("");
+            }
           }
           let folderCount = 0;
           for (const dp of [...dirs].sort((a, b) => a.split("/").length - b.split("/").length)) {
@@ -2689,44 +2682,9 @@ var init_SyncEngine = __esm({
               delCount++;
             }
           }
-          const listAll = async (dir) => {
-            const result = [];
-            try {
-              if (adapter.list) {
-                const listing = await adapter.list(dir);
-                for (const sub of listing.folders) {
-                  const children = await listAll(sub);
-                  result.push(...children);
-                }
-                result.push(dir);
-              }
-            } catch {
-            }
-            return result;
-          };
-          const rootDirs = [];
-          try {
-            if (adapter.list) {
-              const root = await adapter.list("");
-              for (const d of root.folders) {
-                if (d === "." || d === ".." || d.includes("/"))
-                  continue;
-                if (isKept(d))
-                  continue;
-                rootDirs.push(d);
-              }
-            }
-          } catch {
-          }
-          const allDirs = [];
-          for (const d of rootDirs) {
-            const subs = await listAll(d);
-            allDirs.push(...subs);
-          }
-          allDirs.sort((a, b) => b.split("/").length - a.split("/").length);
-          for (const d of allDirs) {
-            if (isKept(d) || d === "")
-              continue;
+          const allLocalDirs = this.plugin.app.vault.getAllLoadedFiles().filter((x) => x instanceof TFolder).map((f) => f.path.replace(/\/+$/, "")).filter((p) => p && !isKept(p));
+          allLocalDirs.sort((a, b) => b.split("/").length - a.split("/").length);
+          for (const d of allLocalDirs) {
             try {
               if (await adapter.exists(d)) {
                 await adapter.rmdir(d, false).catch(() => {
@@ -3924,6 +3882,28 @@ var MockVault = class {
       const ext = f.split(".").pop() || "";
       return ext.length > 0 && ext !== "md" ? true : f.endsWith(".md");
     }).map((f) => new TFile(f));
+  }
+  getAllLoadedFiles() {
+    const out = [];
+    const rec = (dir) => {
+      let ents;
+      try {
+        ents = fs2.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of ents) {
+        const full = path2.join(dir, e.name);
+        const rel = path2.relative(this.root, full).split(path2.sep).join("/");
+        if (e.isDirectory()) {
+          out.push(new TFolder(rel + "/"));
+          rec(full);
+        } else
+          out.push(new TFile(rel));
+      }
+    };
+    rec(this.root);
+    return out;
   }
   walk() {
     const out = [];

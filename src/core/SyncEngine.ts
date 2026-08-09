@@ -1,4 +1,4 @@
-import { Notice, Modal, TFile, TAbstractFile } from 'obsidian';
+import { Notice, Modal, TFile, TAbstractFile, TFolder } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { SyncInfoHandler } from './SyncInfo';
@@ -522,38 +522,30 @@ export class SyncEngine {
         discoverParentDirs(f.path);
       }
 
-      // Also discover empty directories from the filesystem adapter. Materialize
-      // EVERY non-hidden, non-excluded directory (including genuinely empty
-      // user folders like AIReports/Charts), but skip known Obsidian/system
-      // trees (e.g. `<vault>/home/<user>/...` nesting) whose only content is
-      // hidden config.
-      const adapter = this.plugin.app.vault.adapter;
-      const typedAdapter = adapter as unknown as { list: (dir: string) => Promise<{ files: string[]; folders: string[] }> };
+      // Also discover empty directories. Materialize EVERY non-hidden,
+      // non-excluded directory (including genuinely empty user folders like
+      // AIReports/Charts), but skip known Obsidian/system trees. Uses the
+      // vault API (getAllLoadedFiles) — adapter.list('') paths are unreliable
+      // across environments (B15).
       const SYSTEM_TOP_DIRS = new Set(['home', 'Library', 'node_modules', 'tmp', 'private', 'Users']);
-      if (adapter && typedAdapter.list) {
-        const walkDirs = async (dir: string): Promise<void> => {
-          try {
-            const listing = await typedAdapter.list(dir);
-            for (const sub of listing.folders) {
-              const folderName = sub.split('/').pop() || '';
-              if (folderName.startsWith('.')) continue;
-              const rel = dir ? dir + '/' + folderName : folderName;
-              if (this.shouldExclude(rel + '/')) continue;
-              if (!dir && SYSTEM_TOP_DIRS.has(folderName)) continue;
-              if (rel && !folderMap.has(rel)) {
-                const existing = this.plugin.mapping.getByPath(rel + '/');
-                if (existing) {
-                  folderMap.set(rel, existing.joplinId);
-                  pushedFolderIds.add(existing.joplinId);
-                } else {
-                  dirs.add(rel);
-                }
-              }
-              await walkDirs(sub);
-            }
-          } catch { /* ignore unreadable */ }
-        };
-        await walkDirs('');
+      for (const f of this.plugin.app.vault.getAllLoadedFiles()) {
+        if (!(f instanceof TFolder)) continue;
+        const rel = f.path.replace(/\/+$/, '');
+        if (!rel) continue;
+        const folderName = rel.split('/').pop() || '';
+        if (folderName.startsWith('.')) continue;
+        if (this.shouldExclude(rel + '/')) continue;
+        const top = rel.split('/')[0];
+        if (!rel.includes('/') && SYSTEM_TOP_DIRS.has(top)) continue;
+        if (!folderMap.has(rel)) {
+          const existing = this.plugin.mapping.getByPath(rel + '/');
+          if (existing) {
+            folderMap.set(rel, existing.joplinId);
+            pushedFolderIds.add(existing.joplinId);
+          } else {
+            dirs.add(rel);
+          }
+        }
       }
       let folderCount = 0; void folderCount;
       for (const dp of [...dirs].sort((a,b) => a.split('/').length - b.split('/').length)) {
@@ -748,50 +740,17 @@ export class SyncEngine {
         }
       }
 
-      // Recursively delete all empty directories via adapter (bottom-up)
-      const listAll = async (dir: string): Promise<string[]> => {
-        const result: string[] = [];
-        try {
-          if (adapter.list) {
-            const listing = await adapter.list(dir);
-            for (const sub of listing.folders) {
-              const children = await listAll(sub);
-              result.push(...children);
-            }
-            result.push(dir);
-          }
-        } catch {/* empty */}
-        return result;
-      };
-      // List all dirs at vault root (excluding config dir)
-      const rootDirs: string[] = [];
-      try {
-        if (adapter.list) {
-          const root = await adapter.list('');
-          for (const d of root.folders) {
-            // adapter.list('') may return the vault's PARENT dir (e.g. `tmp`
-            // when the vault lives at /tmp/<vault>) — those are not children
-            // of the vault and must never be traversed or deleted, otherwise
-            // a bottom-up delete descends into .obsidian and wipes config.
-            if (d === '.' || d === '..' || d.includes('/')) continue;
-            if (isKept(d)) continue;
-            rootDirs.push(d);
-          }
-        }
-      } catch {/* empty */}
-      // Get all subdirectories recursively, then delete bottom-up
-      const allDirs: string[] = [];
-      for (const d of rootDirs) {
-        const subs = await listAll(d);
-        allDirs.push(...subs);
-      }
-      // Delete from deepest to shallowest, never touching the config dir
-      // (an adapter.list('') may return parent/ancestor dirs of the vault
-      // root when the vault lives under a shared parent — e.g. /tmp — so a
-      // naive bottom-up delete would descend into .obsidian and wipe config).
-      allDirs.sort((a, b) => b.split('/').length - a.split('/').length);
-      for (const d of allDirs) {
-        if (isKept(d) || d === '') continue;
+      // Delete ALL remaining folders bottom-up. Enumerate via the vault API
+      // (getAllLoadedFiles) instead of adapter.list(''): Obsidian's adapter
+      // may return directory names with a `./` prefix, which the old
+      // `d.includes('/')` guard silently filtered out — leaving orphan
+      // folders that exist locally but not on the server (B15).
+      const allLocalDirs = this.plugin.app.vault.getAllLoadedFiles()
+        .filter((x): x is TFolder => x instanceof TFolder)
+        .map(f => f.path.replace(/\/+$/, ''))
+        .filter(p => p && !isKept(p));
+      allLocalDirs.sort((a, b) => b.split('/').length - a.split('/').length);
+      for (const d of allLocalDirs) {
         try {
           if (await adapter.exists(d)) {
             await adapter.rmdir(d, false).catch(() => {});

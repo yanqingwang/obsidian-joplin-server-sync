@@ -637,6 +637,7 @@ async function main() {
     const isExcluded = (p: string) => excludes.some((e: string) => p.startsWith(e)) || p.startsWith('.obsidian/');
     const localMd: string[] = [];
     const localNonMd: string[] = [];
+    const localDirs = new Set<string>();
     const fs = require('fs');
     const pathMod = require('path');
     const walkFs = (dir: string): void => {
@@ -646,6 +647,7 @@ async function main() {
         const rel = dir ? dir + '/' + e.name : e.name;
         if (e.isDirectory()) {
           if (e.name.startsWith('.') || excludes.some((x: string) => (rel + '/').startsWith(x))) continue;
+          localDirs.add(rel);
           walkFs(rel);
         } else if (e.isFile()) {
           if (isExcluded(rel)) continue;
@@ -655,16 +657,12 @@ async function main() {
     };
     walkFs('');
     const localTotal = localMd.length + localNonMd.length;
-    // Local directory count (non-hidden, non-excluded)
-    const localDirs = new Set<string>();
-    for (const f of [...localMd, ...localNonMd]) {
-      if (!f.includes('/')) continue;
-      const parts = f.split('/').slice(0, -1);
-      for (let i = 1; i <= parts.length; i++) localDirs.add(parts.slice(0, i).join('/'));
-    }
 
-    // Remote counts (paginate everything)
+    // Remote counts: paginate everything, then filter to THIS vault's root
+    // subtree — the server account may host other vaults' content (multi-vault
+    // sync). Resources/master keys stay global (they are not folder-scoped).
     let remoteNotes = 0, remoteFolders = 0, remoteResources = 0, remoteBlobs = 0, remoteMk = 0, remoteInfo = 0;
+    const remoteItems: { item: any }[] = [];
     let cursor: string | undefined;
     while (true) {
       const page = await plugin.api.listChildrenOf('', cursor);
@@ -676,15 +674,44 @@ async function main() {
         try {
           const raw = await plugin.api.getItem(it.name);
           if (!raw) continue;
-          const item = new JoplinSerializer().unserialize(raw);
-          if (item.type_ === 1) remoteNotes++;
-          else if (item.type_ === 2) remoteFolders++;
-          else if (item.type_ === 4) remoteResources++;
-          else if (item.type_ === 9) remoteMk++;
+          remoteItems.push({ item: new JoplinSerializer().unserialize(raw) });
         } catch { /* skip unreadable */ }
       }
       cursor = page.cursor;
       if (!page.has_more || !cursor) break;
+    }
+    const rootId: string = plugin.mapping.rootFolderId;
+    if (rootId) {
+      const parentMap = new Map<string, string>();
+      for (const { item } of remoteItems) if (item.parent_id) parentMap.set(item.id, item.parent_id);
+      const cache = new Map<string, boolean>();
+      const belongsToRoot = (item: any): boolean => {
+        if (item.type_ === 4 || item.type_ === 9) return true;
+        let pid = item.parent_id;
+        if (!pid) return false;
+        const visited = new Set<string>();
+        let depth = 0;
+        while (pid && !visited.has(pid) && depth < 64) {
+          visited.add(pid);
+          if (pid === rootId) { for (const v of visited) cache.set(v, true); return true; }
+          const c = cache.get(pid);
+          if (c !== undefined) { for (const v of visited) cache.set(v, c); return c; }
+          const next = parentMap.get(pid);
+          if (next === undefined || next === pid) { for (const v of visited) cache.set(v, false); return false; }
+          pid = next;
+          depth++;
+        }
+        return false;
+      };
+      for (let i = remoteItems.length - 1; i >= 0; i--) {
+        if (!belongsToRoot(remoteItems[i].item)) remoteItems.splice(i, 1);
+      }
+    }
+    for (const { item } of remoteItems) {
+      if (item.type_ === 1) remoteNotes++;
+      else if (item.type_ === 2) remoteFolders++;
+      else if (item.type_ === 4) remoteResources++;
+      else if (item.type_ === 9) remoteMk++;
     }
 
     console.log('  local:  ' + localTotal + ' files (' + localMd.length + ' md, ' + localNonMd.length + ' non-md) in ' + localDirs.size + ' dirs');

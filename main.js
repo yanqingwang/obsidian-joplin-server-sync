@@ -2793,7 +2793,6 @@ var SyncEngine = class {
       }
       if (!this.plugin.settings.syncFoldersOnly) {
         console.debug("[joplin-sync] force push notes: done=" + done + " fail=" + fail + " pushedNoteIds=" + pushedNoteIds.size);
-        this.plugin.logSync("push", done, fail);
       }
       const pushedResourceIds = /* @__PURE__ */ new Set();
       let rDone = 0, rFail = 0;
@@ -2825,40 +2824,104 @@ var SyncEngine = class {
         protectedMasterKeys.add(this.plugin.mapping.e2eeMasterKeyId);
       const remote = await this.listAllRemoteItems();
       console.debug("[joplin-sync] force push cleanup: scanning " + remote.length + " remote items");
+      const parentCache = /* @__PURE__ */ new Map();
+      const ownChainCache = /* @__PURE__ */ new Map();
+      const readParentId = async (id) => {
+        const cached = parentCache.get(id);
+        if (cached !== void 0)
+          return cached || void 0;
+        try {
+          const raw = await this.plugin.api.getItem(id + ".md");
+          if (!raw) {
+            parentCache.set(id, "");
+            return void 0;
+          }
+          const item = this.serializer.unserialize(raw);
+          const pid = item.parent_id ?? "";
+          parentCache.set(id, pid);
+          return pid || void 0;
+        } catch {
+          parentCache.set(id, "");
+          return void 0;
+        }
+      };
+      const isOwnChain = async (id) => {
+        const rootId = this.plugin.mapping.rootFolderId;
+        if (!rootId)
+          return false;
+        const cached = ownChainCache.get(id);
+        if (cached !== void 0)
+          return cached;
+        const visited = /* @__PURE__ */ new Set();
+        let pid = id;
+        let depth = 0;
+        while (pid && !visited.has(pid) && depth < 64) {
+          visited.add(pid);
+          if (pid === rootId) {
+            for (const v of visited)
+              ownChainCache.set(v, true);
+            return true;
+          }
+          const next = await readParentId(pid);
+          if (!next)
+            break;
+          pid = next;
+          depth++;
+        }
+        for (const v of visited)
+          ownChainCache.set(v, false);
+        return false;
+      };
       for (const stat of remote) {
         const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
         if (noteMatch) {
           const id = noteMatch[1];
           if (protectedMasterKeys.has(id))
             continue;
+          const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
+          if (inPushed)
+            continue;
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === 2 /* Folder */) {
-            if (!pushedFolderIds.has(id)) {
-              try {
-                await this.plugin.api.deleteItem(stat.name);
-                removed++;
-                removedFolders++;
-              } catch {
-              }
+            try {
+              await this.plugin.api.deleteItem(stat.name);
+              removed++;
+              removedFolders++;
+            } catch {
             }
           } else if (entry?.type === 4 /* Resource */) {
-            if (!pushedResourceIds.has(id)) {
-              try {
-                await this.plugin.api.deleteItem(stat.name);
-                removed++;
-                removedResources++;
-              } catch {
-              }
+            try {
+              await this.plugin.api.deleteItem(stat.name);
+              removed++;
+              removedResources++;
+            } catch {
             }
-          } else {
-            const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
-            if (!inPushed && !this.plugin.settings.syncFoldersOnly && ownedIds.has(id)) {
+          } else if (entry) {
+            if (!this.plugin.settings.syncFoldersOnly) {
               try {
                 await this.plugin.api.deleteItem(stat.name);
                 removed++;
                 removedNotes++;
               } catch {
               }
+            }
+          } else {
+            const isOwnOrphan = await isOwnChain(id);
+            if (!isOwnOrphan)
+              continue;
+            try {
+              const raw = await this.plugin.api.getItem(stat.name);
+              const item = raw ? this.serializer.unserialize(raw) : void 0;
+              const t = item?.type_;
+              await this.plugin.api.deleteItem(stat.name);
+              removed++;
+              if (t === 2 /* Folder */)
+                removedFolders++;
+              else if (t === 4 /* Resource */)
+                removedResources++;
+              else
+                removedNotes++;
+            } catch {
             }
           }
         } else {
@@ -2885,10 +2948,18 @@ var SyncEngine = class {
           break;
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? "");
-      if (fail || rFail) {
-        this.plugin.statusBar.setError("push: " + fail + " note + " + rFail + " resource failed");
+      if (!this.plugin.settings.syncFoldersOnly) {
+        const totalPushed = done + rDone;
+        const totalFail = fail + rFail;
+        this.plugin.logSync("push", totalPushed, totalFail);
+        new import_obsidian9.Notice("Force push: " + totalPushed + " items" + (totalFail ? ", " + totalFail + " failed" : ""));
+        if (totalFail) {
+          this.plugin.statusBar.setError("push: " + totalFail + " failed");
+        } else {
+          this.plugin.statusBar.setOk(Date.now(), totalPushed);
+        }
       } else {
-        this.plugin.statusBar.setOk(Date.now(), done + rDone);
+        this.plugin.statusBar.setOk(Date.now(), totalFolders);
       }
     } finally {
       this.watcher?.resume();
@@ -3047,11 +3118,60 @@ var SyncEngine = class {
             console.error("[joplin-sync] force-pull:", stat.name, e);
         }
       }
-      const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
-      const serverRoot = folders.find((f) => !f.parent_id && (f.title || "").startsWith("_vault_"));
+      const preFolders = allItems.filter((i) => i.type_ === 2 /* Folder */);
+      const serverRoot = preFolders.find((f) => !f.parent_id && (f.title || "").startsWith("_vault_"));
       if (serverRoot && !this.plugin.mapping.rootFolderId) {
         this.plugin.mapping.setRootFolderId(serverRoot.id);
       }
+      const filterRootId = this.plugin.mapping.rootFolderId;
+      if (filterRootId) {
+        const parentMap = /* @__PURE__ */ new Map();
+        for (const it of allItems)
+          if (it.parent_id)
+            parentMap.set(it.id, it.parent_id);
+        const ancestorCache = /* @__PURE__ */ new Map();
+        const belongsToRoot = (item) => {
+          if (item.type_ === 4 /* Resource */ || item.type_ === 9 /* MasterKey */)
+            return true;
+          let pid = item.parent_id;
+          if (!pid)
+            return false;
+          const visited = /* @__PURE__ */ new Set();
+          let depth = 0;
+          while (pid && !visited.has(pid) && depth < 64) {
+            visited.add(pid);
+            if (pid === filterRootId) {
+              for (const v of visited)
+                ancestorCache.set(v, true);
+              return true;
+            }
+            const cached = ancestorCache.get(pid);
+            if (cached !== void 0) {
+              for (const v of visited)
+                ancestorCache.set(v, cached);
+              return cached;
+            }
+            const next = parentMap.get(pid);
+            if (next === void 0 || next === pid) {
+              for (const v of visited)
+                ancestorCache.set(v, false);
+              return false;
+            }
+            pid = next;
+            depth++;
+          }
+          return false;
+        };
+        const before = allItems.length;
+        for (let i = allItems.length - 1; i >= 0; i--) {
+          if (!belongsToRoot(allItems[i]))
+            allItems.splice(i, 1);
+        }
+        if (allItems.length !== before) {
+          console.debug("[joplin-sync] force pull root filter: kept " + allItems.length + "/" + before + " items (excluded foreign-vault items)");
+        }
+      }
+      const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
       this.buildForcePullFolderPaths(folders);
       const pullRootId = this.plugin.mapping.rootFolderId;
       for (const f of folders) {

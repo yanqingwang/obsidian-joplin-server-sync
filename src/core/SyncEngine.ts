@@ -624,7 +624,6 @@ export class SyncEngine {
       }
       if (!this.plugin.settings.syncFoldersOnly) {
         console.debug('[joplin-sync] force push notes: done=' + done + ' fail=' + fail + ' pushedNoteIds=' + pushedNoteIds.size);
-        this.plugin.logSync('push', done, fail);
       }
 
       // ---- Attachments/files: mirror EVERY local non-md file (except config) ----
@@ -649,8 +648,7 @@ export class SyncEngine {
         if (rDone || rFail) console.debug('[joplin-sync] force push files: ' + rDone + ' uploaded, ' + rFail + ' failed');
       }
 
-      // ---- True-overwrite cleanup: delete server items not present locally ----
-      // Notes are only removed when we actually pushed notes this run
+      // ---- True-overwrite cleanup: delete server items not present locally ----      // Notes are only removed when we actually pushed notes this run
       // (in folders-only mode we must not wipe the server's notes).
       let removed = 0, removedNotes = 0, removedFolders = 0, removedResources = 0;
       // Master keys are never in the pushed sets — always preserve them.
@@ -658,23 +656,78 @@ export class SyncEngine {
       if (this.plugin.mapping.e2eeMasterKeyId) protectedMasterKeys.add(this.plugin.mapping.e2eeMasterKeyId);
       const remote = await this.listAllRemoteItems();
       console.debug('[joplin-sync] force push cleanup: scanning ' + remote.length + ' remote items');
+      // Parent-chain cache for orphan-folder ownership checks: an orphan folder
+      // (not in the fresh mapping) still belongs to this vault when its parent
+      // chain reaches OUR root — it must be deleted, while foreign vaults'
+      // folders (their own `_vault_*` roots) are preserved (C1).
+      const parentCache = new Map<string, string>();
+      const ownChainCache = new Map<string, boolean>();
+      const readParentId = async (id: string): Promise<string | undefined> => {
+        const cached = parentCache.get(id);
+        if (cached !== undefined) return cached || undefined;
+        try {
+          const raw = await this.plugin.api.getItem(id + '.md');
+          if (!raw) { parentCache.set(id, ''); return undefined; }
+          const item = this.serializer.unserialize(raw);
+          const pid = item.parent_id ?? '';
+          parentCache.set(id, pid);
+          return pid || undefined;
+        } catch { parentCache.set(id, ''); return undefined; }
+      };
+      const isOwnChain = async (id: string): Promise<boolean> => {
+        const rootId = this.plugin.mapping.rootFolderId;
+        if (!rootId) return false;
+        const cached = ownChainCache.get(id);
+        if (cached !== undefined) return cached;
+        const visited = new Set<string>();
+        let pid = id;
+        let depth = 0;
+        while (pid && !visited.has(pid) && depth < 64) {
+          visited.add(pid);
+          if (pid === rootId) {
+            for (const v of visited) ownChainCache.set(v, true);
+            return true;
+          }
+          const next = await readParentId(pid);
+          if (!next) break;
+          pid = next;
+          depth++;
+        }
+        for (const v of visited) ownChainCache.set(v, false);
+        return false;
+      };
       for (const stat of remote) {
         const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
         if (noteMatch) {
           const id = noteMatch[1];
           if (protectedMasterKeys.has(id)) continue;
+          const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
+          if (inPushed) continue;
           const entry = this.plugin.mapping.getById(id);
           if (entry?.type === ModelType.Folder) {
-            if (!pushedFolderIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedFolders++; } catch { /* ignore */ } }
+            try { await this.plugin.api.deleteItem(stat.name); removed++; removedFolders++; } catch { /* ignore */ }
           } else if (entry?.type === ModelType.Resource) {
-            if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; removedResources++; } catch { /* ignore */ } }
-          } else {
-            // Delete stale/unknown items ONLY if we owned them before this
-            // push. Items from other vaults sharing the server must stay (C1).
-            const inPushed = pushedNoteIds.has(id) || pushedFolderIds.has(id) || pushedResourceIds.has(id);
-            if (!inPushed && !this.plugin.settings.syncFoldersOnly && ownedIds.has(id)) {
+            try { await this.plugin.api.deleteItem(stat.name); removed++; removedResources++; } catch { /* ignore */ }
+          } else if (entry) {
+            // Note not pushed this run but still mapped: delete (owned before).
+            if (!this.plugin.settings.syncFoldersOnly) {
               try { await this.plugin.api.deleteItem(stat.name); removed++; removedNotes++; } catch { /* ignore */ }
             }
+          } else {
+            // Unknown item: it is an orphan only when its parent chain belongs
+            // to THIS vault (C1: foreign vault items must stay).
+            const isOwnOrphan = await isOwnChain(id);
+            if (!isOwnOrphan) continue;
+            try {
+              const raw = await this.plugin.api.getItem(stat.name);
+              const item = raw ? this.serializer.unserialize(raw) : undefined;
+              const t = item?.type_;
+              await this.plugin.api.deleteItem(stat.name);
+              removed++;
+              if (t === ModelType.Folder) removedFolders++;
+              else if (t === ModelType.Resource) removedResources++;
+              else removedNotes++;
+            } catch { /* ignore */ }
           }
         } else {
           // resource blob: cleanup orphans so the server stays in sync —
@@ -697,10 +750,21 @@ export class SyncEngine {
       }
       this.plugin.mapping.setDeltaCursor(cursor ?? '');
 
-      if (fail || rFail) {
-        this.plugin.statusBar.setError('push: ' + fail + ' note + ' + rFail + ' resource failed');
+      // Unified accounting: count EVERY local file (notes + resources), the
+      // same way forcePull reports (notes + resources), so push and pull show
+      // matching totals. Folders-only mode reports folders only.
+      if (!this.plugin.settings.syncFoldersOnly) {
+        const totalPushed = done + rDone;
+        const totalFail = fail + rFail;
+        this.plugin.logSync('push', totalPushed, totalFail);
+        new Notice('Force push: ' + totalPushed + ' items' + (totalFail ? ', ' + totalFail + ' failed' : ''));
+        if (totalFail) {
+          this.plugin.statusBar.setError('push: ' + totalFail + ' failed');
+        } else {
+          this.plugin.statusBar.setOk(Date.now(), totalPushed);
+        }
       } else {
-        this.plugin.statusBar.setOk(Date.now(), done + rDone);
+        this.plugin.statusBar.setOk(Date.now(), totalFolders);
       }
     } finally {
       this.watcher?.resume();
@@ -856,16 +920,68 @@ export class SyncEngine {
         }
       }
 
+      // Learn the sync root from the server first (B3): on a mirror vault the
+      // top-level `_vault_<name>` folder IS the root. Must happen BEFORE the
+      // belongs-to-root filter so fresh vaults can discover their own root.
+      const preFolders = allItems.filter(i => i.type_ === ModelType.Folder);
+      const serverRoot = preFolders.find(f => !f.parent_id && (f.title || '').startsWith('_vault_'));
+      if (serverRoot && !this.plugin.mapping.rootFolderId) {
+        this.plugin.mapping.setRootFolderId(serverRoot.id);
+      }
+
+      // Root isolation: when multiple vaults share one server account, only
+      // items whose parent chain reaches OUR root folder belong to this vault
+      // (same rule as DeltaPuller.belongsToRoot). Resources and master keys
+      // stay global — a resource is referenced by note id, not by folder
+      // hierarchy, so filtering them by root would drop legitimate
+      // attachments shared across the account (matches DeltaPuller).
+      const filterRootId = this.plugin.mapping.rootFolderId;
+      if (filterRootId) {
+        const parentMap = new Map<string, string>();
+        for (const it of allItems) if (it.parent_id) parentMap.set(it.id, it.parent_id);
+        const ancestorCache = new Map<string, boolean>();
+        const belongsToRoot = (item: JoplinItem): boolean => {
+          if (item.type_ === ModelType.Resource || item.type_ === ModelType.MasterKey) return true;
+          let pid = item.parent_id;
+          if (!pid) return false;
+          const visited = new Set<string>();
+          let depth = 0;
+          while (pid && !visited.has(pid) && depth < 64) {
+            visited.add(pid);
+            if (pid === filterRootId) {
+              for (const v of visited) ancestorCache.set(v, true);
+              return true;
+            }
+            const cached = ancestorCache.get(pid);
+            if (cached !== undefined) {
+              for (const v of visited) ancestorCache.set(v, cached);
+              return cached;
+            }
+            const next = parentMap.get(pid);
+            if (next === undefined || next === pid) {
+              for (const v of visited) ancestorCache.set(v, false);
+              return false;
+            }
+            pid = next;
+            depth++;
+          }
+          return false;
+        };
+        const before = allItems.length;
+        for (let i = allItems.length - 1; i >= 0; i--) {
+          if (!belongsToRoot(allItems[i])) allItems.splice(i, 1);
+        }
+        if (allItems.length !== before) {
+          console.debug('[joplin-sync] force pull root filter: kept ' + allItems.length + '/' + before + ' items (excluded foreign-vault items)');
+        }
+      }
+
       // Pre-compute folder paths from all items.
       // A mirror vault (fresh mapping) must learn the sync root from the
       // server: the top-level `_vault_<name>` folder is THE root — map it to
       // the local vault root (''), so the pulled tree has no `_vault_`
       // prefix and matches the owner vault's layout (B3).
       const folders = allItems.filter(i => i.type_ === ModelType.Folder);
-      const serverRoot = folders.find(f => !f.parent_id && (f.title || '').startsWith('_vault_'));
-      if (serverRoot && !this.plugin.mapping.rootFolderId) {
-        this.plugin.mapping.setRootFolderId(serverRoot.id);
-      }
       this.buildForcePullFolderPaths(folders);
 
       // Create folders first

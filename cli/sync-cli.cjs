@@ -2291,8 +2291,13 @@ var init_SyncEngine = __esm({
       /** Create (or reuse) the vault's root folder on the server. Everything this
        *  vault pushes is parented under it, so the delta-pull root filter
        *  (`belongsToRoot`) can reject items belonging to other vaults that share
-       *  the same account/server — the root cause of cross-vault deletion. */
+       *  the same account/server — the root cause of cross-vault deletion.
+       *  F-03: when the local mapping has no cached root (fresh second end), scan
+       *  the server for an existing `_vault_<vaultName>` folder and reuse it —
+       *  never create a duplicate root for a vault name that already exists. */
       async ensureRootFolder() {
+        const vaultName = this.plugin.app.vault.getName() || "vault";
+        const title = "_vault_" + vaultName;
         const existing = this.plugin.mapping.rootFolderId;
         if (existing) {
           try {
@@ -2302,8 +2307,31 @@ var init_SyncEngine = __esm({
           } catch {
           }
         }
-        const vaultName = this.plugin.app.vault.getName() || "vault";
-        const title = "_vault_" + vaultName;
+        const remote = await this.listAllRemoteItems();
+        for (const stat of remote) {
+          if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
+            continue;
+          try {
+            const raw = await this.plugin.api.getItem(stat.name);
+            if (!raw)
+              continue;
+            const item2 = this.serializer.unserialize(raw);
+            if (item2.type_ === 2 /* Folder */ && item2.title === title && !item2.parent_id) {
+              this.plugin.mapping.setRootFolderId(item2.id);
+              this.plugin.mapping.upsert({
+                joplinId: item2.id,
+                path: title + "/",
+                type: 2 /* Folder */,
+                localHash: "",
+                remoteUpdatedTime: item2.updated_time,
+                syncedAt: Date.now()
+              });
+              console.debug("[joplin-sync] root folder reused: " + title + " (" + item2.id + ")");
+              return item2.id;
+            }
+          } catch {
+          }
+        }
         const id = createJoplinId();
         const now = Date.now();
         const item = {

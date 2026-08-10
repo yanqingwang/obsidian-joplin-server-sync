@@ -387,17 +387,39 @@ export class SyncEngine {
   /** Create (or reuse) the vault's root folder on the server. Everything this
    *  vault pushes is parented under it, so the delta-pull root filter
    *  (`belongsToRoot`) can reject items belonging to other vaults that share
-   *  the same account/server — the root cause of cross-vault deletion. */
+   *  the same account/server — the root cause of cross-vault deletion.
+   *  F-03: when the local mapping has no cached root (fresh second end), scan
+   *  the server for an existing `_vault_<vaultName>` folder and reuse it —
+   *  never create a duplicate root for a vault name that already exists. */
   async ensureRootFolder(): Promise<string> {
+    const vaultName = this.plugin.app.vault.getName() || 'vault';
+    const title = '_vault_' + vaultName;
     const existing = this.plugin.mapping.rootFolderId;
     if (existing) {
       try {
         const raw = await this.plugin.api.getItem(existing + '.md');
         if (raw !== null) return existing;
-      } catch { /* fall through and recreate */ }
+      } catch { /* fall through to discovery */ }
     }
-    const vaultName = this.plugin.app.vault.getName() || 'vault';
-    const title = '_vault_' + vaultName;
+    // Discover an existing same-name root on the server (second-end join).
+    const remote = await this.listAllRemoteItems();
+    for (const stat of remote) {
+      if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
+      try {
+        const raw = await this.plugin.api.getItem(stat.name);
+        if (!raw) continue;
+        const item = this.serializer.unserialize(raw);
+        if (item.type_ === ModelType.Folder && item.title === title && !item.parent_id) {
+          this.plugin.mapping.setRootFolderId(item.id);
+          this.plugin.mapping.upsert({
+            joplinId: item.id, path: title + '/', type: ModelType.Folder,
+            localHash: '', remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
+          });
+          console.debug('[joplin-sync] root folder reused: ' + title + ' (' + item.id + ')');
+          return item.id;
+        }
+      } catch { /* skip unreadable */ }
+    }
     const id = createJoplinId();
     const now = Date.now();
     const item: JoplinItem = {

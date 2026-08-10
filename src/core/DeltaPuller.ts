@@ -129,15 +129,20 @@ export class DeltaPuller {
     // is almost certainly a stale cursor or foreign-vault replay, not a real
     // mass deletion. Refuse to act on it — and keep the OLD cursor so the
     // deletes replay next run instead of being permanently lost (B10).
+    // Only count deletes that map to real local items: after a force push
+    // rebuilds the server with fresh ids, the delta stream replays deletes
+    // for OLD ids that are no longer in our mapping — applyDelete is a no-op
+    // for them, so they must not trip the guard (C5 regression).
     const totalMapped = this.plugin.mapping.all().length;
-    if (totalMapped > 20 && deletes.length > totalMapped / 2) {
-      console.error('[joplin-sync] refusing ' + deletes.length + ' delta deletes over ' + totalMapped
+    const relevantDeletes = deletes.filter(id => this.plugin.mapping.getById(id));
+    if (totalMapped > 20 && relevantDeletes.length > totalMapped / 2) {
+      console.error('[joplin-sync] refusing ' + relevantDeletes.length + ' relevant delta deletes over ' + totalMapped
         + ' mapped items — possible stale cursor or foreign vault. Skipping this batch (cursor NOT advanced).');
-      stats.fail += deletes.length;
+      stats.fail += relevantDeletes.length;
       this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
       // C5: give the user an exit — otherwise every cycle replays the same
       // refused batch forever with only a console line.
-      new Notice('Sync blocked: ' + deletes.length + ' deletes detected (over half the vault). '
+      new Notice('Sync blocked: ' + relevantDeletes.length + ' deletes detected (over half the vault). '
         + 'This usually means the server was force-pushed from another vault. '
         + 'Run "Force pull" to rebuild from the server, or "Force push" to overwrite it.', 15000);
       return stats;

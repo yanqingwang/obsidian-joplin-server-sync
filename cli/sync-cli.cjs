@@ -528,7 +528,12 @@ var init_VaultWatcher = __esm({
           this.changeLog.push({ fileId: fileId2, op: kind === "modify" ? "update" : kind, path: path4, oldPath, type: 4 /* Resource */, hash: void 0 });
           return;
         }
-        const fileId = await this.plugin.identity.ensureId(file);
+        let fileId;
+        if (kind === "delete") {
+          fileId = this.plugin.mapping.getByPath(path4)?.joplinId ?? "file:" + path4;
+        } else {
+          fileId = await this.plugin.identity.ensureId(file);
+        }
         const op = kind === "modify" ? "update" : kind;
         let hash;
         if (kind !== "delete") {
@@ -1409,11 +1414,12 @@ var init_DeltaPuller = __esm({
             break;
         }
         const totalMapped = this.plugin.mapping.all().length;
-        if (totalMapped > 20 && deletes.length > totalMapped / 2) {
-          console.error("[joplin-sync] refusing " + deletes.length + " delta deletes over " + totalMapped + " mapped items \u2014 possible stale cursor or foreign vault. Skipping this batch (cursor NOT advanced).");
-          stats.fail += deletes.length;
+        const relevantDeletes = deletes.filter((id) => this.plugin.mapping.getById(id));
+        if (totalMapped > 20 && relevantDeletes.length > totalMapped / 2) {
+          console.error("[joplin-sync] refusing " + relevantDeletes.length + " relevant delta deletes over " + totalMapped + " mapped items \u2014 possible stale cursor or foreign vault. Skipping this batch (cursor NOT advanced).");
+          stats.fail += relevantDeletes.length;
           this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
-          new Notice("Sync blocked: " + deletes.length + ' deletes detected (over half the vault). This usually means the server was force-pushed from another vault. Run "Force pull" to rebuild from the server, or "Force push" to overwrite it.', 15e3);
+          new Notice("Sync blocked: " + relevantDeletes.length + ' deletes detected (over half the vault). This usually means the server was force-pushed from another vault. Run "Force pull" to rebuild from the server, or "Force push" to overwrite it.', 15e3);
           return stats;
         }
         for (const id of deletes) {

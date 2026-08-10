@@ -94,7 +94,14 @@ export class VaultWatcher {
       return;
     }
     // Markdown: stable fileId from frontmatter (mints one on first touch).
-    const fileId = await this.plugin.identity.ensureId(file);
+    // For delete events the file is already gone — reading it for
+    // frontmatter throws ENOENT. Fall back to mapping/path identity.
+    let fileId: string;
+    if (kind === 'delete') {
+      fileId = this.plugin.mapping.getByPath(path)?.joplinId ?? 'file:' + path;
+    } else {
+      fileId = await this.plugin.identity.ensureId(file);
+    }
     const op: ChangeOp = kind === 'modify' ? 'update' : kind;
     let hash: string | undefined;
     if (kind !== 'delete') {

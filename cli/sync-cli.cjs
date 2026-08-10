@@ -2640,6 +2640,7 @@ var init_SyncEngine = __esm({
         } finally {
           this.watcher?.resume();
           this.plugin.changeLog.clear();
+          await this.plugin.changeLog.flush();
           this.running = false;
           await this.plugin.mapping.flush();
         }
@@ -2663,6 +2664,7 @@ var init_SyncEngine = __esm({
         } finally {
           this.watcher?.resume();
           this.plugin.changeLog.clear();
+          await this.plugin.changeLog.flush();
           this.running = false;
           await this.plugin.mapping.flush();
         }

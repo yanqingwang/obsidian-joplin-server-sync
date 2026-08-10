@@ -695,6 +695,7 @@ export class SyncEngine {
     } finally {
       this.watcher?.resume();
       this.plugin.changeLog.clear(); // C3: watcher events from the rebuild must not replay
+      await this.plugin.changeLog.flush(); // persist the clear — dirty flag alone loses it
       this.running = false;
       await this.plugin.mapping.flush();
     }
@@ -716,6 +717,7 @@ export class SyncEngine {
     } finally {
       this.watcher?.resume();
       this.plugin.changeLog.clear(); // C3: watcher events from the rebuild must not replay
+      await this.plugin.changeLog.flush(); // persist the clear — dirty flag alone loses it
       this.running = false;
       await this.plugin.mapping.flush();
     }

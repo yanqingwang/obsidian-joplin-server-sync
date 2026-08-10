@@ -2892,6 +2892,7 @@ var SyncEngine = class {
     } finally {
       this.watcher?.resume();
       this.plugin.changeLog.clear();
+      await this.plugin.changeLog.flush();
       this.running = false;
       await this.plugin.mapping.flush();
     }
@@ -2915,6 +2916,7 @@ var SyncEngine = class {
     } finally {
       this.watcher?.resume();
       this.plugin.changeLog.clear();
+      await this.plugin.changeLog.flush();
       this.running = false;
       await this.plugin.mapping.flush();
     }

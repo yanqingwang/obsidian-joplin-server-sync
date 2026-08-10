@@ -1720,13 +1720,9 @@ var DeltaPuller = class {
         break;
     }
     const totalMapped = this.plugin.mapping.all().length;
-    const relevantDeletes = deletes.filter((id) => this.plugin.mapping.getById(id));
-    if (totalMapped > 20 && relevantDeletes.length > totalMapped / 2) {
-      console.error("[joplin-sync] refusing " + relevantDeletes.length + " relevant delta deletes over " + totalMapped + " mapped items \u2014 possible stale cursor or foreign vault. Skipping this batch (cursor NOT advanced).");
-      stats.fail += relevantDeletes.length;
-      this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
-      new import_obsidian7.Notice("Sync blocked: " + relevantDeletes.length + ' deletes detected (over half the vault). This usually means the server was force-pushed from another vault. Run "Force pull" to rebuild from the server, or "Force push" to overwrite it.', 15e3);
-      return stats;
+    if (totalMapped > 20 && deletes.length > totalMapped / 2) {
+      console.warn("[joplin-sync] large delta delete batch: " + deletes.length + " deletes over " + totalMapped + " mapped items \u2014 applying with per-item server verification. If this is a stale cursor, deletes are skipped; if the server was force-pushed from another vault, local files are removed.");
+      new import_obsidian7.Notice("Large delete batch (" + deletes.length + ') from server. Applying with verification \u2014 run "Force pull" if local state diverged.', 1e4);
     }
     for (const id of deletes) {
       try {

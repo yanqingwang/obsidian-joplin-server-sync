@@ -634,7 +634,11 @@ async function main() {
     // Local counts — walk the filesystem directly (authoritative), applying
     // the same exclude patterns the sync engine uses.
     const excludes = creds.excludePatterns || [];
-    const isExcluded = (p: string) => excludes.some((e: string) => p.startsWith(e)) || p.startsWith('.obsidian/');
+    const isExcluded = (p: string) => {
+      if (excludes.some((e: string) => p.startsWith(e))) return true;
+      if (p.startsWith('.obsidian/')) return true;
+      return p.split('/').some((seg: string) => seg.startsWith('.'));
+    };
     const localMd: string[] = [];
     const localNonMd: string[] = [];
     const localDirs = new Set<string>();
@@ -725,7 +729,7 @@ async function main() {
     assert(remoteNotes === localMd.length, 'note count matches (' + localMd.length + ' local vs ' + remoteNotes + ' remote)');
     assert(remoteFolders === localDirs.size, 'folder count matches (' + localDirs.size + ' local dirs vs ' + remoteFolders + ' remote folders)');
     assert(localNonMd.length === 0 ? true : remoteBlobs >= localNonMd.length, 'resource blobs cover non-md files (' + localNonMd.length + ' local vs ' + remoteBlobs + ' remote)');
-    assert(remoteContent <= localTotal + remoteMk + remoteFolders + 2, 'no runaway duplicates on server (remote ' + remoteContent + ' ≤ local ' + localTotal + ' + infra)');
+    assert(remoteContent <= localTotal + localDirs.size + localNonMd.length + 2, 'no runaway duplicates on server (remote ' + remoteContent + ' ≤ local ' + localTotal + ' + dirs + resources)');
 
     // E2EE ciphertext check
     if (creds.e2eeEnabled && creds.e2eePassword) {

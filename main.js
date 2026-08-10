@@ -2642,7 +2642,6 @@ var SyncEngine = class {
       await this.enableE2EE();
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
-      const ownedIds = new Set(this.plugin.mapping.all().map((e) => e.joplinId));
       {
         const remote2 = await this.listAllRemoteItems();
         let wiped = 0, skipped = 0;
@@ -2650,7 +2649,43 @@ var SyncEngine = class {
         const masterKeyIds = new Set(this.plugin.e2ee.availableMasterKeys);
         if (this.plugin.mapping.e2eeMasterKeyId)
           masterKeyIds.add(this.plugin.mapping.e2eeMasterKeyId);
-        const protectedRootId = this.plugin.mapping.rootFolderId;
+        const rootId = this.plugin.mapping.rootFolderId;
+        const parentMap = /* @__PURE__ */ new Map();
+        const itemsById = /* @__PURE__ */ new Map();
+        for (const stat of remote2) {
+          if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
+            continue;
+          try {
+            const raw = await this.plugin.api.getItem(stat.name);
+            if (!raw)
+              continue;
+            const item = this.serializer.unserialize(raw);
+            itemsById.set(item.id, { type: item.type_, parent: item.parent_id ?? "", name: stat.name });
+            if (item.parent_id)
+              parentMap.set(item.id, item.parent_id);
+          } catch {
+          }
+        }
+        const belongsToRoot = (id, rootId2) => {
+          if (!rootId2)
+            return true;
+          let pid = parentMap.get(id) ?? itemsById.get(id)?.parent ?? "";
+          if (!pid)
+            return false;
+          const visited = /* @__PURE__ */ new Set();
+          let depth = 0;
+          while (pid && !visited.has(pid) && depth < 64) {
+            visited.add(pid);
+            if (pid === rootId2)
+              return true;
+            const next = parentMap.get(pid) ?? itemsById.get(pid)?.parent;
+            if (!next || next === pid)
+              return false;
+            pid = next;
+            depth++;
+          }
+          return false;
+        };
         for (const stat of remote2) {
           if (stat.name === "info.json") {
             skipped++;
@@ -2659,22 +2694,22 @@ var SyncEngine = class {
           const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
           if (noteMatch) {
             const id = noteMatch[1];
-            if (id === protectedRootId) {
+            if (id === rootId) {
               skipped++;
               continue;
             }
-            const entry = this.plugin.mapping.getById(id);
-            if (entry?.type === 9 /* MasterKey */ || masterKeyIds.has(id)) {
+            const meta = itemsById.get(id);
+            if (meta?.type === 9 /* MasterKey */ || masterKeyIds.has(id)) {
               skipped++;
               continue;
             }
-            if (!ownedIds.has(id)) {
+            if (!belongsToRoot(id, rootId)) {
               skipped++;
               continue;
             }
           } else {
             const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
-            if (resMatch && !ownedIds.has(resMatch[1])) {
+            if (resMatch && !belongsToRoot(resMatch[1], rootId)) {
               skipped++;
               continue;
             }
@@ -2687,7 +2722,7 @@ var SyncEngine = class {
           }
         }
         this.plugin.mapping.clearAll();
-        console.debug("[joplin-sync] force push reset: wiped " + wiped + " items, kept " + skipped + " (info.json/master keys/foreign items)");
+        console.debug("[joplin-sync] force push reset: wiped " + wiped + " items, kept " + skipped + " (info.json/master keys/foreign vaults)");
       }
       const pushedNoteIds = /* @__PURE__ */ new Set();
       const pushedFolderIds = /* @__PURE__ */ new Set();
@@ -2954,9 +2989,9 @@ var SyncEngine = class {
           }
         } else {
           const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
-          if (resMatch && !this.plugin.settings.syncFoldersOnly && ownedIds.has(resMatch[1])) {
+          if (resMatch && !this.plugin.settings.syncFoldersOnly) {
             const id = resMatch[1];
-            if (!pushedResourceIds.has(id)) {
+            if (!pushedResourceIds.has(id) && await isOwnChain(id)) {
               try {
                 await this.plugin.api.deleteItem(stat.name);
                 removed++;
@@ -3036,6 +3071,7 @@ var SyncEngine = class {
         return;
       }
       await this.enableE2EE();
+      await this.ensureRootFolder();
       this.plugin.mapping.clearAll();
       const adapter = this.plugin.app.vault.adapter;
       const isKept = (p) => this.shouldExclude(p);

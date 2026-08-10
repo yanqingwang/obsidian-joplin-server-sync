@@ -469,38 +469,66 @@ export class SyncEngine {
 
       const rootFolderId = await this.ensureRootFolder();
       const files = this.collectMarkdownFiles();
-      // Items this vault owns (mapping BEFORE clearAll). reset and cleanup
-      // only ever delete these — other vaults sharing the server are
-      // preserved (C1).
-      const ownedIds = new Set(this.plugin.mapping.all().map(e => e.joplinId));
 
-      // ---- True-overwrite reset: delete EVERYTHING on the server first ----
-      // (except info.json and master-key items, which are infra, not content).
-      // This guarantees a clean slate: no stale/orphan/duplicate items remain
-      // from previous partial syncs (which accumulated 2000+ items on the
-      // test server while the vault only had ~30 files).
+      // ---- True-overwrite reset: delete THIS VAULT's server items first ----
+      // Root-isolated (V-5): only items whose parent chain reaches OUR root
+      // folder (`_vault_<name>`) are deleted. Other vaults' roots and their
+      // subtrees are preserved — never rely on the local mapping (ownedIds)
+      // for ownership, because a polluted/historic mapping can contain other
+      // vaults' ids (which would make this reset delete them).
       {
         const remote = await this.listAllRemoteItems();
         let wiped = 0, skipped = 0;
         console.debug('[joplin-sync] force push reset: scanning ' + remote.length + ' remote items');
-        // Master keys are NOT in the mapping (enableE2EE only caches their id),
-        // so protect them explicitly — deleting them would break E2EE for all
-        // synced clients (they could no longer decrypt server-stored data).
         const masterKeyIds = new Set(this.plugin.e2ee.availableMasterKeys);
         if (this.plugin.mapping.e2eeMasterKeyId) masterKeyIds.add(this.plugin.mapping.e2eeMasterKeyId);
-        const protectedRootId = this.plugin.mapping.rootFolderId;
+        const rootId = this.plugin.mapping.rootFolderId;
+        // Read item contents to build parent chains for root isolation.
+        const parentMap = new Map<string, string>();
+        const itemsById = new Map<string, { type: ModelType; parent: string; name: string }>();
+        for (const stat of remote) {
+          if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
+          try {
+            const raw = await this.plugin.api.getItem(stat.name);
+            if (!raw) continue;
+            const item = this.serializer.unserialize(raw);
+            itemsById.set(item.id, { type: item.type_, parent: item.parent_id ?? '', name: stat.name });
+            if (item.parent_id) parentMap.set(item.id, item.parent_id);
+          } catch { /* skip unreadable */ }
+        }
+        const belongsToRoot = (id: string, rootId: string): boolean => {
+          if (!rootId) return true;
+          let pid = parentMap.get(id) ?? itemsById.get(id)?.parent ?? '';
+          if (!pid) return false;
+          const visited = new Set<string>();
+          let depth = 0;
+          while (pid && !visited.has(pid) && depth < 64) {
+            visited.add(pid);
+            if (pid === rootId) return true;
+            const next = parentMap.get(pid) ?? itemsById.get(pid)?.parent;
+            if (!next || next === pid) return false;
+            pid = next;
+            depth++;
+          }
+          return false;
+        };
         for (const stat of remote) {
           if (stat.name === 'info.json') { skipped++; continue; }
           const noteMatch = stat.name.match(/^([0-9a-f]{32})\.md$/);
           if (noteMatch) {
             const id = noteMatch[1];
-            if (id === protectedRootId) { skipped++; continue; }
-            const entry = this.plugin.mapping.getById(id);
-            if (entry?.type === ModelType.MasterKey || masterKeyIds.has(id)) { skipped++; continue; }
-            if (!ownedIds.has(id)) { skipped++; continue; } // foreign vault item
+            if (id === rootId) { skipped++; continue; } // keep our own root
+            const meta = itemsById.get(id);
+            if (meta?.type === ModelType.MasterKey || masterKeyIds.has(id)) { skipped++; continue; }
+            // Delete only items under OUR root subtree; other `_vault_*`
+            // roots and their content are foreign and must stay (V-5).
+            if (!belongsToRoot(id, rootId)) { skipped++; continue; }
           } else {
+            // Resource blobs: keep only when the corresponding meta belongs
+            // to our root; blobs themselves carry no parent — decide via the
+            // meta id (`.resource/<id>` = meta `<id>.md`).
             const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
-            if (resMatch && !ownedIds.has(resMatch[1])) { skipped++; continue; } // foreign blob
+            if (resMatch && !belongsToRoot(resMatch[1], rootId)) { skipped++; continue; }
           }
           try { await this.plugin.api.deleteItem(stat.name); wiped++; }
           catch (e: unknown) {
@@ -509,7 +537,7 @@ export class SyncEngine {
         }
         // Clear local mapping so re-upload creates fresh IDs for everything.
         this.plugin.mapping.clearAll();
-        console.debug('[joplin-sync] force push reset: wiped ' + wiped + ' items, kept ' + skipped + ' (info.json/master keys/foreign items)');
+        console.debug('[joplin-sync] force push reset: wiped ' + wiped + ' items, kept ' + skipped + ' (info.json/master keys/foreign vaults)');
       }
 
       // IDs we actually push this run. Anything left on the server that is
@@ -753,11 +781,13 @@ export class SyncEngine {
           }
         } else {
           // resource blob: cleanup orphans so the server stays in sync —
-          // but only blobs we owned before this push (C1).
+          // but only blobs whose meta belongs to OUR root (C1/V-5).
           const resMatch = stat.name.match(/^\.resource\/([0-9a-f]{32})$/);
-          if (resMatch && !this.plugin.settings.syncFoldersOnly && ownedIds.has(resMatch[1])) {
+          if (resMatch && !this.plugin.settings.syncFoldersOnly) {
             const id = resMatch[1];
-            if (!pushedResourceIds.has(id)) { try { await this.plugin.api.deleteItem(stat.name); removed++; } catch { /* ignore */ } }
+            if (!pushedResourceIds.has(id) && (await isOwnChain(id))) {
+              try { await this.plugin.api.deleteItem(stat.name); removed++; } catch { /* ignore */ }
+            }
           }
         }
       }
@@ -834,6 +864,11 @@ export class SyncEngine {
         return;
       }
       await this.enableE2EE();
+      // Refresh the vault root BEFORE clearing the mapping: a same-name
+      // second end must rediscover the server's `_vault_<name>` root (F-03),
+      // otherwise its stale rootFolderId filters out every note/folder as
+      // foreign and the pull comes back empty.
+      await this.ensureRootFolder();
       this.plugin.mapping.clearAll();
 
       // Delete ALL files and folders except config + excluded dirs

@@ -36,7 +36,6 @@ export enum EncryptionMethod {
 
 const HEADER_IDENTIFIER = 'JED01';
 const GCM_TAG_BITS = 128;
-const GCM_TAG_BYTES = 16;
 const NONCE_BYTES = 12;
 const KEY_BYTES = 32;
 const SALT_BYTES = 16;
@@ -57,7 +56,7 @@ const CHUNK_SIZES: Record<number, number> = {
 
 interface EncryptedHeader {
   version: number;
-  method: number;
+  method: EncryptionMethod;
   masterKeyId: string;
 }
 
@@ -207,7 +206,7 @@ export class EncryptionService {
   /** Encrypt binary data → ArrayBuffer (JED01 cipher text bytes, for direct upload). */
   async encryptBlobData(data: ArrayBuffer, masterKeyId: string): Promise<ArrayBuffer> {
     const hex = await this.encryptBlob(data, masterKeyId);
-    return new TextEncoder().encode(hex).buffer as ArrayBuffer;
+    return new TextEncoder().encode(hex).buffer;
   }
 
   /** Decrypt a JED01 cipher text blob (ArrayBuffer from server) → plaintext ArrayBuffer. */
@@ -353,7 +352,7 @@ export class EncryptionService {
     if (isNaN(mdSize) || !mdSize) throw new Error('Invalid E2EE header metadata size: ' + mdSizeHex);
     const md = ct.slice(HEADER_IDENTIFIER.length + 6, HEADER_IDENTIFIER.length + 6 + mdSize);
     // md layout: [2-hex method][32-hex masterKeyId]
-    const method = parseInt(md.slice(0, 2), 16);
+    const method = parseInt(md.slice(0, 2), 16) as EncryptionMethod;
     const masterKeyId = md.slice(2, 34);
     if (masterKeyId.length !== 32) throw new Error('Invalid E2EE header master key ID size');
     return { version: 1, method, masterKeyId };
@@ -429,7 +428,7 @@ export class EncryptionService {
   private buf(u8: Uint8Array): Uint8Array<ArrayBuffer> {
     const out = new Uint8Array(u8.byteLength);
     out.set(u8);
-    return new Uint8Array(out.buffer) as Uint8Array<ArrayBuffer>;
+    return new Uint8Array(out.buffer);
   }
 
   get hasLoadedKeys(): boolean { return this.masterKeyPlainTexts.size > 0; }

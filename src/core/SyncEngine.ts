@@ -33,8 +33,7 @@ export class SyncEngine {
   resources!: ResourceManager;
 
   private get configDir(): string {
-    const vault = this.plugin.app.vault as unknown as { configDir?: string };
-    return vault.configDir ?? '.obsidian';
+    return this.plugin.app.vault.configDir ?? '.obsidian';
   }
 
   constructor(private plugin: JoplinSyncPlugin) {
@@ -78,7 +77,7 @@ export class SyncEngine {
             e2ee.feedMasterKey(item);
             await e2ee.loadMasterKey(cachedId, pw);
             cachedOk = true;
-            console.log('[joplin-sync] E2EE cached key ' + cachedId + ' loaded');
+            console.debug('[joplin-sync] E2EE cached key ' + cachedId + ' loaded');
           }
         }
       } catch (e: unknown) {
@@ -104,20 +103,31 @@ export class SyncEngine {
     if (!anyLoaded && mkIds.length === 0) {
       const mkId = createJoplinId();
       const mk = await e2ee.generateMasterKey(pw, mkId);
-      await this.plugin.api.putItem(mkId + '.md', this.serializer.serialize({
-        id: mkId, type_: ModelType.MasterKey, content: mk.encryptedContent, encryption_cipher_text: '', encryption_applied: 0,
-      } as any), true);
-      e2ee.feedMasterKey({ id: mkId, type_: 9, content: mk.encryptedContent } as any);
+      const mkItem: JoplinItem = {
+        id: mkId,
+        parent_id: '',
+        title: '',
+        created_time: Date.now(),
+        updated_time: Date.now(),
+        user_created_time: Date.now(),
+        user_updated_time: Date.now(),
+        type_: ModelType.MasterKey,
+        encryption_applied: 0,
+        encryption_cipher_text: '',
+        content: mk.encryptedContent,
+      };
+      await this.plugin.api.putItem(mkId + '.md', this.serializer.serialize(mkItem), true);
+      e2ee.feedMasterKey(mkItem);
       try { await e2ee.loadMasterKey(mkId, pw); anyLoaded = true; } catch { /* ignore */ }
       this.plugin.mapping.setE2eeMasterKeyId(mkId);
       // Mark the sync target as E2EE-enabled for cross-client visibility.
       try { await this.plugin.api.putItem('info.json', JSON.stringify({ version: 3, e2ee: { value: true } })); } catch { /* best effort */ }
-      console.log('[joplin-sync] E2EE: generated + uploaded first master key ' + mkId);
+      console.debug('[joplin-sync] E2EE: generated + uploaded first master key ' + mkId);
     } else if (!anyLoaded && mkIds.length > 0) {
       new Notice('E2EE password is wrong — none of the ' + mkIds.length + ' server master keys could be decrypted. Check the password.');
     }
     this.e2eeActive = anyLoaded;
-    if (anyLoaded) console.log('[joplin-sync] E2EE active with ' + e2ee.availableMasterKeys.length + ' master key(s)');
+    if (anyLoaded) console.debug('[joplin-sync] E2EE active with ' + e2ee.availableMasterKeys.length + ' master key(s)');
     return anyLoaded;
   }
 
@@ -402,7 +412,7 @@ export class SyncEngine {
       joplinId: id, path: title + '/', type: ModelType.Folder,
       localHash: '', remoteUpdatedTime: now, syncedAt: now,
     });
-    console.log('[joplin-sync] root folder created: ' + title + ' (' + id + ')');
+    console.debug('[joplin-sync] root folder created: ' + title + ' (' + id + ')');
     return id;
   }
 

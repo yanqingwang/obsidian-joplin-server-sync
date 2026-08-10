@@ -4,8 +4,6 @@ import { JoplinSerializer } from '../convert/JoplinSerializer';
 import { ModelType, JoplinItem } from '../api/models';
 import { createJoplinId } from '../mapping/IdGenerator';
 import { sha256, chunk } from './SyncEngine';
-import { stampFrontmatter } from './FileIdentity';
-import { safeFileName } from './pathUtil';
 
 /**
  * First-sync = full bidirectional reconciliation, NOT "upload + jump cursor".

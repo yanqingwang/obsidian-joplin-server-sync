@@ -1326,7 +1326,6 @@ var LocalPusher = class {
     const existing = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(path);
     if (!force && existing && existing.localHash === hash && existing.path === path)
       return "none";
-    const moved = existing && existing.path !== path;
     const isNew = !existing;
     const id = existing?.joplinId ?? fileId;
     let base = {};
@@ -2178,8 +2177,7 @@ var SyncEngine = class {
     this.resources = new ResourceManager(plugin);
   }
   get configDir() {
-    const vault = this.plugin.app.vault;
-    return vault.configDir ?? ".obsidian";
+    return this.plugin.app.vault.configDir ?? ".obsidian";
   }
   /**
    * Provision + load the E2EE master key so the live sync path can encrypt.
@@ -2217,7 +2215,7 @@ var SyncEngine = class {
             e2ee.feedMasterKey(item);
             await e2ee.loadMasterKey(cachedId, pw);
             cachedOk = true;
-            console.log("[joplin-sync] E2EE cached key " + cachedId + " loaded");
+            console.debug("[joplin-sync] E2EE cached key " + cachedId + " loaded");
           }
         }
       } catch (e) {
@@ -2237,14 +2235,21 @@ var SyncEngine = class {
     if (!anyLoaded && mkIds.length === 0) {
       const mkId = createJoplinId();
       const mk = await e2ee.generateMasterKey(pw, mkId);
-      await this.plugin.api.putItem(mkId + ".md", this.serializer.serialize({
+      const mkItem = {
         id: mkId,
+        parent_id: "",
+        title: "",
+        created_time: Date.now(),
+        updated_time: Date.now(),
+        user_created_time: Date.now(),
+        user_updated_time: Date.now(),
         type_: 9 /* MasterKey */,
-        content: mk.encryptedContent,
+        encryption_applied: 0,
         encryption_cipher_text: "",
-        encryption_applied: 0
-      }), true);
-      e2ee.feedMasterKey({ id: mkId, type_: 9, content: mk.encryptedContent });
+        content: mk.encryptedContent
+      };
+      await this.plugin.api.putItem(mkId + ".md", this.serializer.serialize(mkItem), true);
+      e2ee.feedMasterKey(mkItem);
       try {
         await e2ee.loadMasterKey(mkId, pw);
         anyLoaded = true;
@@ -2255,13 +2260,13 @@ var SyncEngine = class {
         await this.plugin.api.putItem("info.json", JSON.stringify({ version: 3, e2ee: { value: true } }));
       } catch {
       }
-      console.log("[joplin-sync] E2EE: generated + uploaded first master key " + mkId);
+      console.debug("[joplin-sync] E2EE: generated + uploaded first master key " + mkId);
     } else if (!anyLoaded && mkIds.length > 0) {
       new import_obsidian9.Notice("E2EE password is wrong \u2014 none of the " + mkIds.length + " server master keys could be decrypted. Check the password.");
     }
     this.e2eeActive = anyLoaded;
     if (anyLoaded)
-      console.log("[joplin-sync] E2EE active with " + e2ee.availableMasterKeys.length + " master key(s)");
+      console.debug("[joplin-sync] E2EE active with " + e2ee.availableMasterKeys.length + " master key(s)");
     return anyLoaded;
   }
   /** Find existing MasterKey items (type_=9) on the server. */
@@ -2575,7 +2580,7 @@ var SyncEngine = class {
       remoteUpdatedTime: now,
       syncedAt: now
     });
-    console.log("[joplin-sync] root folder created: " + title + " (" + id + ")");
+    console.debug("[joplin-sync] root folder created: " + title + " (" + id + ")");
     return id;
   }
   async forcePush() {

@@ -7,7 +7,6 @@ import { ModelType, JoplinItem } from '../api/models';
 import { sha256 } from './SyncEngine';
 import { ResourceManager } from '../resource/ResourceManager';
 import { ConflictResolver } from './ConflictResolver';
-import type { VaultWatcher } from '../vault/VaultWatcher';
 
 export class LocalPusher {
   private serializer = new JoplinSerializer();
@@ -68,7 +67,6 @@ export class LocalPusher {
     // rename leaves content identical but changes parent_id/title, which the
     // server must reflect — so only skip when the mapped path also matches.
     if (!force && existing && existing.localHash === hash && existing.path === path) return 'none';
-    const moved = existing && existing.path !== path;
 
     const isNew = !existing;
     const id = existing?.joplinId ?? fileId;

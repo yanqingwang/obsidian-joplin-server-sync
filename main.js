@@ -3139,23 +3139,40 @@ var SyncEngine = class {
       }
       this.plugin.mapping.setDeltaCursor("");
       console.debug("[joplin-sync] force pull: deleted " + delCount + " files, " + delDirCount + " dirs");
+      console.debug("[joplin-sync] force pull: listing remote items...");
       const remoteStats = await this.listAllRemoteItems();
+      console.debug("[joplin-sync] force pull: listed " + remoteStats.length + " remote items");
       const e2ee = this.plugin.e2ee;
       let done = 0;
       let failed = 0;
       let skipped = 0;
       const allItems = [];
-      for (const stat of remoteStats) {
-        if (!/^[0-9a-f]{32}\.md$/.test(stat.name))
-          continue;
-        if (stat.name.startsWith(".resource/"))
-          continue;
-        try {
-          const raw = await this.plugin.api.getItem(stat.name);
-          if (!raw)
+      const allowedPullTypes = /* @__PURE__ */ new Set([1 /* Note */, 2 /* Folder */, 4 /* Resource */, 9 /* MasterKey */]);
+      const readStats = remoteStats.filter(
+        (s) => /^[0-9a-f]{32}\.md$/.test(s.name) && !s.name.startsWith(".resource/")
+      );
+      console.debug("[joplin-sync] force pull: reading " + readStats.length + " item contents in batches of 5...");
+      let batchNum = 0;
+      for (const batch of chunk(readStats, 5)) {
+        batchNum++;
+        if (batchNum % 20 === 0)
+          console.debug("[joplin-sync] force pull: read batch " + batchNum + "/" + Math.ceil(readStats.length / 5) + " (" + allItems.length + " items so far)");
+        const results = await Promise.all(batch.map(async (stat) => {
+          try {
+            const raw = await this.plugin.api.getItem(stat.name);
+            if (!raw)
+              return null;
+            return this.serializer.unserialize(raw);
+          } catch (e) {
+            failed++;
+            if (failed <= 3)
+              console.error("[joplin-sync] force-pull read:", stat.name, e);
+            return null;
+          }
+        }));
+        for (const item of results) {
+          if (!item)
             continue;
-          const item = this.serializer.unserialize(raw);
-          const allowedPullTypes = /* @__PURE__ */ new Set([1 /* Note */, 2 /* Folder */, 4 /* Resource */, 9 /* MasterKey */]);
           if (!allowedPullTypes.has(item.type_))
             continue;
           if (item.type_ === 9 /* MasterKey */) {
@@ -3171,15 +3188,10 @@ var SyncEngine = class {
               }
             } catch {
               failed++;
-              continue;
             }
           } else {
             allItems.push(item);
           }
-        } catch (e) {
-          failed++;
-          if (failed <= 3)
-            console.error("[joplin-sync] force-pull:", stat.name, e);
         }
       }
       const preFolders = allItems.filter((i) => i.type_ === 2 /* Folder */);
@@ -3236,106 +3248,100 @@ var SyncEngine = class {
         }
       }
       const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
+      console.debug("[joplin-sync] force pull: build paths for " + folders.length + " folders");
       this.buildForcePullFolderPaths(folders);
+      console.debug("[joplin-sync] force pull: paths built, creating folders");
       const pullRootId = this.plugin.mapping.rootFolderId;
+      const foldersByDepth = /* @__PURE__ */ new Map();
       for (const f of folders) {
-        if (!f.title) {
-          skipped++;
-          continue;
-        }
-        if (f.id === pullRootId) {
-          this.plugin.mapping.upsert({
-            joplinId: f.id,
-            path: "",
-            type: 2 /* Folder */,
-            localHash: "",
-            remoteUpdatedTime: f.updated_time,
-            syncedAt: Date.now()
-          });
-          continue;
-        }
-        try {
-          const parentPath = this.resolveForcePullFolderPath(f.parent_id);
-          const dirName = safeFileName(f.title);
-          const dirPath = parentPath + dirName;
-          if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
-            await this.plugin.app.vault.createFolder(dirPath).catch(() => {
+        if (!f.title || f.id === pullRootId) {
+          if (f.id === pullRootId) {
+            this.plugin.mapping.upsert({
+              joplinId: f.id,
+              path: "",
+              type: 2 /* Folder */,
+              localHash: "",
+              remoteUpdatedTime: f.updated_time,
+              syncedAt: Date.now()
             });
           }
-          this.plugin.mapping.upsert({
-            joplinId: f.id,
-            path: dirPath + "/",
-            type: 2 /* Folder */,
-            localHash: "",
-            remoteUpdatedTime: f.updated_time,
-            syncedAt: Date.now()
-          });
-        } catch (e) {
-          console.warn("[joplin-sync] force-pull folder:", f.title, e instanceof Error ? e.message : String(e));
+          continue;
+        }
+        const depth = this.resolveForcePullFolderPath(f.parent_id).split("/").filter(Boolean).length;
+        if (!foldersByDepth.has(depth))
+          foldersByDepth.set(depth, []);
+        foldersByDepth.get(depth).push(f);
+      }
+      const sortedDepths = [...foldersByDepth.keys()].sort((a, b) => a - b);
+      for (const depth of sortedDepths) {
+        const levelFolders = foldersByDepth.get(depth);
+        for (const batch of chunk(levelFolders, 5)) {
+          await Promise.all(batch.map(async (f) => {
+            try {
+              const parentPath = this.resolveForcePullFolderPath(f.parent_id);
+              const dirName = safeFileName(f.title);
+              const dirPath = parentPath + dirName;
+              if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+                await this.plugin.app.vault.createFolder(dirPath).catch(() => {
+                });
+              }
+              this.plugin.mapping.upsert({
+                joplinId: f.id,
+                path: dirPath + "/",
+                type: 2 /* Folder */,
+                localHash: "",
+                remoteUpdatedTime: f.updated_time,
+                syncedAt: Date.now()
+              });
+            } catch (e) {
+              console.warn("[joplin-sync] force-pull folder:", f.title, e instanceof Error ? e.message : String(e));
+            }
+          }));
         }
       }
       const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
       const usedPaths = /* @__PURE__ */ new Set();
-      for (const item of notes) {
-        if (!item.title) {
-          skipped++;
-          continue;
-        }
-        try {
-          const dir = this.resolveForcePullFolderPath(item.parent_id);
-          const sanitized = safeFileName(item.title);
-          let path = dir + sanitized + ".md";
-          if (usedPaths.has(path)) {
-            path = dir + sanitized + " (" + item.id.slice(0, 7) + ").md";
-          }
-          usedPaths.add(path);
-          let body = item.body ?? "";
-          if (e2ee.isEncrypted(item)) {
-            try {
-              const ds = await e2ee.decryptItem(item);
-              if (ds) {
-                const d = this.serializer.unserialize(ds);
-                body = d.body ?? "";
+      for (const batch of chunk(notes, 5)) {
+        await Promise.all(batch.map(async (item) => {
+          if (!item.title)
+            return;
+          try {
+            const dir = this.resolveForcePullFolderPath(item.parent_id);
+            const sanitized = safeFileName(item.title);
+            let path = dir + sanitized + ".md";
+            if (usedPaths.has(path)) {
+              path = dir + sanitized + " (" + item.id.slice(0, 7) + ").md";
+            }
+            usedPaths.add(path);
+            if (dir && !this.plugin.app.vault.getAbstractFileByPath(dir.replace(/\/$/, ""))) {
+              try {
+                await this.plugin.app.vault.createFolder(dir.replace(/\/$/, ""));
+              } catch {
               }
-            } catch {
-              failed++;
-              continue;
             }
-          }
-          if (dir && !this.plugin.app.vault.getAbstractFileByPath(dir.replace(/\/$/, ""))) {
-            try {
-              await this.plugin.app.vault.createFolder(dir.replace(/\/$/, ""));
-            } catch {
+            const existing = this.plugin.app.vault.getAbstractFileByPath(path);
+            const stamped = stampFrontmatter(item.body || "", item.id);
+            if (existing instanceof import_obsidian9.TFile) {
+              await this.plugin.app.vault.modify(existing, stamped);
+            } else if (!existing) {
+              await this.plugin.app.vault.create(path, stamped);
             }
+            const hash = await sha256(stamped);
+            this.plugin.mapping.upsert({
+              joplinId: item.id,
+              path,
+              type: 1 /* Note */,
+              localHash: hash,
+              remoteUpdatedTime: item.updated_time,
+              syncedAt: Date.now()
+            });
+            done++;
+          } catch (e) {
+            failed++;
+            if (failed <= 3)
+              console.error("[joplin-sync] force-pull note:", item.title, e instanceof Error ? e.message : String(e));
           }
-          const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-          const stamped = stampFrontmatter(body || "", item.id);
-          if (existing instanceof import_obsidian9.TFile) {
-            await this.plugin.app.vault.modify(existing, stamped);
-          } else if (!existing) {
-            await this.plugin.app.vault.create(path, stamped);
-          }
-          const hash = await sha256(stamped);
-          this.plugin.mapping.upsert({
-            joplinId: item.id,
-            path,
-            type: 1 /* Note */,
-            localHash: hash,
-            remoteUpdatedTime: item.updated_time,
-            syncedAt: Date.now()
-          });
-          done++;
-        } catch (e) {
-          failed++;
-          const msg = e instanceof Error ? e.message : String(e);
-          if (msg.includes("401"))
-            try {
-              await this.plugin.api.login(true);
-            } catch {
-            }
-          if (failed <= 3)
-            console.error("[joplin-sync] force-pull:", item.title, msg);
-        }
+        }));
         this.plugin.statusBar.setProgress(done, notes.length, "pull");
       }
       let cursor;
@@ -3495,12 +3501,15 @@ var SyncEngine = class {
   async listAllRemoteItems() {
     const out = [];
     let cursor;
+    let pageNum = 0;
     while (true) {
+      pageNum++;
       const page = await this.plugin.api.listChildrenOf("", cursor);
       for (const it of page.items) {
         out.push(it);
       }
       cursor = page.cursor;
+      console.debug("[joplin-sync] listAllRemoteItems: page " + pageNum + " (" + page.items.length + " items, total " + out.length + ", has_more=" + page.has_more + ")");
       if (!page.has_more)
         break;
       if (!cursor)

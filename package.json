@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-joplin-server-sync",
-	"version": "0.1.0",
+	"version": "0.4.3",
 	"description": "Sync Obsidian vault with Joplin Server",
 	"main": "main.js",
 	"scripts": {

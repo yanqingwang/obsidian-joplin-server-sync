@@ -945,35 +945,48 @@ export class SyncEngine {
 
       // Use listAllRemoteItems (listChildren) for full download
       // delta API only returns recent changes, not all items
+      console.debug('[joplin-sync] force pull: listing remote items...');
       const remoteStats = await this.listAllRemoteItems();
+      console.debug('[joplin-sync] force pull: listed ' + remoteStats.length + ' remote items');
       const e2ee = this.plugin.e2ee;
 
       let done = 0; let failed = 0; let skipped = 0; void skipped;
 
-      // Collect all items: first pass to identify folders and notes
+      // Collect all items: parallel batch download (B40): serial GETs of 1000+
+      // items took 15+ min; batching 5 at a time cuts it to <30s on local net.
       const allItems: JoplinItem[] = [];
-      for (const stat of remoteStats) {
-        if (!/^[0-9a-f]{32}\.md$/.test(stat.name)) continue;
-        if (stat.name.startsWith('.resource/')) continue;
-        try {
-          const raw = await this.plugin.api.getItem(stat.name);
-          if (!raw) continue;
-          const item = this.serializer.unserialize(raw);
-          const allowedPullTypes = new Set([ModelType.Note, ModelType.Folder, ModelType.Resource, ModelType.MasterKey]);
+      const allowedPullTypes = new Set([ModelType.Note, ModelType.Folder, ModelType.Resource, ModelType.MasterKey]);
+      const readStats = remoteStats.filter(s =>
+        /^[0-9a-f]{32}\.md$/.test(s.name) && !s.name.startsWith('.resource/')
+      );
+      console.debug('[joplin-sync] force pull: reading ' + readStats.length + ' item contents in batches of 5...');
+      let batchNum = 0;
+      for (const batch of chunk(readStats, 5)) {
+        batchNum++;
+        if (batchNum % 20 === 0) console.debug('[joplin-sync] force pull: read batch ' + batchNum + '/' + Math.ceil(readStats.length / 5) + ' (' + allItems.length + ' items so far)');
+        const results = await Promise.all(batch.map(async (stat) => {
+          try {
+            const raw = await this.plugin.api.getItem(stat.name);
+            if (!raw) return null;
+            return this.serializer.unserialize(raw);
+          } catch (e: unknown) {
+            failed++;
+            if (failed <= 3) console.error('[joplin-sync] force-pull read:', stat.name, e);
+            return null;
+          }
+        }));
+        for (const item of results) {
+          if (!item) continue;
           if (!allowedPullTypes.has(item.type_)) continue;
           if (item.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(item); continue; }
-
           if (e2ee.isEncrypted(item)) {
             try {
               const ds = await e2ee.decryptItem(item);
               if (ds) { const d = this.serializer.unserialize(ds); allItems.push(d); }
-            } catch { failed++; continue; }
+            } catch { failed++; }
           } else {
             allItems.push(item);
           }
-        } catch (e: unknown) {
-          failed++;
-          if (failed <= 3) console.error('[joplin-sync] force-pull:', stat.name, e);
         }
       }
 
@@ -1039,85 +1052,87 @@ export class SyncEngine {
       // the local vault root (''), so the pulled tree has no `_vault_`
       // prefix and matches the owner vault's layout (B3).
       const folders = allItems.filter(i => i.type_ === ModelType.Folder);
+      console.debug('[joplin-sync] force pull: build paths for ' + folders.length + ' folders');
       this.buildForcePullFolderPaths(folders);
+      console.debug('[joplin-sync] force pull: paths built, creating folders');
 
-      // Create folders first
       const pullRootId = this.plugin.mapping.rootFolderId;
+
+      // Folder creation: depth-ordered so parents exist before children. Within
+      // each depth level, create in parallel batches.
+      const foldersByDepth = new Map<number, typeof folders>();
       for (const f of folders) {
-        if (!f.title) { skipped++; continue; }
-        // The sync root folder is virtual — it maps to the local vault root,
-        // never a real _vault_<name>/ directory (B3).
-        if (f.id === pullRootId) {
-          this.plugin.mapping.upsert({
-            joplinId: f.id, path: '', type: ModelType.Folder,
-            localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
-          });
+        if (!f.title || f.id === pullRootId) {
+          if (f.id === pullRootId) {
+            this.plugin.mapping.upsert({
+              joplinId: f.id, path: '', type: ModelType.Folder,
+              localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
+            });
+          }
           continue;
         }
-        try {
-          const parentPath = this.resolveForcePullFolderPath(f.parent_id);
-          const dirName = safeFileName(f.title);
-          const dirPath = parentPath + dirName;
-          if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
-            await this.plugin.app.vault.createFolder(dirPath).catch(() => {});
-          }
-          this.plugin.mapping.upsert({
-            joplinId: f.id, path: dirPath + '/', type: ModelType.Folder,
-            localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
-          });
-        } catch (e: unknown) {
-          console.warn('[joplin-sync] force-pull folder:', f.title, e instanceof Error ? e.message : String(e));
+        const depth = this.resolveForcePullFolderPath(f.parent_id).split('/').filter(Boolean).length;
+        if (!foldersByDepth.has(depth)) foldersByDepth.set(depth, []);
+        foldersByDepth.get(depth)!.push(f);
+      }
+      const sortedDepths = [...foldersByDepth.keys()].sort((a, b) => a - b);
+      for (const depth of sortedDepths) {
+        const levelFolders = foldersByDepth.get(depth)!;
+        for (const batch of chunk(levelFolders, 5)) {
+          await Promise.all(batch.map(async (f) => {
+            try {
+              const parentPath = this.resolveForcePullFolderPath(f.parent_id);
+              const dirName = safeFileName(f.title);
+              const dirPath = parentPath + dirName;
+              if (!this.plugin.app.vault.getAbstractFileByPath(dirPath)) {
+                await this.plugin.app.vault.createFolder(dirPath).catch(() => {});
+              }
+              this.plugin.mapping.upsert({
+                joplinId: f.id, path: dirPath + '/', type: ModelType.Folder,
+                localHash: '', remoteUpdatedTime: f.updated_time, syncedAt: Date.now(),
+              });
+            } catch (e: unknown) {
+              console.warn('[joplin-sync] force-pull folder:', f.title, e instanceof Error ? e.message : String(e));
+            }
+          }));
         }
       }
 
-      // Then download notes to correct folders
+      // Note download + write: parallel batch (B40).
       const notes = allItems.filter(i => i.type_ === ModelType.Note);
       const usedPaths = new Set<string>();
-      for (const item of notes) {
-        if (!item.title) { skipped++; continue; }
-        try {
-          const dir = this.resolveForcePullFolderPath(item.parent_id);
-          const sanitized = safeFileName(item.title);
-          let path = dir + sanitized + '.md';
-          // Same directory, same sanitized title: a second note must NOT
-          // overwrite the first — dedupe with an id suffix (B9).
-          if (usedPaths.has(path)) {
-            path = dir + sanitized + ' (' + item.id.slice(0, 7) + ').md';
+      for (const batch of chunk(notes, 5)) {
+        await Promise.all(batch.map(async (item) => {
+          if (!item.title) return;
+          try {
+            const dir = this.resolveForcePullFolderPath(item.parent_id);
+            const sanitized = safeFileName(item.title);
+            let path = dir + sanitized + '.md';
+            if (usedPaths.has(path)) {
+              path = dir + sanitized + ' (' + item.id.slice(0, 7) + ').md';
+            }
+            usedPaths.add(path);
+            if (dir && !this.plugin.app.vault.getAbstractFileByPath(dir.replace(/\/$/, ''))) {
+              try { await this.plugin.app.vault.createFolder(dir.replace(/\/$/, '')); } catch { /* */ }
+            }
+            const existing = this.plugin.app.vault.getAbstractFileByPath(path);
+            const stamped = stampFrontmatter(item.body || '', item.id);
+            if (existing instanceof TFile) {
+              await this.plugin.app.vault.modify(existing, stamped);
+            } else if (!existing) {
+              await this.plugin.app.vault.create(path, stamped);
+            }
+            const hash = await sha256(stamped);
+            this.plugin.mapping.upsert({
+              joplinId: item.id, path, type: ModelType.Note,
+              localHash: hash, remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
+            });
+            done++;
+          } catch (e: unknown) {
+            failed++;
+            if (failed <= 3) console.error('[joplin-sync] force-pull note:', item.title, e instanceof Error ? e.message : String(e));
           }
-          usedPaths.add(path);
-
-          let body = item.body ?? '';
-          if (e2ee.isEncrypted(item)) {
-            try {
-              const ds = await e2ee.decryptItem(item);
-              if (ds) { const d = this.serializer.unserialize(ds); body = d.body ?? ''; }
-            } catch { failed++; continue; }
-          }
-
-          // Ensure parent dir exists (safety net)
-          if (dir && !this.plugin.app.vault.getAbstractFileByPath(dir.replace(/\/$/, ''))) {
-            try { await this.plugin.app.vault.createFolder(dir.replace(/\/$/, '')); } catch {/* empty */}
-          }
-
-          const existing = this.plugin.app.vault.getAbstractFileByPath(path);
-          const stamped = stampFrontmatter(body || '', item.id);
-          if (existing instanceof TFile) {
-            await this.plugin.app.vault.modify(existing, stamped);
-          } else if (!existing) {
-            await this.plugin.app.vault.create(path, stamped);
-          }
-          const hash = await sha256(stamped);
-          this.plugin.mapping.upsert({
-            joplinId: item.id, path, type: ModelType.Note,
-            localHash: hash, remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
-          });
-          done++;
-        } catch (e: unknown) {
-          failed++;
-          const msg = e instanceof Error ? e.message : String(e);
-          if (msg.includes('401')) try { await this.plugin.api.login(true); } catch { void 0; }
-          if (failed <= 3) console.error('[joplin-sync] force-pull:', item.title, msg);
-        }
+        }));
         this.plugin.statusBar.setProgress(done, notes.length, 'pull');
       }
 
@@ -1262,12 +1277,15 @@ export class SyncEngine {
   private async listAllRemoteItems(): Promise<import('../api/models').RemoteItemStat[]> {
     const out: import('../api/models').RemoteItemStat[] = [];
     let cursor: string | undefined;
+    let pageNum = 0;
     while (true) {
+      pageNum++;
       const page = await this.plugin.api.listChildrenOf('', cursor);
       for (const it of page.items) {
         out.push(it);
       }
       cursor = page.cursor;
+      console.debug('[joplin-sync] listAllRemoteItems: page ' + pageNum + ' (' + page.items.length + ' items, total ' + out.length + ', has_more=' + page.has_more + ')');
       if (!page.has_more) break;
       if (!cursor) break; // safety: no cursor but has_more = prevent infinite loop
     }

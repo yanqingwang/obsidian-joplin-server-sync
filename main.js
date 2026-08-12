@@ -1406,6 +1406,19 @@ var LocalPusher = class {
     const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
     if (!entry)
       return "none";
+    if (isFolder) {
+      const children = this.plugin.mapping.all().filter(
+        (e) => e.joplinId !== entry.joplinId && e.path.startsWith(entry.path)
+      );
+      for (const child of children) {
+        try {
+          await this.plugin.api.deleteItem(child.joplinId + ".md");
+          this.plugin.mapping.remove(child.joplinId);
+          this.plugin.mapping.addTombstone(child.joplinId, child.type);
+        } catch {
+        }
+      }
+    }
     await this.plugin.api.deleteItem(entry.joplinId + ".md");
     this.plugin.mapping.remove(entry.joplinId);
     this.plugin.mapping.addTombstone(entry.joplinId, entry.type);

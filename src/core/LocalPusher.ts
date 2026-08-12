@@ -142,6 +142,23 @@ export class LocalPusher {
     const key = isFolder ? path + '/' : path;
     const entry = this.plugin.mapping.getById(fileId) ?? this.plugin.mapping.getByPath(key);
     if (!entry) return 'none';
+
+    // Folder delete: recursively delete mapped children too. Obsidian fires
+    // per-file delete events, but rapid-fire events can be missed by the
+    // watcher — this guarantees no orphans remain on the server.
+    if (isFolder) {
+      const children = this.plugin.mapping.all().filter(e =>
+        e.joplinId !== entry.joplinId && e.path.startsWith(entry.path)
+      );
+      for (const child of children) {
+        try {
+          await this.plugin.api.deleteItem(child.joplinId + '.md');
+          this.plugin.mapping.remove(child.joplinId);
+          this.plugin.mapping.addTombstone(child.joplinId, child.type);
+        } catch { /* child may already be gone */ }
+      }
+    }
+
     await this.plugin.api.deleteItem(entry.joplinId + '.md');
     this.plugin.mapping.remove(entry.joplinId);
     this.plugin.mapping.addTombstone(entry.joplinId, entry.type);

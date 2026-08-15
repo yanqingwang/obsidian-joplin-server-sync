@@ -8,6 +8,12 @@ export class JoplinServerApi {
   private getConfig: () => ApiConfig;
   private loginPromise: Promise<void> | null = null;
 
+  /** Per-request timeout. Without it a stalled server connection (accepts the
+   *  socket but never responds) makes requestUrl hang forever, which wedges
+   *  the whole sync with no progress and no error (the "半天没有反应" symptom).
+   *  2 min is generous for metadata GETs and even large resource blobs. */
+  static readonly DEFAULT_TIMEOUT_MS = 120_000;
+
   constructor(getConfig: () => ApiConfig) {
     this.getConfig = getConfig;
   }
@@ -42,9 +48,11 @@ export class JoplinServerApi {
     body?: string | ArrayBuffer;
     contentType?: string;
     retries?: number;
+    timeout?: number;
   } = {}): Promise<{ status: number; text: string; arrayBuffer: ArrayBuffer }> {
     if (!this.sessionId) await this.login();
     const maxRetries = opts.retries ?? 3;
+    const timeoutMs = opts.timeout ?? JoplinServerApi.DEFAULT_TIMEOUT_MS;
 
     for (let attempt = 0; ; attempt++) {
       const headers: Record<string, string> = {
@@ -52,29 +60,59 @@ export class JoplinServerApi {
         'X-API-MIN-VERSION': '2.6.0',
       };
       if (opts.contentType) headers['Content-Type'] = opts.contentType;
-      const res = await requestUrl({
-        url: this.trimSlash(this.getConfig().baseUrl) + path,
-        method,
-        headers,
-        body: opts.body,
-        throw: false,
-      });
+      try {
+        const res = await this.requestWithTimeout(method, path, headers, opts.body, timeoutMs);
 
-      if (res.status === 401 && attempt === 0) {
-        this.sessionId = null;
-        await this.login(true);
-        continue;
+        if (res.status === 401) {
+          // Session expired mid-stream — re-auth and retry with a fresh token.
+          // Handled on any attempt (not just the first) so a token that dies
+          // between retries is transparently recovered instead of erroring out.
+          this.sessionId = null;
+          await this.login(true);
+          continue;
+        }
+        if (res.status === 429 && attempt < maxRetries) {
+          await this.sleep(Math.pow(2, attempt) * 1000);
+          continue;
+        }
+        if (res.status >= 500 && attempt < maxRetries) {
+          await this.sleep(Math.pow(4, attempt) * 1000);
+          continue;
+        }
+        return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
+      } catch (e: unknown) {
+        // Network error / timeout / connection reset. Retry with backoff so a
+        // transient blip doesn't wedge the whole sync (reliability).
+        if (attempt < maxRetries) {
+          console.warn('[joplin-sync] request failed (attempt ' + (attempt + 1) + '/' + (maxRetries + 1)
+            + '), retrying: ' + method + ' ' + path + ' — ' + (e instanceof Error ? e.message : String(e)));
+          await this.sleep(Math.pow(2, attempt) * 1000);
+          continue;
+        }
+        throw e;
       }
-      if (res.status === 429 && attempt < maxRetries) {
-        await this.sleep(Math.pow(2, attempt) * 1000);
-        continue;
-      }
-      if (res.status >= 500 && attempt < maxRetries) {
-        await this.sleep(Math.pow(4, attempt) * 1000);
-        continue;
-      }
-      return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
     }
+  }
+
+  /** requestUrl with a hard timeout. Obsidian's requestUrl has no built-in
+   *  per-request timeout, so we race it against a timer. The slower promise is
+   *  guarded with a no-op catch to avoid an unhandled rejection when the timer
+   *  wins and the request later settles in the background. */
+  private requestWithTimeout(
+    method: string, path: string, headers: Record<string, string>,
+    body: string | ArrayBuffer | undefined, timeoutMs: number,
+  ): Promise<{ status: number; text: string; arrayBuffer: ArrayBuffer }> {
+    const url = this.trimSlash(this.getConfig().baseUrl) + path;
+    const req = requestUrl({ url, method, headers, body, throw: false });
+    req.catch(() => {}); // swallow late settle; value is discarded after timeout
+    let timer: number | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = window.setTimeout(
+        () => reject(new Error('Request timed out after ' + timeoutMs + 'ms: ' + method + ' ' + path)),
+        timeoutMs,
+      );
+    });
+    return Promise.race([req, timeout]).finally(() => { if (timer !== undefined) window.clearTimeout(timer); });
   }
 
   private safeJson(text: string): Record<string, unknown> | null {

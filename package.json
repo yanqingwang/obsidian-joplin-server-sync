@@ -1,17 +1,17 @@
 {
-	"name": "obsidian-joplin-server-sync",
-	"version": "0.4.3",
-	"description": "Sync Obsidian vault with Joplin Server",
-	"main": "main.js",
-	"scripts": {
-		"dev": "node esbuild.config.mjs",
-		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
-	},
-	"devDependencies": {
-		"@types/node": "^20.0.0",
-		"esbuild": "^0.19.0",
-		"obsidian": "^1.6.0",
-		"tslib": "^2.6.0",
-		"typescript": "^5.3.0"
-	}
+  "name": "obsidian-joplin-server-sync",
+  "version": "0.4.4",
+  "description": "Sync Obsidian vault with Joplin Server",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.19.0",
+    "obsidian": "^1.6.0",
+    "tslib": "^2.6.0",
+    "typescript": "^5.3.0"
+  }
 }

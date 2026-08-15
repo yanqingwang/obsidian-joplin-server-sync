@@ -193,7 +193,7 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
 
 // src/api/JoplinServerApi.ts
 var import_obsidian2 = require("obsidian");
-var JoplinServerApi = class {
+var _JoplinServerApi = class _JoplinServerApi {
   constructor(getConfig) {
     this.sessionId = null;
     this.loginPromise = null;
@@ -232,6 +232,7 @@ var JoplinServerApi = class {
     if (!this.sessionId)
       await this.login();
     const maxRetries = opts.retries ?? 3;
+    const timeoutMs = opts.timeout ?? _JoplinServerApi.DEFAULT_TIMEOUT_MS;
     for (let attempt = 0; ; attempt++) {
       const headers = {
         "X-API-AUTH": this.sessionId,
@@ -239,28 +240,52 @@ var JoplinServerApi = class {
       };
       if (opts.contentType)
         headers["Content-Type"] = opts.contentType;
-      const res = await (0, import_obsidian2.requestUrl)({
-        url: this.trimSlash(this.getConfig().baseUrl) + path,
-        method,
-        headers,
-        body: opts.body,
-        throw: false
-      });
-      if (res.status === 401 && attempt === 0) {
-        this.sessionId = null;
-        await this.login(true);
-        continue;
+      try {
+        const res = await this.requestWithTimeout(method, path, headers, opts.body, timeoutMs);
+        if (res.status === 401) {
+          this.sessionId = null;
+          await this.login(true);
+          continue;
+        }
+        if (res.status === 429 && attempt < maxRetries) {
+          await this.sleep(Math.pow(2, attempt) * 1e3);
+          continue;
+        }
+        if (res.status >= 500 && attempt < maxRetries) {
+          await this.sleep(Math.pow(4, attempt) * 1e3);
+          continue;
+        }
+        return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
+      } catch (e) {
+        if (attempt < maxRetries) {
+          console.warn("[joplin-sync] request failed (attempt " + (attempt + 1) + "/" + (maxRetries + 1) + "), retrying: " + method + " " + path + " \u2014 " + (e instanceof Error ? e.message : String(e)));
+          await this.sleep(Math.pow(2, attempt) * 1e3);
+          continue;
+        }
+        throw e;
       }
-      if (res.status === 429 && attempt < maxRetries) {
-        await this.sleep(Math.pow(2, attempt) * 1e3);
-        continue;
-      }
-      if (res.status >= 500 && attempt < maxRetries) {
-        await this.sleep(Math.pow(4, attempt) * 1e3);
-        continue;
-      }
-      return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
     }
+  }
+  /** requestUrl with a hard timeout. Obsidian's requestUrl has no built-in
+   *  per-request timeout, so we race it against a timer. The slower promise is
+   *  guarded with a no-op catch to avoid an unhandled rejection when the timer
+   *  wins and the request later settles in the background. */
+  requestWithTimeout(method, path, headers, body, timeoutMs) {
+    const url = this.trimSlash(this.getConfig().baseUrl) + path;
+    const req = (0, import_obsidian2.requestUrl)({ url, method, headers, body, throw: false });
+    req.catch(() => {
+    });
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = window.setTimeout(
+        () => reject(new Error("Request timed out after " + timeoutMs + "ms: " + method + " " + path)),
+        timeoutMs
+      );
+    });
+    return Promise.race([req, timeout]).finally(() => {
+      if (timer !== void 0)
+        window.clearTimeout(timer);
+    });
   }
   safeJson(text) {
     try {
@@ -397,6 +422,12 @@ var JoplinServerApi = class {
     return new Promise((r) => window.setTimeout(r, ms));
   }
 };
+/** Per-request timeout. Without it a stalled server connection (accepts the
+ *  socket but never responds) makes requestUrl hang forever, which wedges
+ *  the whole sync with no progress and no error (the "半天没有反应" symptom).
+ *  2 min is generous for metadata GETs and even large resource blobs. */
+_JoplinServerApi.DEFAULT_TIMEOUT_MS = 12e4;
+var JoplinServerApi = _JoplinServerApi;
 var ApiError = class extends Error {
   constructor(status, text) {
     super("API error " + status + ": " + text);
@@ -1623,7 +1654,7 @@ var FileIdentity = class {
 };
 
 // src/core/DeltaPuller.ts
-var DeltaPuller = class {
+var _DeltaPuller = class _DeltaPuller {
   // item_id → full path
   constructor(plugin, watcher) {
     this.plugin = plugin;
@@ -1684,7 +1715,7 @@ var DeltaPuller = class {
   }
   async pullAll() {
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
-    const allItems = [];
+    const changes = [];
     const deletes = [];
     let cursor = this.plugin.mapping.getDeltaCursor();
     while (true) {
@@ -1707,23 +1738,13 @@ var DeltaPuller = class {
         break;
       }
       for (const d of page.items) {
-        try {
-          if (d.type === 3 /* Delete */) {
-            const id = d.name.replace(/\.resource\//, "").replace(/\.md$/, "");
-            deletes.push(id);
-            continue;
-          }
-          const items = await this.collectChange(d);
-          allItems.push(...items);
-        } catch (e) {
-          const isAbort = e?.__decryptAbort === true;
-          stats.fail++;
-          console.error("[joplin-sync] collect delta failed", d.name, e);
-          if (isAbort) {
-            console.error("[joplin-sync] aborting pull before cursor advance (decrypt failure)");
-            this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
-            return stats;
-          }
+        if (d.type === 3 /* Delete */) {
+          const id = d.name.replace(/\.resource\//, "").replace(/\.md$/, "");
+          deletes.push(id);
+          continue;
+        }
+        if (!d.name.startsWith(".resource/") && /^[0-9a-f]{32}\.md$/.test(d.name)) {
+          changes.push(d);
         }
       }
       if (page.cursor)
@@ -1736,13 +1757,74 @@ var DeltaPuller = class {
       console.warn("[joplin-sync] large delta delete batch: " + deletes.length + " deletes over " + totalMapped + " mapped items \u2014 applying with per-item server verification. If this is a stale cursor, deletes are skipped; if the server was force-pushed from another vault, local files are removed.");
       new import_obsidian7.Notice("Large delete batch (" + deletes.length + ') from server. Applying with verification \u2014 run "Force pull" if local state diverged.', 1e4);
     }
+    const goneIds = /* @__PURE__ */ new Set();
+    if (deletes.length > 0) {
+      for (const batch of chunk(deletes, _DeltaPuller.DOWNLOAD_BATCH)) {
+        const results = await Promise.all(batch.map(async (id) => {
+          try {
+            const stillThere = await this.plugin.api.getItem(id + ".md");
+            return stillThere === null ? id : null;
+          } catch (e) {
+            console.warn("[joplin-sync] delete verification failed for " + id + ", skipping local delete: " + (e instanceof Error ? e.message : String(e)));
+            return null;
+          }
+        }));
+        for (const id of results)
+          if (id)
+            goneIds.add(id);
+      }
+    }
     for (const id of deletes) {
+      if (!goneIds.has(id)) {
+        console.warn("[joplin-sync] skip local delete for " + id + ": server still has item (stale cursor or foreign vault)");
+        continue;
+      }
       try {
-        if (await this.applyDelete(id))
+        if (await this.applyDeleteLocal(id))
           stats.deleted++;
       } catch (e) {
         stats.fail++;
         console.error("[joplin-sync] delta delete failed", id, e);
+      }
+    }
+    const downloaded = [];
+    if (changes.length > 0) {
+      console.debug("[joplin-sync] pull: downloading " + changes.length + " changed items in parallel batches of " + _DeltaPuller.DOWNLOAD_BATCH + "...");
+      let batchNum = 0;
+      for (const batch of chunk(changes, _DeltaPuller.DOWNLOAD_BATCH)) {
+        batchNum++;
+        if (batchNum % 40 === 0)
+          console.debug("[joplin-sync] pull: download batch " + batchNum + "/" + Math.ceil(changes.length / _DeltaPuller.DOWNLOAD_BATCH) + " (" + downloaded.length + " so far)");
+        const results = await Promise.all(batch.map(async (d) => {
+          try {
+            const raw = await this.plugin.api.getItem(d.name);
+            return raw !== null ? { d, raw } : null;
+          } catch (e) {
+            stats.fail++;
+            console.error("[joplin-sync] pull download failed", d.name, e);
+            return null;
+          }
+        }));
+        for (const r of results)
+          if (r)
+            downloaded.push(r);
+      }
+    }
+    const allItems = [];
+    for (const { d, raw } of downloaded) {
+      try {
+        const item = await this.processChangeItem(d, raw);
+        if (item)
+          allItems.push(item);
+      } catch (e) {
+        const isAbort = e?.__decryptAbort === true;
+        stats.fail++;
+        console.error("[joplin-sync] process delta failed", d.name, e);
+        if (isAbort) {
+          console.error("[joplin-sync] aborting pull before cursor advance (decrypt failure)");
+          this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
+          return stats;
+        }
       }
     }
     this.buildParentMap(allItems);
@@ -1774,45 +1856,34 @@ var DeltaPuller = class {
         }
       }
     }
-    for (const r of resources) {
-      try {
-        await this.applyResource(r);
-        stats.created++;
-      } catch (e) {
-        stats.fail++;
-        console.error("[joplin-sync] resource apply failed", r.id, e);
+    if (resources.length > 0) {
+      for (const batch of chunk(resources, _DeltaPuller.DOWNLOAD_BATCH)) {
+        await Promise.all(batch.map(async (r) => {
+          try {
+            await this.applyResource(r);
+            stats.created++;
+          } catch (e) {
+            stats.fail++;
+            console.error("[joplin-sync] resource apply failed", r.id, e);
+          }
+        }));
       }
     }
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
     return stats;
   }
-  /** Download a delta item and return fully unserialized JoplinItems it contains */
-  async collectChange(d) {
-    if (d.name.startsWith(".resource/")) {
-      if (d.type === 3 /* Delete */) {
-        await this.applyDelete(d.name.replace(".resource/", ""));
-        return [];
-      }
-      return [];
-    }
-    if (!/^[0-9a-f]{32}\.md$/.test(d.name))
-      return [];
-    const id = d.name.slice(0, 32);
-    if (d.type === 3 /* Delete */) {
-      await this.applyDelete(id);
-      return [];
-    }
-    const raw = await this.plugin.api.getItem(d.name);
-    if (raw === null)
-      return [];
+  /** Unserialize + type-filter + E2EE decrypt + root-isolate one downloaded
+   *  change item. Returns the JoplinItem to apply, or null to skip. Throws a
+   *  tagged error on undecryptable E2EE (caller must not advance the cursor). */
+  async processChangeItem(d, raw) {
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
     const allowed = /* @__PURE__ */ new Set([1 /* Note */, 2 /* Folder */, 4 /* Resource */, 9 /* MasterKey */]);
     if (!allowed.has(probe.type_))
-      return [];
+      return null;
     if (probe.type_ === 9 /* MasterKey */) {
       e2ee.feedMasterKey(probe);
-      return [];
+      return null;
     }
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
@@ -1823,8 +1894,8 @@ var DeltaPuller = class {
           const decrypted = this.serializer.unserialize(decryptedBody);
           decrypted.updated_time = item.updated_time;
           if (!this.belongsToRoot(decrypted))
-            return [];
-          return [decrypted];
+            return null;
+          return decrypted;
         }
       } catch (e) {
         console.warn("[joplin-sync] E2EE decrypt failed for " + d.name + ": " + (e instanceof Error ? e.message : String(e)));
@@ -1834,8 +1905,8 @@ var DeltaPuller = class {
       }
     }
     if (!this.belongsToRoot(item))
-      return [];
-    return [item];
+      return null;
+    return item;
   }
   async applyNote(item) {
     const mapping = this.plugin.mapping.getById(item.id);
@@ -1913,20 +1984,13 @@ var DeltaPuller = class {
     });
     return isNew;
   }
-  async applyDelete(id) {
+  /** Remove a locally-mapped item from the vault + mapping. The server
+   *  existence check is done up front in pullAll (in parallel); this only does
+   *  the local removal for ids already confirmed gone on the server. */
+  async applyDeleteLocal(id) {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping)
       return false;
-    try {
-      const stillThere = await this.plugin.api.getItem(id + ".md");
-      if (stillThere !== null) {
-        console.warn("[joplin-sync] skip local delete for " + mapping.path + ": server still has item " + id + " (stale cursor or foreign vault)");
-        return false;
-      }
-    } catch (e) {
-      console.warn("[joplin-sync] delete verification failed for " + id + ", skipping local delete: " + (e instanceof Error ? e.message : String(e)));
-      return false;
-    }
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
     if (f) {
       this.watcher.suppress(f.path);
@@ -2031,6 +2095,17 @@ var DeltaPuller = class {
     return p;
   }
 };
+/** Concurrency for parallel network work. Mirrors the proven forcePull batch
+ *  size (B40): 5-at-a-time cut a 1000+ item pull from 15+ min to <30s on a
+ *  local network. Kept modest so a slow/misbehaving server isn't hammered. */
+_DeltaPuller.DOWNLOAD_BATCH = 5;
+var DeltaPuller = _DeltaPuller;
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size)
+    out.push(arr.slice(i, i + size));
+  return out;
+}
 
 // src/core/InitialSync.ts
 var import_obsidian8 = require("obsidian");
@@ -2065,7 +2140,7 @@ var InitialSync = class {
     let done = 0;
     let fail = 0;
     if (!this.plugin.settings.syncFoldersOnly) {
-      for (const batch of chunk(unmapped, 5)) {
+      for (const batch of chunk2(unmapped, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
             const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -2329,7 +2404,7 @@ var SyncEngine = class {
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
       const failed = [];
-      for (const batch of chunk(files, 5)) {
+      for (const batch of chunk2(files, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
             const changed = await this.uploadNote(file, "");
@@ -2848,7 +2923,7 @@ var SyncEngine = class {
         this.plugin.logSync("folders", totalFolders, 0);
         done = totalFolders;
       } else {
-        for (const batch of chunk(files, 5)) {
+        for (const batch of chunk2(files, 5)) {
           await Promise.all(batch.map(async (file) => {
             try {
               const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -2876,7 +2951,7 @@ var SyncEngine = class {
         const allFiles = this.plugin.app.vault.getFiles();
         const resourceFiles = allFiles.filter((f) => f.extension !== "md" && !this.shouldExclude(f.path));
         if (resourceFiles.length > 0) {
-          for (const batch of chunk(resourceFiles, 5)) {
+          for (const batch of chunk2(resourceFiles, 5)) {
             await Promise.all(batch.map(async (f) => {
               try {
                 const rid = await this.resources.uploadResource(f, true);
@@ -3166,7 +3241,7 @@ var SyncEngine = class {
       );
       console.debug("[joplin-sync] force pull: reading " + readStats.length + " item contents in batches of 5...");
       let batchNum = 0;
-      for (const batch of chunk(readStats, 5)) {
+      for (const batch of chunk2(readStats, 5)) {
         batchNum++;
         if (batchNum % 20 === 0)
           console.debug("[joplin-sync] force pull: read batch " + batchNum + "/" + Math.ceil(readStats.length / 5) + " (" + allItems.length + " items so far)");
@@ -3288,7 +3363,7 @@ var SyncEngine = class {
       const sortedDepths = [...foldersByDepth.keys()].sort((a, b) => a - b);
       for (const depth of sortedDepths) {
         const levelFolders = foldersByDepth.get(depth);
-        for (const batch of chunk(levelFolders, 5)) {
+        for (const batch of chunk2(levelFolders, 5)) {
           await Promise.all(batch.map(async (f) => {
             try {
               const parentPath = this.resolveForcePullFolderPath(f.parent_id);
@@ -3314,7 +3389,7 @@ var SyncEngine = class {
       }
       const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
       const usedPaths = /* @__PURE__ */ new Set();
-      for (const batch of chunk(notes, 5)) {
+      for (const batch of chunk2(notes, 5)) {
         await Promise.all(batch.map(async (item) => {
           if (!item.title)
             return;
@@ -3617,7 +3692,7 @@ async function sha256(text) {
   const digest = await crypto.subtle.digest("SHA-256", data);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
-function chunk(arr, size) {
+function chunk2(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size)
     out.push(arr.slice(i, i + size));
@@ -3942,8 +4017,8 @@ var EncryptionService = class {
   }
   buildCipherText(method, masterKeyId, chunks) {
     let out = this.buildHeader(method, masterKeyId);
-    for (const chunk2 of chunks) {
-      out += chunk2.length.toString(16).padStart(6, "0") + chunk2;
+    for (const chunk3 of chunks) {
+      out += chunk3.length.toString(16).padStart(6, "0") + chunk3;
     }
     return out;
   }

@@ -69,13 +69,21 @@ export class DeltaPuller {
     return false;
   }
 
+  /** Concurrency for parallel network work. Mirrors the proven forcePull batch
+   *  size (B40): 5-at-a-time cut a 1000+ item pull from 15+ min to <30s on a
+   *  local network. Kept modest so a slow/misbehaving server isn't hammered. */
+  private static readonly DOWNLOAD_BATCH = 5;
+
   async pullAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
-    const allItems: JoplinItem[] = [];
+    const changes: DeltaItem[] = [];   // non-delete items whose content we must fetch
     const deletes: string[] = [];
     let cursor = this.plugin.mapping.getDeltaCursor();
 
-    // First pass: collect all items from delta stream.
+    // ---- Pass 1: page the delta, collecting change descriptors + delete ids ----
+    // Cheap: only the delta metadata is read here. Content download happens in
+    // parallel in pass 2 (the old code fetched each item serially inside this
+    // loop, which made a large delta crawl for minutes).
     // A 400-class failure while paging with a saved cursor means the server
     // dropped the change history (cursor invalidated). Recover by clearing the
     // cursor and forcing a full reconciliation instead of erroring forever (B26).
@@ -99,38 +107,27 @@ export class DeltaPuller {
         break;
       }
       for (const d of page.items) {
-        try {
-          if (d.type === DeltaChangeType.Delete) {
-            const id = d.name.replace(/\.resource\//, '').replace(/\.md$/, '');
-            deletes.push(id);
-            continue;
-          }
-          const items = await this.collectChange(d);
-          allItems.push(...items);
-        } catch (e: unknown) {
-          const isAbort = (e as Error & { __decryptAbort?: boolean })?.__decryptAbort === true;
-          stats.fail++;
-          console.error('[joplin-sync] collect delta failed', d.name, e);
-          if (isAbort) {
-            // C11: do not advance the cursor past an undecryptable item —
-            // keep the pre-batch cursor so the change replays next run.
-            console.error('[joplin-sync] aborting pull before cursor advance (decrypt failure)');
-            this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
-            return stats;
-          }
+        if (d.type === DeltaChangeType.Delete) {
+          const id = d.name.replace(/\.resource\//, '').replace(/\.md$/, '');
+          deletes.push(id);
+          continue;
+        }
+        // Only collect fetchable note/folder/resource metadata items
+        // (`<id>.md`); resource blobs (`.resource/<id>`) are pulled via their
+        // metadata item in pass 2.
+        if (!d.name.startsWith('.resource/') && /^[0-9a-f]{32}\.md$/.test(d.name)) {
+          changes.push(d);
         }
       }
       if (page.cursor) cursor = page.cursor;
       if (!page.has_more) break;
     }
 
-    // Apply deletes (folders first so children are removed after their parents).
-    // Mass-delete guard: a delta page reporting more deletes than half the
-    // local mapping is usually a stale cursor or a foreign-vault force-push
-    // rebuild. We do NOT refuse the batch (that would wedge sync forever):
-    // applyDelete verifies each id against the server (404 = really gone →
-    // delete locally; still present = stale replay → skip), so acting is
-    // safe in both cases. We only surface a warning + user guidance.
+    // ---- Pass 1b: verify deletes against the server in parallel ----
+    // Each delete is verified by a read-only GET so we never delete locally
+    // when the item still exists on the server (stale cursor / foreign vault).
+    // Parallelizing these GETs (they were serial before) avoids a long stall
+    // when a delete batch is large (e.g. a folder with many children).
     const totalMapped = this.plugin.mapping.all().length;
     if (totalMapped > 20 && deletes.length > totalMapped / 2) {
       console.warn('[joplin-sync] large delta delete batch: ' + deletes.length + ' deletes over ' + totalMapped
@@ -139,9 +136,76 @@ export class DeltaPuller {
       new Notice('Large delete batch (' + deletes.length + ') from server. Applying with verification — '
         + 'run "Force pull" if local state diverged.', 10000);
     }
+    const goneIds = new Set<string>();
+    if (deletes.length > 0) {
+      for (const batch of chunk(deletes, DeltaPuller.DOWNLOAD_BATCH)) {
+        const results = await Promise.all(batch.map(async (id) => {
+          try {
+            const stillThere = await this.plugin.api.getItem(id + '.md');
+            return stillThere === null ? id : null;
+          } catch (e: unknown) {
+            console.warn('[joplin-sync] delete verification failed for ' + id + ', skipping local delete: '
+              + (e instanceof Error ? e.message : String(e)));
+            return null;
+          }
+        }));
+        for (const id of results) if (id) goneIds.add(id);
+      }
+    }
     for (const id of deletes) {
-      try { if (await this.applyDelete(id)) stats.deleted++; }
+      if (!goneIds.has(id)) {
+        console.warn('[joplin-sync] skip local delete for ' + id
+          + ': server still has item (stale cursor or foreign vault)');
+        continue;
+      }
+      try { if (await this.applyDeleteLocal(id)) stats.deleted++; }
       catch (e) { stats.fail++; console.error('[joplin-sync] delta delete failed', id, e); }
+    }
+
+    // ---- Pass 2: parallel batch download of changed-item content ----
+    const downloaded: { d: DeltaItem; raw: string }[] = [];
+    if (changes.length > 0) {
+      console.debug('[joplin-sync] pull: downloading ' + changes.length + ' changed items in parallel batches of '
+        + DeltaPuller.DOWNLOAD_BATCH + '...');
+      let batchNum = 0;
+      for (const batch of chunk(changes, DeltaPuller.DOWNLOAD_BATCH)) {
+        batchNum++;
+        if (batchNum % 40 === 0) console.debug('[joplin-sync] pull: download batch ' + batchNum + '/'
+          + Math.ceil(changes.length / DeltaPuller.DOWNLOAD_BATCH) + ' (' + downloaded.length + ' so far)');
+        const results = await Promise.all(batch.map(async (d) => {
+          try {
+            const raw = await this.plugin.api.getItem(d.name);
+            return raw !== null ? { d, raw } : null;
+          } catch (e: unknown) {
+            stats.fail++;
+            console.error('[joplin-sync] pull download failed', d.name, e);
+            return null;
+          }
+        }));
+        for (const r of results) if (r) downloaded.push(r);
+      }
+    }
+
+    // ---- Pass 3: serial process of downloaded content ----
+    // Unserialize, feed master keys, decrypt (E2EE) and root-isolate. Kept
+    // serial so the shared rootAncestorCache / mapping reads stay deterministic.
+    const allItems: JoplinItem[] = [];
+    for (const { d, raw } of downloaded) {
+      try {
+        const item = await this.processChangeItem(d, raw);
+        if (item) allItems.push(item);
+      } catch (e: unknown) {
+        const isAbort = (e as Error & { __decryptAbort?: boolean })?.__decryptAbort === true;
+        stats.fail++;
+        console.error('[joplin-sync] process delta failed', d.name, e);
+        if (isAbort) {
+          // C11: do not advance the cursor past an undecryptable item —
+          // keep the pre-batch cursor so the change replays next run.
+          console.error('[joplin-sync] aborting pull before cursor advance (decrypt failure)');
+          this.plugin.mapping.setDeltaCursor(this.plugin.mapping.getDeltaCursor());
+          return stats;
+        }
+      }
     }
 
     // Seed the parent chain for belongsToRoot before applying items.
@@ -166,37 +230,35 @@ export class DeltaPuller {
         catch (e) { stats.fail++; console.error('[joplin-sync] note apply failed', n.title, e); }
       }
     }
-    for (const r of resources) {
-      try { await this.applyResource(r); stats.created++; }
-      catch (e) { stats.fail++; console.error('[joplin-sync] resource apply failed', r.id, e); }
+
+    // Resources: download blobs in parallel batches (network-heavy, like the
+    // note content above). Downloads are independent; mapping writes are safe
+    // (in-memory until the cycle flushes).
+    if (resources.length > 0) {
+      for (const batch of chunk(resources, DeltaPuller.DOWNLOAD_BATCH)) {
+        await Promise.all(batch.map(async (r) => {
+          try { await this.applyResource(r); stats.created++; }
+          catch (e) { stats.fail++; console.error('[joplin-sync] resource apply failed', r.id, e); }
+        }));
+      }
     }
 
     this.plugin.mapping.setDeltaCursor(cursor ?? '');
     return stats;
   }
 
-  /** Download a delta item and return fully unserialized JoplinItems it contains */
-  private async collectChange(d: DeltaItem): Promise<JoplinItem[]> {
-    // Handle resource blob items
-    if (d.name.startsWith('.resource/')) {
-      if (d.type === DeltaChangeType.Delete) { await this.applyDelete(d.name.replace('.resource/', '')); return []; }
-      return [];
-    }
-    if (!/^[0-9a-f]{32}\.md$/.test(d.name)) return [];
-    const id = d.name.slice(0, 32);
-    if (d.type === DeltaChangeType.Delete) { await this.applyDelete(id); return []; }
-
-    const raw = await this.plugin.api.getItem(d.name);
-    if (raw === null) return [];
-
+  /** Unserialize + type-filter + E2EE decrypt + root-isolate one downloaded
+   *  change item. Returns the JoplinItem to apply, or null to skip. Throws a
+   *  tagged error on undecryptable E2EE (caller must not advance the cursor). */
+  private async processChangeItem(d: DeltaItem, raw: string): Promise<JoplinItem | null> {
     const e2ee = this.plugin.e2ee;
     const probe = this.serializer.unserialize(raw);
     // Whitelist the item types this plugin understands. A shared server may
     // carry Revision/Tag/NoteTag items from other clients — they must be
     // skipped, never treated as notes (B28).
     const allowed = new Set([ModelType.Note, ModelType.Folder, ModelType.Resource, ModelType.MasterKey]);
-    if (!allowed.has(probe.type_)) return [];
-    if (probe.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(probe); return []; }
+    if (!allowed.has(probe.type_)) return null;
+    if (probe.type_ === ModelType.MasterKey) { e2ee.feedMasterKey(probe); return null; }
 
     const item = this.serializer.unserialize(raw);
     item.updated_time = d.jop_updated_time ?? item.updated_time;
@@ -208,8 +270,8 @@ export class DeltaPuller {
         if (decryptedBody !== null) {
           const decrypted = this.serializer.unserialize(decryptedBody);
           decrypted.updated_time = item.updated_time;
-          if (!this.belongsToRoot(decrypted)) return [];
-          return [decrypted];
+          if (!this.belongsToRoot(decrypted)) return null;
+          return decrypted;
         }
       } catch (e: unknown) {
         console.warn('[joplin-sync] E2EE decrypt failed for ' + d.name + ': ' + (e instanceof Error ? e.message : String(e)));
@@ -221,8 +283,8 @@ export class DeltaPuller {
       }
     }
 
-    if (!this.belongsToRoot(item)) return [];
-    return [item];
+    if (!this.belongsToRoot(item)) return null;
+    return item;
   }
 
   private async applyNote(item: JoplinItem): Promise<boolean> {
@@ -296,25 +358,12 @@ export class DeltaPuller {
     return isNew;
   }
 
-  private async applyDelete(id: string): Promise<boolean> {
+  /** Remove a locally-mapped item from the vault + mapping. The server
+   *  existence check is done up front in pullAll (in parallel); this only does
+   *  the local removal for ids already confirmed gone on the server. */
+  private async applyDeleteLocal(id: string): Promise<boolean> {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping) return false;
-
-    // Stale delta cursors replay Delete events for items that still exist
-    // locally (account reset, or a second vault on the same account). Only
-    // delete locally when the server confirms the item is really gone.
-    try {
-      const stillThere = await this.plugin.api.getItem(id + '.md');
-      if (stillThere !== null) {
-        console.warn('[joplin-sync] skip local delete for ' + mapping.path
-          + ': server still has item ' + id + ' (stale cursor or foreign vault)');
-        return false;
-      }
-    } catch (e: unknown) {
-      console.warn('[joplin-sync] delete verification failed for ' + id + ', skipping local delete: '
-        + (e instanceof Error ? e.message : String(e)));
-      return false;
-    }
 
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
     if (f) {
@@ -414,4 +463,11 @@ export class DeltaPuller {
     }
     return p;
   }
+}
+
+/** Split an array into fixed-size chunks (for bounded parallelism). */
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }

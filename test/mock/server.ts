@@ -102,7 +102,10 @@ export class MockJoplinServer {
     const start = cursor ? parseInt(cursor, 10) : 0;
     const slice = this.deltas.slice(start, start + this.page);
     const has_more = start + this.page < this.deltas.length;
-    const nextCursor = has_more ? String(start + this.page) : undefined;
+    // A terminal page still returns a cursor pointing at the END of the
+    // change log — like the real server. Without it a client that stores the
+    // empty cursor replays the FULL history on every pull.
+    const nextCursor = has_more ? String(start + this.page) : String(this.deltas.length);
     const items = slice.map(d => ({
       name: d.name, type: d.type, updated_time: d.updated_time,
       item_name: d.name, jop_updated_time: d.updated_time,

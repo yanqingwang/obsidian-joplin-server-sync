@@ -12,6 +12,7 @@ import { InitialSync } from './InitialSync';
 import { safeFileName } from './pathUtil';
 import { stampFrontmatter } from './FileIdentity';
 import { ResourceManager } from '../resource/ResourceManager';
+import { confirmDestructive, remoteLooksIncomplete } from '../ui/SafetyGuards';
 
 export enum SyncState { Idle, Pushing, Pulling, Resolving, Error }
 
@@ -34,6 +35,31 @@ export class SyncEngine {
 
   private get configDir(): string {
     return this.plugin.app.vault.configDir ?? '.obsidian';
+  }
+
+  /** True only in the real Obsidian plugin (set in main.ts). Headless hosts
+   *  (tests / CLI) construct plugin stubs without it: confirmations are
+   *  skipped there instead of hanging on a stubbed Modal. */
+  private get uiAvailable(): boolean {
+    return (this.plugin as unknown as { uiConfirmAvailable?: boolean }).uiConfirmAvailable === true;
+  }
+
+  /** Typed confirmation for destructive ops. Returns false (do NOT proceed)
+   *  when the user declines OR when there is no UI and the operation must
+   *  not run unattended. */
+  private async confirmDestructiveOp(kind: 'push' | 'pull'): Promise<boolean> {
+    if (!this.uiAvailable) return true;
+    if (this.plugin.settings.confirmDestructiveOps === false) return true;
+    const vaultName = this.plugin.app.vault.getName() || 'vault';
+    const msg = kind === 'push'
+      ? 'Force push will DELETE the server copy of vault "' + vaultName + '" (notes, folders, attachments under its own root) and re-upload the local vault. Items of other vaults on the same account are preserved. This cannot be undone.'
+      : 'Force pull will DELETE every non-excluded local file in vault "' + vaultName + '" and replace it with the server copy. Local-only files are moved to the Obsidian trash where possible. This cannot be undone.';
+    return confirmDestructive(this.plugin.app, {
+      title: kind === 'push' ? 'Force push (overwrite server)' : 'Force pull (overwrite local)',
+      message: msg,
+      requireText: vaultName,
+      ctaText: kind === 'push' ? 'Delete server copy & re-upload' : 'Delete local copy & re-download',
+    });
   }
 
   constructor(private plugin: JoplinSyncPlugin) {
@@ -251,6 +277,8 @@ export class SyncEngine {
       joplinId: id, path: file.path, type: ModelType.Note,
       localHash: hash, remoteUpdatedTime: result.updated_time, syncedAt: Date.now(),
     });
+    // The uploaded content is the new three-way-merge base.
+    this.plugin.baseSnapshots?.set(id, content);
     return true;
   }
 
@@ -291,7 +319,9 @@ export class SyncEngine {
   startScheduler(): void {
     const interval = this.plugin.settings.syncIntervalSec;
     if (interval > 0) {
-      this.timer = window.setInterval(() => this.syncCycle(), interval * 1000);
+      // Clamp to ≥60s (matching the setting's documented minimum): a typo like
+      // "5" would otherwise fire a full sync cycle 12×/minute.
+      this.timer = window.setInterval(() => this.syncCycle(), Math.max(60, interval) * 1000);
     }
     if (this.plugin.settings.syncOnStartup) {
       window.setTimeout(() => this.syncCycle(), 5000);
@@ -334,8 +364,22 @@ export class SyncEngine {
 
       this.state = SyncState.Resolving;
       for (const t of [...this.plugin.mapping.tombstones]) {
-        try { await this.plugin.api.deleteItem(t.joplinId + '.md'); }
-        catch { /* already deleted on server — tombstone is just a local marker */ }
+        try {
+          await this.plugin.api.deleteItem(t.joplinId + '.md');
+        } catch (e: unknown) {
+          // A 404 means the server item is already gone — fine. Anything else
+          // (network, 5xx) means we do NOT know: keep the tombstone so the
+          // delete is retried next cycle instead of being resurrected by a
+          // later pull.
+          const status = (e as { status?: number }).status;
+          if (typeof status === 'number' && status === 404) {
+            // fall through to clear below
+          } else {
+            console.warn('[joplin-sync] tombstone delete retry kept: ' + t.joplinId + ' - '
+              + (e instanceof Error ? e.message : String(e)));
+            continue;
+          }
+        }
         this.plugin.mapping.clearTombstone(t.joplinId);
       }
 
@@ -357,6 +401,8 @@ export class SyncEngine {
       new Notice('Sync failed: ' + msg, 8000);
     } finally {
       await this.plugin.mapping.flush();
+      await this.plugin.baseSnapshots?.flush().catch?.(() => {});
+      this.plugin.changeLog.prune();
       this.state = SyncState.Idle;
       this.running = false;
     }
@@ -364,6 +410,11 @@ export class SyncEngine {
 
   async shutdown(): Promise<void> {
     if (this.timer) window.clearInterval(this.timer);
+    // Persist pending local-change bookkeeping so a quit right after an edit
+    // does not lose it.
+    await this.plugin.changeLog?.flush().catch?.(() => {});
+    await this.plugin.mapping?.flush().catch?.(() => {});
+    await this.plugin.baseSnapshots?.flush().catch?.(() => {});
   }
 
   /** SHA-256 of a TFile's current content (used by the watcher). */
@@ -454,6 +505,11 @@ export class SyncEngine {
         new Notice('Force push blocked: ' + pushCompatErr, 10000);
         return;
       }
+      if (!(await this.confirmDestructiveOp('push'))) {
+        this.plugin.statusBar.setIdle();
+        new Notice('Force push cancelled.');
+        return;
+      }
       const migratingToE2EE =
         (this.plugin.settings.e2eeEnabled && !!this.plugin.settings.e2eePassword) &&
         !(await this.serverIsEncrypted());
@@ -537,6 +593,7 @@ export class SyncEngine {
         }
         // Clear local mapping so re-upload creates fresh IDs for everything.
         this.plugin.mapping.clearAll();
+        this.plugin.baseSnapshots?.clear();
         console.debug('[joplin-sync] force push reset: wiped ' + wiped + ' items, kept ' + skipped + ' (info.json/master keys/foreign vaults)');
       }
 
@@ -830,6 +887,10 @@ export class SyncEngine {
   // ============ Force Pull: overwrite local with server ============
   async forcePull(): Promise<void> {
     if (this.running) { new Notice('Sync already in progress'); return; }
+    if (!(await this.confirmDestructiveOp('pull'))) {
+      new Notice('Force pull cancelled.');
+      return;
+    }
     this.running = true;
     this.ensureReady();
     this.watcher?.suspend();
@@ -869,85 +930,16 @@ export class SyncEngine {
       // otherwise its stale rootFolderId filters out every note/folder as
       // foreign and the pull comes back empty.
       await this.ensureRootFolder();
-      this.plugin.mapping.clearAll();
 
-      // Delete ALL files and folders except config + excluded dirs
-      const adapter = this.plugin.app.vault.adapter;
-      const isKept = (p: string) => this.shouldExclude(p);
-      let delCount = 0, delDirCount = 0;
-
-      // Delete all non-kept files
-      for (const f of this.plugin.app.vault.getFiles()) {
-        if (!isKept(f.path)) {
-          const fm = this.plugin.app.fileManager as unknown as { trashFile?: (f: TAbstractFile) => Promise<void> } | undefined;
-          try {
-            if (fm?.trashFile) await fm.trashFile(f);
-            else await (this.plugin.app.vault as unknown as { remove: (x: TAbstractFile) => Promise<void> }).remove(f);
-            delCount++;
-          } catch (e: unknown) {
-            console.warn('[joplin-sync] force pull file delete failed: ' + f.path + ' - ' + (e instanceof Error ? e.message : String(e)));
-          }
-        }
-      }
-
-      // Delete ALL remaining folders bottom-up, enumerating via the FILESYSTEM
-      // adapter — disk is authoritative, the Obsidian vault model can lag
-      // after hundreds of trashFile calls. adapter.list may return names
-      // with a `./` prefix in real Obsidian: normalize them instead of
-      // filtering on '/' (which silently skipped every folder — B15).
-      const listAll = async (dir: string): Promise<string[]> => {
-        const result: string[] = [];
-        try {
-          if (adapter.list) {
-            const listing = await adapter.list(dir);
-            for (const sub of listing.folders) {
-              const clean = normDir(sub);
-              if (!clean || clean === '.' || clean === '..') continue;
-              const children = await listAll(clean);
-              result.push(...children, clean);
-            }
-          }
-        } catch {/* ignore unreadable */}
-        return result;
-      };
-      let allLocalDirs: string[] = [];
-      try {
-        if (adapter.list) {
-          const root = await adapter.list('');
-          for (const d of root.folders) {
-            const clean = normDir(d);
-            if (!clean || clean === '.' || clean === '..') continue;
-            if (isKept(clean)) continue;
-            const subs = await listAll(clean);
-            allLocalDirs.push(...subs, clean);
-          }
-        }
-      } catch {/* ignore */}
-      allLocalDirs = [...new Set(allLocalDirs)];
-      allLocalDirs.sort((a, b) => b.split('/').length - a.split('/').length);
-      for (const d of allLocalDirs) {
-        if (isKept(d)) continue;
-        try {
-          if (await adapter.exists(d)) {
-            // Non-recursive on purpose: files were already deleted above, so a
-            // dir that is still non-empty contains kept (excluded) files and
-            // must be preserved. Recursive rmdir would delete them (data loss).
-            await adapter.rmdir(d, false);
-            delDirCount++;
-          }
-        } catch (e: unknown) {
-          console.warn('[joplin-sync] force pull rmdir failed: ' + d + ' - ' + (e instanceof Error ? e.message : String(e)));
-        }
-      }
-
-      this.plugin.mapping.setDeltaCursor('');
-      console.debug('[joplin-sync] force pull: deleted ' + delCount + ' files, ' + delDirCount + ' dirs');
-
-      // Use listAllRemoteItems (listChildren) for full download
-      // delta API only returns recent changes, not all items
+      // Download EVERYTHING first (read-only). The local wipe happens only
+      // after we hold a complete in-memory copy of what we are about to
+      // write — a network failure mid-download must never leave the vault
+      // half-deleted.
+      const preMapped = this.plugin.mapping.all().length;
       console.debug('[joplin-sync] force pull: listing remote items...');
       const remoteStats = await this.listAllRemoteItems();
       console.debug('[joplin-sync] force pull: listed ' + remoteStats.length + ' remote items');
+
       const e2ee = this.plugin.e2ee;
 
       let done = 0; let failed = 0; let skipped = 0; void skipped;
@@ -1046,6 +1038,115 @@ export class SyncEngine {
         }
       }
 
+      // ---- Completeness guard (data-loss brake) ----
+      // The server exposing far fewer notes/folders than this vault has
+      // mapped is almost never a legitimate delete: it is a wrong sync
+      // target, a broken root filter, or a wiped server. Local files are
+      // still intact at this point, so aborting is cheap and safe.
+      const inScope = allItems.filter(i => i.type_ === ModelType.Note || i.type_ === ModelType.Folder).length;
+      if (remoteLooksIncomplete(preMapped, inScope)) {
+        let proceed = false;
+        if (this.uiAvailable && this.plugin.settings.confirmDestructiveOps !== false) {
+          proceed = await confirmDestructive(this.plugin.app, {
+            title: 'Force pull: server looks incomplete',
+            message: 'The server exposes ' + inScope + ' note(s)/folder(s) but this vault has ' + preMapped
+              + ' mapped items. Continuing would replace the local vault with that much smaller set. Verify the server URL and account first — this may be the wrong sync target.',
+            requireText: this.plugin.app.vault.getName() || 'vault',
+            ctaText: 'Continue anyway (delete local extras)',
+          });
+        }
+        if (!proceed) {
+          const msg = 'Force pull aborted: server exposes ' + inScope + ' in-scope item(s) but this vault has '
+            + preMapped + ' mapped. Wrong sync target or wiped server. Nothing was deleted locally.';
+          console.error('[joplin-sync] ' + msg);
+          this.plugin.statusBar.setError('force pull blocked: remote incomplete');
+          new Notice(msg, 15000);
+          const err = new Error('force pull blocked: remote looks incomplete (' + inScope + ' in-scope vs ' + preMapped + ' mapped)') as Error & { __pullAborted?: boolean };
+          err.__pullAborted = true;
+          throw err;
+        }
+      }
+
+      // ---- Only now wipe local: mapping first, then disk ----
+      // Keep the root folder id: ensureRootFolder / serverRoot discovery
+      // established it above, and the pulled tree layout depends on it (B3).
+      const keepRootId = this.plugin.mapping.rootFolderId;
+      this.plugin.mapping.clearAll();
+      this.plugin.baseSnapshots?.clear();
+      if (keepRootId) this.plugin.mapping.setRootFolderId(keepRootId);
+
+      // Delete ALL files and folders except config + excluded dirs
+      const adapter = this.plugin.app.vault.adapter;
+      const isKept = (p: string) => this.shouldExclude(p);
+      let delCount = 0, delDirCount = 0;
+
+      // Delete all non-kept files
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (!isKept(f.path)) {
+          const fm = this.plugin.app.fileManager as unknown as { trashFile?: (f: TAbstractFile) => Promise<void> } | undefined;
+          try {
+            if (fm?.trashFile) await fm.trashFile(f);
+            else await (this.plugin.app.vault as unknown as { remove: (x: TAbstractFile) => Promise<void> }).remove(f);
+            delCount++;
+          } catch (e: unknown) {
+            console.warn('[joplin-sync] force pull file delete failed: ' + f.path + ' - ' + (e instanceof Error ? e.message : String(e)));
+          }
+        }
+      }
+
+      // Delete ALL remaining folders bottom-up, enumerating via the FILESYSTEM
+      // adapter — disk is authoritative, the Obsidian vault model can lag
+      // after hundreds of trashFile calls. adapter.list may return names
+      // with a `./` prefix in real Obsidian: normalize them instead of
+      // filtering on '/' (which silently skipped every folder — B15).
+      const listAll = async (dir: string): Promise<string[]> => {
+        const result: string[] = [];
+        try {
+          if (adapter.list) {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const clean = normDir(sub);
+              if (!clean || clean === '.' || clean === '..') continue;
+              const children = await listAll(clean);
+              result.push(...children, clean);
+            }
+          }
+        } catch {/* ignore unreadable */}
+        return result;
+      };
+      let allLocalDirs: string[] = [];
+      try {
+        if (adapter.list) {
+          const root = await adapter.list('');
+          for (const d of root.folders) {
+            const clean = normDir(d);
+            if (!clean || clean === '.' || clean === '..') continue;
+            if (isKept(clean)) continue;
+            const subs = await listAll(clean);
+            allLocalDirs.push(...subs, clean);
+          }
+        }
+      } catch {/* ignore */}
+      allLocalDirs = [...new Set(allLocalDirs)];
+      allLocalDirs.sort((a, b) => b.split('/').length - a.split('/').length);
+      for (const d of allLocalDirs) {
+        if (isKept(d)) continue;
+        try {
+          if (await adapter.exists(d)) {
+            // Non-recursive on purpose: files were already deleted above, so a
+            // dir that is still non-empty contains kept (excluded) files and
+            // must be preserved. Recursive rmdir would delete them (data loss).
+            await adapter.rmdir(d, false);
+            delDirCount++;
+          }
+        } catch (e: unknown) {
+          console.warn('[joplin-sync] force pull rmdir failed: ' + d + ' - ' + (e instanceof Error ? e.message : String(e)));
+        }
+      }
+
+      this.plugin.mapping.setDeltaCursor('');
+      console.debug('[joplin-sync] force pull: deleted ' + delCount + ' files, ' + delDirCount + ' dirs');
+
       // Pre-compute folder paths from all items.
       // A mirror vault (fresh mapping) must learn the sync root from the
       // server: the top-level `_vault_<name>` folder is THE root — map it to
@@ -1127,6 +1228,7 @@ export class SyncEngine {
               joplinId: item.id, path, type: ModelType.Note,
               localHash: hash, remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
             });
+            this.plugin.baseSnapshots?.set(item.id, item.body ?? '');
             done++;
           } catch (e: unknown) {
             failed++;
@@ -1184,6 +1286,10 @@ export class SyncEngine {
       console.error('[joplin-sync] force pull failed:', msg);
       this.plugin.statusBar.setError(msg);
       new Notice('Force pull failed: ' + msg, 8000);
+      // A blocked pull (wrong sync target / wiped server) must propagate:
+      // InitialSync runs inside syncCycle and would otherwise continue
+      // UPLOADING this vault to the foreign target.
+      if ((e as Error & { __pullAborted?: boolean })?.__pullAborted) throw e;
     } finally {
       await this.plugin.mapping.flush();
     }

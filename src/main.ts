@@ -7,6 +7,7 @@ import { SyncEngine } from './core/SyncEngine';
 import { StatusBar } from './ui/StatusBar';
 import { EncryptionService } from './e2ee/EncryptionService';
 import { ChangeLogStore } from './core/ChangeLogStore';
+import { BaseSnapshotStore } from './core/BaseSnapshotStore';
 import { FileIdentity } from './core/FileIdentity';
 
 export default class JoplinSyncPlugin extends Plugin {
@@ -17,10 +18,16 @@ export default class JoplinSyncPlugin extends Plugin {
   statusBar!: StatusBar;
   e2ee!: EncryptionService;
   changeLog!: ChangeLogStore;
+  baseSnapshots!: BaseSnapshotStore;
   identity!: FileIdentity;
+  /** Real Obsidian UI is available for confirmations. Headless hosts (tests,
+   *  CLI) build plugin stubs without this, and the engine then skips Modal
+   *  prompts instead of hanging on them. */
+  uiConfirmAvailable = false;
   private initialized = false;
 
   async onload() {
+    this.uiConfirmAvailable = true;
     await this.loadSettings();
 
     this.api = new JoplinServerApi(() => ({
@@ -34,6 +41,10 @@ export default class JoplinSyncPlugin extends Plugin {
 
     this.changeLog = new ChangeLogStore(this);
     await this.changeLog.load();
+    this.changeLog.prune();
+
+    this.baseSnapshots = new BaseSnapshotStore(this);
+    await this.baseSnapshots.load();
 
     this.statusBar = new StatusBar(this.addStatusBarItem());
     this.e2ee = new EncryptionService();
@@ -84,7 +95,12 @@ export default class JoplinSyncPlugin extends Plugin {
       name: 'About / Status',
       callback: () => {
         const total = this.mapping.all().length;
-        new Notice('v0.2.1\nMapped items: ' + total + '\nDelta cursor: ' + (this.mapping.getDeltaCursor() ? 'yes' : 'no'));
+        const st = this.api.stats;
+        new Notice('v' + this.manifest.version
+          + '\nMapped items: ' + total
+          + '\nDelta cursor: ' + (this.mapping.getDeltaCursor() ? 'yes' : 'no')
+          + '\nPending local changes: ' + this.changeLog.pending().length
+          + '\nRequests this session: ' + st.requests + ' (retries ' + st.retries + ', throttled ' + st.throttled + ')');
       },
     });
 
@@ -103,6 +119,8 @@ export default class JoplinSyncPlugin extends Plugin {
   onunload(): void {
     void this.engine?.shutdown();
     void this.mapping?.flush();
+    void this.changeLog?.flush();
+    void this.baseSnapshots?.flush();
   }
 
   async loadSettings(): Promise<void> {

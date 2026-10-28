@@ -27,6 +27,22 @@ export class Notice {
   }
 }
 
+// Stub: SyncEngine/SafetyGuards import Modal. Headless tests never interact
+// with it — confirmations are skipped via plugin.uiConfirmAvailable === false.
+export class Modal {
+  titleEl: any = { setText() {} };
+  contentEl: any = {
+    createEl(): any {
+      return { setText() {}, addClass() {}, setAttribute() {}, removeAttribute() {}, addEventListener() {}, style: {} };
+    },
+    createDiv(): any { return { createEl() { return {}; } }; },
+  };
+  onClose = () => {};
+  constructor(_app?: unknown) {}
+  open(): void {}
+  close(): void {}
+}
+
 export function normalizePath(p: string): string {
   return p.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '') || '/';
 }

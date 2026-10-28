@@ -28,7 +28,7 @@ __export(main_exports, {
   default: () => JoplinSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian10 = require("obsidian");
+var import_obsidian11 = require("obsidian");
 
 // src/settings/PluginSettings.ts
 var DEFAULT_SETTINGS = {
@@ -46,7 +46,8 @@ var DEFAULT_SETTINGS = {
   logLevel: "info",
   syncLog: [],
   e2eeEnabled: false,
-  e2eePassword: ""
+  e2eePassword: "",
+  confirmDestructiveOps: true
 };
 
 // src/settings/SettingsTab.ts
@@ -99,6 +100,10 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     }));
     new import_obsidian.Setting(containerEl).setName("Sync on startup").addToggle((t) => t.setValue(this.plugin.settings.syncOnStartup).onChange(async (v) => {
       this.plugin.settings.syncOnStartup = v;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Confirm force push / force pull").setDesc("Ask for a typed vault-name confirmation before overwriting the server or the local vault").addToggle((t) => t.setValue(this.plugin.settings.confirmDestructiveOps).onChange(async (v) => {
+      this.plugin.settings.confirmDestructiveOps = v;
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("Conflict strategy").addDropdown((d) => d.addOption("duplicate", "Duplicate").addOption("local-wins", "Local wins").addOption("remote-wins", "Remote wins").setValue(this.plugin.settings.conflictStrategy).onChange(async (v) => {
@@ -193,11 +198,129 @@ var JoplinSyncSettingTab = class extends import_obsidian.PluginSettingTab {
 
 // src/api/JoplinServerApi.ts
 var import_obsidian2 = require("obsidian");
+
+// src/core/netUtil.ts
+var MD_NAME_RE = /^[0-9a-f]{32}\.md$/;
+var RESOURCE_BLOB_RE = /^\.resource\/([0-9a-f]{32})$/;
+function isMdItemName(name) {
+  return MD_NAME_RE.test(name);
+}
+function resourceBlobId(name) {
+  const m = name.match(RESOURCE_BLOB_RE);
+  return m ? m[1] : null;
+}
+function backoffDelay(attempt, baseMs = 1e3, capMs = 3e4) {
+  const exp = Math.min(capMs, baseMs * Math.pow(2, attempt));
+  return Math.round(exp / 2 + Math.random() * (exp / 2));
+}
+function redactSecrets(input) {
+  let s = typeof input === "string" ? input : (() => {
+    try {
+      return JSON.stringify(input);
+    } catch {
+      return String(input);
+    }
+  })();
+  if (!s)
+    return "";
+  s = s.replace(/("(?:password|passwd|pwd)"\s*:\s*)"[^"]*"/gi, '$1"***"');
+  s = s.replace(/(X-API-AUTH\s*[:=]\s*)[^\s,;'"}]+/gi, "$1***");
+  s = s.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/g, "$1***");
+  s = s.replace(/(sessionId\s*=\s*)[0-9a-f]{32}/gi, "$1***");
+  return s;
+}
+var ConcurrencyGate = class {
+  constructor(limit, maxLimit = limit, minLimit = 1) {
+    this.maxLimit = maxLimit;
+    this.minLimit = minLimit;
+    this.active = 0;
+    this.waiters = [];
+    this._limit = Math.max(minLimit, Math.min(maxLimit, limit));
+  }
+  get limit() {
+    return this._limit;
+  }
+  get pending() {
+    return this.waiters.length;
+  }
+  get inflight() {
+    return this.active;
+  }
+  /** Grow the limit (sustained fast successes). */
+  grow(step = 1) {
+    this._limit = Math.min(this.maxLimit, this._limit + step);
+    this.drain();
+  }
+  /** Shrink the limit (server pushed back). Never drops in-flight work. */
+  shrink(factor = 0.5) {
+    this._limit = Math.max(this.minLimit, Math.floor(this._limit * factor));
+  }
+  async run(fn) {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+  acquire() {
+    if (this.active < this._limit) {
+      this.active++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+  release() {
+    this.active--;
+    this.drain();
+  }
+  drain() {
+    while (this.waiters.length > 0 && this.active < this._limit) {
+      const next = this.waiters.shift();
+      if (!next)
+        break;
+      this.active++;
+      next();
+    }
+  }
+};
+async function mapConcurrent(items, gate, fn) {
+  const out = new Array(items.length);
+  await Promise.all(items.map((item, i) => gate.run(async () => {
+    try {
+      out[i] = { value: await fn(item, i), item };
+    } catch (e) {
+      out[i] = { error: e, item };
+    }
+  })));
+  return out;
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// src/api/JoplinServerApi.ts
+var MAX_RETRIES = 4;
 var _JoplinServerApi = class _JoplinServerApi {
   constructor(getConfig) {
     this.sessionId = null;
     this.loginPromise = null;
+    /** Global outbound gate. Every request goes through it, so the plugin never
+     *  opens more than `limit` sockets regardless of how many call sites fan
+     *  out. Grows on sustained success, halves on 429/5xx. */
+    this.gate = new ConcurrencyGate(6, 12, 1);
+    /** Serialised side-channel counters for the UI / diagnostics. */
+    this.stats = { requests: 0, retries: 0, throttled: 0, bytes: 0 };
     this.execJsonLogCount = 0;
+    /** The delta feed does NOT report an item's `type_`. Deciding whether a
+     *  delete refers to a folder (root folder!) or a note therefore used to
+     *  require a content GET in the puller — an O(n) request storm.
+     *  `listChildren` reports `item_type` on most server builds, so we cache the
+     *  id→type map once per session and refresh it when a delta mentions an id
+     *  we have never seen. */
+    this.itemKinds = /* @__PURE__ */ new Map();
+    this.kindsLoadedAt = 0;
+    this.kindsLoading = null;
     this.getConfig = getConfig;
   }
   async login(force = false) {
@@ -214,10 +337,14 @@ var _JoplinServerApi = class _JoplinServerApi {
         body: JSON.stringify({ email, password }),
         throw: false
       });
-      if (res.status !== 200)
-        throw new Error("Login failed (" + res.status + "): " + res.text);
+      if (res.status !== 200) {
+        throw new Error("Login failed (" + res.status + "): " + redactSecrets(res.text).slice(0, 300));
+      }
       const body = res.json;
-      this.sessionId = body.id;
+      const id = body.id;
+      if (!id)
+        throw new Error("Login failed: server returned no session id");
+      this.sessionId = id;
     };
     if (force) {
       await doLogin();
@@ -228,42 +355,68 @@ var _JoplinServerApi = class _JoplinServerApi {
       return this.loginPromise;
     }
   }
+  /** Drop the cached session (settings changed / logout). */
+  resetSession() {
+    this.sessionId = null;
+  }
   async rawRequest(method, path, opts = {}) {
     if (!this.sessionId)
       await this.login();
-    const maxRetries = opts.retries ?? 3;
+    const maxRetries = opts.retries ?? MAX_RETRIES;
     const timeoutMs = opts.timeout ?? _JoplinServerApi.DEFAULT_TIMEOUT_MS;
-    for (let attempt = 0; ; attempt++) {
+    for (let attempt = 0, authRetries = 0; ; ) {
       const headers = {
         "X-API-AUTH": this.sessionId,
         "X-API-MIN-VERSION": "2.6.0"
       };
       if (opts.contentType)
         headers["Content-Type"] = opts.contentType;
+      let res = null;
       try {
-        const res = await this.requestWithTimeout(method, path, headers, opts.body, timeoutMs);
-        if (res.status === 401) {
-          this.sessionId = null;
-          await this.login(true);
-          continue;
-        }
-        if (res.status === 429 && attempt < maxRetries) {
-          await this.sleep(Math.pow(2, attempt) * 1e3);
-          continue;
-        }
-        if (res.status >= 500 && attempt < maxRetries) {
-          await this.sleep(Math.pow(4, attempt) * 1e3);
-          continue;
-        }
-        return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
+        this.stats.requests++;
+        res = await this.gate.run(() => this.requestWithTimeout(method, path, headers, opts.body, timeoutMs));
       } catch (e) {
         if (attempt < maxRetries) {
-          console.warn("[joplin-sync] request failed (attempt " + (attempt + 1) + "/" + (maxRetries + 1) + "), retrying: " + method + " " + path + " \u2014 " + (e instanceof Error ? e.message : String(e)));
-          await this.sleep(Math.pow(2, attempt) * 1e3);
+          this.stats.retries++;
+          const delay = backoffDelay(attempt);
+          console.warn("[joplin-sync] request failed (attempt " + (attempt + 1) + "/" + (maxRetries + 1) + "), retrying in " + delay + "ms: " + method + " " + path + " \u2014 " + redactSecrets(e instanceof Error ? e.message : String(e)));
+          attempt++;
+          await sleep(delay);
           continue;
         }
         throw e;
       }
+      if (res.status === 401) {
+        if (authRetries >= 2)
+          throw new ApiError(401, "Authentication failed after re-login: " + redactSecrets(res.text).slice(0, 200));
+        authRetries++;
+        this.sessionId = null;
+        await this.login(true);
+        continue;
+      }
+      if (res.status === 429) {
+        this.stats.throttled++;
+        this.gate.shrink();
+        if (attempt < maxRetries) {
+          this.stats.retries++;
+          const delay = backoffDelay(attempt, 2e3);
+          attempt++;
+          await sleep(delay);
+          continue;
+        }
+      }
+      if (res.status >= 500 && attempt < maxRetries) {
+        this.gate.shrink();
+        this.stats.retries++;
+        const delay = backoffDelay(attempt);
+        attempt++;
+        await sleep(delay);
+        continue;
+      }
+      if (res.status < 400)
+        this.gate.grow();
+      this.stats.bytes += res.arrayBuffer?.byteLength ?? 0;
+      return { status: res.status, text: res.text, arrayBuffer: res.arrayBuffer };
     }
   }
   /** requestUrl with a hard timeout. Obsidian's requestUrl has no built-in
@@ -287,13 +440,6 @@ var _JoplinServerApi = class _JoplinServerApi {
         window.clearTimeout(timer);
     });
   }
-  safeJson(text) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return null;
-    }
-  }
   async exec(method, path, opts = {}) {
     const res = await this.rawRequest(method, path, opts);
     let json = null;
@@ -302,7 +448,7 @@ var _JoplinServerApi = class _JoplinServerApi {
     } catch {
       if (this.execJsonLogCount < 5) {
         this.execJsonLogCount++;
-        console.warn("[joplin-sync] non-json response", method, path, "status=" + res.status, "body=" + res.text.slice(0, 200));
+        console.warn("[joplin-sync] non-json response", method, path, "status=" + res.status, "body=" + redactSecrets(res.text).slice(0, 200));
       }
     }
     return { ...res, json };
@@ -335,7 +481,7 @@ var _JoplinServerApi = class _JoplinServerApi {
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
     if (!res.json)
-      throw new ApiError(res.status, "PUT response not JSON: " + res.text.slice(0, 200));
+      throw new ApiError(res.status, "PUT response not JSON: " + redactSecrets(res.text).slice(0, 200));
     return {
       id: res.json.id || "",
       updated_time: res.json.updated_time || Date.now()
@@ -352,7 +498,7 @@ var _JoplinServerApi = class _JoplinServerApi {
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
     if (!res.json)
-      throw new ApiError(res.status, "listChildren body is not JSON: " + res.text.slice(0, 200));
+      throw new ApiError(res.status, "listChildren body is not JSON: " + redactSecrets(res.text).slice(0, 200));
     return res.json;
   }
   async listChildrenOf(parentId, cursor, itemType) {
@@ -367,7 +513,7 @@ var _JoplinServerApi = class _JoplinServerApi {
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
     if (!res.json)
-      throw new ApiError(res.status, "listChildrenOf body is not JSON: " + res.text.slice(0, 200));
+      throw new ApiError(res.status, "listChildrenOf body is not JSON: " + redactSecrets(res.text).slice(0, 200));
     return res.json;
   }
   async delta(cursor) {
@@ -376,20 +522,70 @@ var _JoplinServerApi = class _JoplinServerApi {
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
     if (!res.json)
-      throw new ApiError(res.status, "delta body is not JSON: " + res.text.slice(0, 200));
+      throw new ApiError(res.status, "delta body is not JSON: " + redactSecrets(res.text).slice(0, 200));
     const raw = res.json;
     const items = raw.items ?? [];
     for (const item of items) {
       if (item.item_name)
         item.name = item.item_name;
-      if (item.jop_updated_time)
-        item.updated_time = item.jop_updated_time;
+      const jut = item.jop_updated_time;
+      if (jut !== void 0 && jut !== null) {
+        const n = typeof jut === "number" ? jut : Date.parse(String(jut));
+        if (Number.isFinite(n) && n > 0)
+          item.updated_time = n;
+      }
       if (item.type !== void 0 && item.type !== null)
         item.type = Number(item.type);
-      if (item.item_type !== void 0 && item.item_type !== null)
-        item.item_type = Number(item.item_type);
     }
-    return { items, has_more: !!raw.has_more, cursor: raw.cursor };
+    const page = { items, has_more: !!raw.has_more, cursor: raw.cursor };
+    await this.mergeItemKinds(page.items);
+    return page;
+  }
+  getKnownItemType(id) {
+    return this.itemKinds.get(id);
+  }
+  async loadItemKinds(force = false) {
+    if (!force && this.kindsLoadedAt > 0)
+      return;
+    if (this.kindsLoading)
+      return this.kindsLoading;
+    this.kindsLoading = (async () => {
+      let cursor;
+      let pages = 0;
+      while (pages < 500) {
+        pages++;
+        const page = await this.listChildrenOf("", cursor);
+        for (const it of page.items) {
+          const m = it.name.match(/^([0-9a-f]{32})\.md$/);
+          if (!m)
+            continue;
+          const t = it.item_type ?? it.type_;
+          if (typeof t === "number" && t > 0)
+            this.itemKinds.set(m[1], t);
+        }
+        cursor = page.cursor;
+        if (!page.has_more || !cursor)
+          break;
+      }
+      this.kindsLoadedAt = Date.now();
+    })().finally(() => {
+      this.kindsLoading = null;
+    });
+    return this.kindsLoading;
+  }
+  /** Remember a type we learned from an item body (free, no extra request). */
+  rememberItemType(id, type) {
+    if (type > 0)
+      this.itemKinds.set(id, type);
+  }
+  async mergeItemKinds(items) {
+    const unknown = items.some((i) => isMdItemName(i.name) && !this.itemKinds.has(i.name.slice(0, 32)));
+    if (unknown) {
+      try {
+        await this.loadItemKinds(this.kindsLoadedAt === 0);
+      } catch {
+      }
+    }
   }
   async acquireLock(type, clientType, clientId) {
     const res = await this.exec("POST", "/api/locks", {
@@ -401,7 +597,7 @@ var _JoplinServerApi = class _JoplinServerApi {
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
     if (!res.json)
-      throw new ApiError(res.status, "acquireLock body is not JSON: " + res.text.slice(0, 200));
+      throw new ApiError(res.status, "acquireLock body is not JSON: " + redactSecrets(res.text).slice(0, 200));
     return res.json;
   }
   async releaseLock(type, clientType, clientId) {
@@ -412,14 +608,11 @@ var _JoplinServerApi = class _JoplinServerApi {
     if (res.status !== 200)
       throw new ApiError(res.status, res.text);
     if (!res.json)
-      throw new ApiError(res.status, "listLocks body is not JSON: " + res.text.slice(0, 200));
+      throw new ApiError(res.status, "listLocks body is not JSON: " + redactSecrets(res.text).slice(0, 200));
     return res.json;
   }
   trimSlash(u) {
     return u.replace(/\/+$/, "");
-  }
-  sleep(ms) {
-    return new Promise((r) => window.setTimeout(r, ms));
   }
 };
 /** Per-request timeout. Without it a stalled server connection (accepts the
@@ -430,7 +623,7 @@ _JoplinServerApi.DEFAULT_TIMEOUT_MS = 12e4;
 var JoplinServerApi = _JoplinServerApi;
 var ApiError = class extends Error {
   constructor(status, text) {
-    super("API error " + status + ": " + text);
+    super("API error " + status + ": " + redactSecrets(text).slice(0, 500));
     this.status = status;
   }
 };
@@ -577,7 +770,7 @@ var MappingStore = class {
 };
 
 // src/core/SyncEngine.ts
-var import_obsidian9 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 
 // src/convert/JoplinSerializer.ts
 var NOTE_FIELD_ORDER = [
@@ -1097,7 +1290,7 @@ var ResourceManager = class {
     }
     return accumulated;
   }
-  async downloadResource(meta) {
+  async downloadResource(meta, force = false) {
     const e2ee = this.plugin.e2ee;
     let metaToUse = meta;
     if (e2ee.isEncrypted(meta)) {
@@ -1107,7 +1300,7 @@ var ResourceManager = class {
     }
     const existing = this.plugin.mapping.getById(meta.id);
     const correctPath = metaToUse.filename ? (0, import_obsidian4.normalizePath)(metaToUse.filename) : "";
-    if (existing && (metaToUse.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
+    if (!force && existing && (metaToUse.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
       if (correctPath && existing.path !== correctPath) {
         this.plugin.mapping.remove(existing.joplinId);
       } else if (this.plugin.app.vault.getAbstractFileByPath(existing.path)) {
@@ -1171,63 +1364,124 @@ var ResourceManager = class {
 
 // src/core/ConflictResolver.ts
 var import_obsidian5 = require("obsidian");
+
+// src/core/merge3.ts
+function diffHunks(base, other, side) {
+  const n = base.length;
+  const m = other.length;
+  if (n * m > 4e6)
+    return [];
+  const width = m + 1;
+  const lcs = new Uint32Array((n + 1) * width);
+  for (let i2 = n - 1; i2 >= 0; i2--) {
+    const row = i2 * width;
+    const nextRow = (i2 + 1) * width;
+    for (let j2 = m - 1; j2 >= 0; j2--) {
+      lcs[row + j2] = base[i2] === other[j2] ? lcs[nextRow + j2 + 1] + 1 : Math.max(lcs[nextRow + j2], lcs[row + j2 + 1]);
+    }
+  }
+  const hunks = [];
+  let i = 0;
+  let j = 0;
+  let pending = null;
+  while (i < n && j < m) {
+    if (base[i] === other[j]) {
+      if (pending) {
+        hunks.push(pending);
+        pending = null;
+      }
+      i++;
+      j++;
+      continue;
+    }
+    if (!pending)
+      pending = { start: i, end: i, lines: [], side };
+    if (lcs[(i + 1) * width + j] >= lcs[i * width + j + 1]) {
+      pending.end = ++i;
+    } else {
+      pending.lines.push(other[j]);
+      j++;
+    }
+  }
+  if (pending) {
+    while (i < n) {
+      pending.end = ++i;
+    }
+    hunks.push(pending);
+    pending = null;
+  }
+  if (j < m) {
+    const h = { start: n, end: n, lines: other.slice(j), side };
+    hunks.push(h);
+  }
+  return hunks;
+}
+function overlaps(a, b) {
+  if (a.start === a.end && b.start === b.end)
+    return a.start === b.start;
+  if (a.start === a.end)
+    return b.start < a.start && a.start < b.end;
+  if (b.start === b.end)
+    return a.start < b.start && b.start < a.end;
+  return a.start < b.end && b.start < a.end;
+}
+function merge3(base, local, remote) {
+  if (local === remote)
+    return local;
+  if (local === base)
+    return remote;
+  if (remote === base)
+    return local;
+  const baseLines = base.split("\n");
+  const localHunks = diffHunks(baseLines, local.split("\n"), "local");
+  const remoteHunks = diffHunks(baseLines, remote.split("\n"), "remote");
+  const conflicts = localHunks.some((lh) => remoteHunks.some((rh) => overlaps(lh, rh) && lh.lines.join("\n") !== rh.lines.join("\n")));
+  if (conflicts)
+    return null;
+  const all = [...localHunks, ...remoteHunks].sort((x, y) => x.start - y.start || x.end - y.end);
+  const out = [];
+  let cursor = 0;
+  for (const h of all) {
+    if (h.start < cursor)
+      continue;
+    out.push(...baseLines.slice(cursor, h.start));
+    out.push(...h.lines);
+    cursor = Math.max(cursor, h.end);
+  }
+  out.push(...baseLines.slice(cursor));
+  return out.join("\n");
+}
+
+// src/core/ConflictResolver.ts
 var ConflictResolver = class {
   constructor(plugin, watcher) {
     this.plugin = plugin;
     this.watcher = watcher;
   }
   async resolve(mapping, remote, localContent, targetPath) {
-    const base = await this.readBase(mapping);
+    const base = this.readBase(mapping, remote);
     if (base !== null) {
-      const merged = this.tryMerge(base, localContent, remote.body ?? "");
-      if (merged) {
+      const merged = merge3(
+        normalizeForMerge(base),
+        normalizeForMerge(localContent),
+        normalizeForMerge(remote.body ?? "")
+      );
+      if (merged !== null) {
         await this.applyMerged(mapping, remote, merged, targetPath);
         return;
       }
     }
     await this.resolveByStrategy(mapping, remote, localContent, targetPath);
   }
-  /** Read base content if stored (mapping keeps only a hash — subclasses may persist full base). */
-  async readBase(mapping) {
-    const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path);
-    if (f instanceof import_obsidian5.TFile) {
-      const content = await this.plugin.app.vault.read(f);
-      const h = await sha256(content);
-      if (h === mapping.localHash)
-        return content;
+  /** Last-synced body for this note, or null if we have no usable base. */
+  readBase(mapping, remote) {
+    const snap = this.plugin.baseSnapshots?.get(mapping.joplinId);
+    if (typeof snap === "string")
+      return snap;
+    if (remote.updated_time && remote.updated_time <= mapping.remoteUpdatedTime) {
+      return remote.body ?? null;
     }
     return null;
-  }
-  /** Line-based merge: identical base lines are dropped; diverging hunks kept. */
-  tryMerge(base, local, remote) {
-    const b = base.split("\n"), l = local.split("\n"), r = remote.split("\n");
-    if (l.join("\n") === b.join("\n"))
-      return remote;
-    if (r.join("\n") === b.join("\n"))
-      return local;
-    const out = [];
-    let conflict = false;
-    const max = Math.max(b.length, l.length, r.length);
-    for (let i = 0; i < max; i++) {
-      const lb = b[i], ll = l[i], lr = r[i];
-      if (ll !== void 0 && ll === lb) {
-        if (lr !== void 0)
-          out.push(lr);
-      } else if (lr !== void 0 && lr === lb) {
-        if (ll !== void 0)
-          out.push(ll);
-      } else if (ll === lr) {
-        out.push(ll ?? "");
-      } else if (ll === void 0 && lr === void 0) {
-        continue;
-      } else {
-        conflict = true;
-        break;
-      }
-    }
-    if (conflict)
-      return null;
-    return out.join("\n");
   }
   async applyMerged(mapping, remote, merged, targetPath) {
     const f = this.plugin.app.vault.getAbstractFileByPath(targetPath);
@@ -1244,15 +1498,20 @@ var ConflictResolver = class {
       ...mapping,
       path: targetPath,
       localHash: await sha256(merged),
-      remoteUpdatedTime: remote.updated_time,
+      // The merged text is NOT on the server yet: leaving remoteUpdatedTime at
+      // the remote value would make the next pull treat it as up-to-date and
+      // the merge would never be pushed. Zeroing it makes the push path see
+      // "remote moved" and upload the merged body.
+      remoteUpdatedTime: 0,
       syncedAt: Date.now()
     });
+    this.plugin.baseSnapshots?.set(mapping.joplinId, remote.body ?? "");
     new import_obsidian5.Notice("Sync: auto-merged changes for " + targetPath);
   }
   async resolveByStrategy(mapping, remote, localContent, targetPath) {
     switch (this.plugin.settings.conflictStrategy) {
       case "local-wins":
-        this.plugin.mapping.upsert({ ...mapping, path: targetPath, remoteUpdatedTime: remote.updated_time });
+        this.plugin.mapping.upsert({ ...mapping, path: targetPath, remoteUpdatedTime: 0 });
         return;
       case "remote-wins":
         return this.applyRemote(mapping, remote, targetPath);
@@ -1260,7 +1519,7 @@ var ConflictResolver = class {
       default: {
         const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "");
         const base = mapping.path.replace(/\.md$/, "").split("/").pop();
-        const conflictPath = (0, import_obsidian5.normalizePath)("_conflicts/" + base + " (conflict " + ts + ").md");
+        const conflictPath = uniqueConflictPath(this.plugin, (0, import_obsidian5.normalizePath)("_conflicts/" + base + " (conflict " + ts + ").md"));
         if (!this.plugin.app.vault.getAbstractFileByPath("_conflicts")) {
           await this.plugin.app.vault.createFolder("_conflicts").catch(() => {
           });
@@ -1291,8 +1550,24 @@ var ConflictResolver = class {
       remoteUpdatedTime: remote.updated_time,
       syncedAt: Date.now()
     });
+    this.plugin.baseSnapshots?.set(mapping.joplinId, remote.body ?? "");
   }
 };
+function uniqueConflictPath(plugin, path) {
+  if (!plugin.app.vault.getAbstractFileByPath(path))
+    return path;
+  const dot = path.lastIndexOf(".md");
+  const stem = dot >= 0 ? path.slice(0, dot) : path;
+  for (let i = 2; i < 1e3; i++) {
+    const candidate = stem + " " + i + ".md";
+    if (!plugin.app.vault.getAbstractFileByPath(candidate))
+      return candidate;
+  }
+  return stem + " " + Date.now() + ".md";
+}
+function normalizeForMerge(body) {
+  return body.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/^joplin-file-id:.*\n?/m, "");
+}
 
 // src/core/LocalPusher.ts
 var LocalPusher = class {
@@ -1305,24 +1580,47 @@ var LocalPusher = class {
   async pushAll() {
     const changes = this.changeLog.pending();
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
-    const failed = [];
-    for (const change of changes) {
-      try {
-        const op = await this.pushOne(change);
-        if (op === "create")
-          stats.created++;
-        else if (op === "update")
-          stats.updated++;
-        else if (op === "delete")
-          stats.deleted++;
-        this.changeLog.markSynced(change.fileId);
-      } catch (e) {
-        console.error("[joplin-sync] push failed: " + change.path, e);
+    if (changes.length === 0)
+      return stats;
+    const folderOps = changes.filter((c) => c.type === 2 /* Folder */);
+    const fileOps = changes.filter((c) => c.type !== 2 /* Folder */);
+    for (const change of folderOps) {
+      await this.pushOneTracked(change, stats);
+    }
+    const results = await mapConcurrent(fileOps, this.plugin.api.gate, (change) => this.pushOne(change));
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const change = fileOps[i];
+      if (r.error !== void 0) {
+        console.error("[joplin-sync] push failed: " + change.path, r.error);
         stats.fail++;
-        failed.push(change);
+        continue;
       }
+      const op = r.value;
+      if (op === "create")
+        stats.created++;
+      else if (op === "update")
+        stats.updated++;
+      else if (op === "delete")
+        stats.deleted++;
+      this.changeLog.markSynced(change.fileId);
     }
     return stats;
+  }
+  async pushOneTracked(change, stats) {
+    try {
+      const op = await this.pushOne(change);
+      if (op === "create")
+        stats.created++;
+      else if (op === "update")
+        stats.updated++;
+      else if (op === "delete")
+        stats.deleted++;
+      this.changeLog.markSynced(change.fileId);
+    } catch (e) {
+      console.error("[joplin-sync] push failed: " + change.path, e);
+      stats.fail++;
+    }
   }
   async pushOne(c) {
     switch (c.op) {
@@ -1411,26 +1709,32 @@ var LocalPusher = class {
       };
       const cipherSerialized = this.serializer.serialize(cipherItem);
       const res2 = await this.plugin.api.putItem(id + ".md", cipherSerialized);
-      this.plugin.mapping.upsert({
-        joplinId: id,
-        path,
-        type: 1 /* Note */,
-        localHash: hash,
-        remoteUpdatedTime: res2.updated_time,
-        syncedAt: Date.now()
-      });
+      this.recordSynced(id, path, hash, res2.updated_time);
       return isNew ? "create" : "update";
     }
     const res = await this.plugin.api.putItem(id + ".md", this.serializer.serialize(item));
+    this.recordSynced(id, path, hash, res.updated_time);
+    return isNew ? "create" : "update";
+  }
+  /** Record the successful push: mapping + last-synced base snapshot (so a
+   *  future concurrent edit can be three-way merged instead of duplicated). */
+  recordSynced(id, path, hash, remoteUpdatedTime) {
     this.plugin.mapping.upsert({
       joplinId: id,
       path,
       type: 1 /* Note */,
       localHash: hash,
-      remoteUpdatedTime: res.updated_time,
+      remoteUpdatedTime,
       syncedAt: Date.now()
     });
-    return isNew ? "create" : "update";
+    this.plugin.baseSnapshots?.delete(id);
+    const f = this.plugin.app.vault.getAbstractFileByPath(path);
+    if (f instanceof import_obsidian6.TFile) {
+      void this.plugin.app.vault.read(f).then((content) => {
+        this.plugin.baseSnapshots?.set(id, content);
+      }).catch(() => {
+      });
+    }
   }
   async deleteItem(path, fileId, isFolder) {
     const key = isFolder ? path + "/" : path;
@@ -1452,6 +1756,7 @@ var LocalPusher = class {
     }
     await this.plugin.api.deleteItem(entry.joplinId + ".md");
     this.plugin.mapping.remove(entry.joplinId);
+    this.plugin.baseSnapshots?.delete(entry.joplinId);
     this.plugin.mapping.addTombstone(entry.joplinId, entry.type);
     return "delete";
   }
@@ -1654,7 +1959,7 @@ var FileIdentity = class {
 };
 
 // src/core/DeltaPuller.ts
-var _DeltaPuller = class _DeltaPuller {
+var DeltaPuller = class {
   // item_id → full path
   constructor(plugin, watcher) {
     this.plugin = plugin;
@@ -1713,10 +2018,15 @@ var _DeltaPuller = class _DeltaPuller {
     }
     return false;
   }
+  /** Pull download concurrency is governed by the API client's shared
+   *  ConcurrencyGate: it starts at 6, grows on sustained success and halves
+   *  when the server answers 429/5xx — faster than the old fixed 5-batch on a
+   *  healthy server, safer than it on a slow one. */
   async pullAll() {
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
     const changes = [];
     const deletes = [];
+    const blobChangedIds = /* @__PURE__ */ new Set();
     let cursor = this.plugin.mapping.getDeltaCursor();
     while (true) {
       let page;
@@ -1743,7 +2053,12 @@ var _DeltaPuller = class _DeltaPuller {
           deletes.push(id);
           continue;
         }
-        if (!d.name.startsWith(".resource/") && /^[0-9a-f]{32}\.md$/.test(d.name)) {
+        const blobId = resourceBlobId(d.name);
+        if (blobId) {
+          blobChangedIds.add(blobId);
+          continue;
+        }
+        if (/^[0-9a-f]{32}\.md$/.test(d.name)) {
           changes.push(d);
         }
       }
@@ -1759,19 +2074,17 @@ var _DeltaPuller = class _DeltaPuller {
     }
     const goneIds = /* @__PURE__ */ new Set();
     if (deletes.length > 0) {
-      for (const batch of chunk(deletes, _DeltaPuller.DOWNLOAD_BATCH)) {
-        const results = await Promise.all(batch.map(async (id) => {
-          try {
-            const stillThere = await this.plugin.api.getItem(id + ".md");
-            return stillThere === null ? id : null;
-          } catch (e) {
-            console.warn("[joplin-sync] delete verification failed for " + id + ", skipping local delete: " + (e instanceof Error ? e.message : String(e)));
-            return null;
-          }
-        }));
-        for (const id of results)
-          if (id)
-            goneIds.add(id);
+      const results = await mapConcurrent(deletes, this.plugin.api.gate, async (id) => {
+        const stillThere = await this.plugin.api.getItem(id + ".md");
+        return stillThere === null ? id : null;
+      });
+      for (const r of results) {
+        if (r.error !== void 0) {
+          console.warn("[joplin-sync] delete verification failed for " + r.item + ", skipping local delete: " + redactErr(r.error));
+          continue;
+        }
+        if (r.value)
+          goneIds.add(r.value);
       }
     }
     for (const id of deletes) {
@@ -1788,26 +2101,28 @@ var _DeltaPuller = class _DeltaPuller {
       }
     }
     const downloaded = [];
+    const changeNames = new Set(changes.map((c) => c.name));
+    for (const blobId of blobChangedIds) {
+      const name = blobId + ".md";
+      if (changeNames.has(name))
+        continue;
+      changes.push({ name, type: 2 /* Update */, updated_time: 0 });
+      changeNames.add(name);
+    }
     if (changes.length > 0) {
-      console.debug("[joplin-sync] pull: downloading " + changes.length + " changed items in parallel batches of " + _DeltaPuller.DOWNLOAD_BATCH + "...");
-      let batchNum = 0;
-      for (const batch of chunk(changes, _DeltaPuller.DOWNLOAD_BATCH)) {
-        batchNum++;
-        if (batchNum % 40 === 0)
-          console.debug("[joplin-sync] pull: download batch " + batchNum + "/" + Math.ceil(changes.length / _DeltaPuller.DOWNLOAD_BATCH) + " (" + downloaded.length + " so far)");
-        const results = await Promise.all(batch.map(async (d) => {
-          try {
-            const raw = await this.plugin.api.getItem(d.name);
-            return raw !== null ? { d, raw } : null;
-          } catch (e) {
-            stats.fail++;
-            console.error("[joplin-sync] pull download failed", d.name, e);
-            return null;
-          }
-        }));
-        for (const r of results)
-          if (r)
-            downloaded.push(r);
+      console.debug("[joplin-sync] pull: downloading " + changes.length + " changed items (gate limit " + this.plugin.api.gate.limit + ")...");
+      const results = await mapConcurrent(changes, this.plugin.api.gate, async (d) => {
+        const raw = await this.plugin.api.getItem(d.name);
+        return raw !== null ? { d, raw } : null;
+      });
+      for (const r of results) {
+        if (r.error !== void 0) {
+          stats.fail++;
+          console.error("[joplin-sync] pull download failed", r.item.name, r.error);
+          continue;
+        }
+        if (r.value)
+          downloaded.push(r.value);
       }
     }
     const allItems = [];
@@ -1857,16 +2172,14 @@ var _DeltaPuller = class _DeltaPuller {
       }
     }
     if (resources.length > 0) {
-      for (const batch of chunk(resources, _DeltaPuller.DOWNLOAD_BATCH)) {
-        await Promise.all(batch.map(async (r) => {
-          try {
-            await this.applyResource(r);
-            stats.created++;
-          } catch (e) {
-            stats.fail++;
-            console.error("[joplin-sync] resource apply failed", r.id, e);
-          }
-        }));
+      const results = await mapConcurrent(resources, this.plugin.api.gate, (r) => this.applyResource(r, blobChangedIds.has(r.id)));
+      for (const r of results) {
+        if (r.error !== void 0) {
+          stats.fail++;
+          console.error("[joplin-sync] resource apply failed", r.item.id, r.error);
+        } else {
+          stats.created++;
+        }
       }
     }
     this.plugin.mapping.setDeltaCursor(cursor ?? "");
@@ -1986,12 +2299,29 @@ var _DeltaPuller = class _DeltaPuller {
   }
   /** Remove a locally-mapped item from the vault + mapping. The server
    *  existence check is done up front in pullAll (in parallel); this only does
-   *  the local removal for ids already confirmed gone on the server. */
+   *  the local removal for ids already confirmed gone on the server.
+   *
+   *  Remote delete + local edit is a genuine conflict: the file changed here
+   *  since the last sync, so deleting it would destroy work the server never
+   *  saw. Keep the file and zero remoteUpdatedTime so the next push re-uploads
+   *  it (delete is effectively rejected). Unchanged files are deleted. */
   async applyDeleteLocal(id) {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping)
       return false;
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ""));
+    if (f instanceof import_obsidian7.TFile && mapping.type === 1 /* Note */ && mapping.localHash) {
+      try {
+        const content = await this.plugin.app.vault.read(f);
+        if (await sha256(content) !== mapping.localHash) {
+          console.warn("[joplin-sync] remote delete for " + mapping.path + " conflicts with local edits \u2014 keeping the file and re-uploading it");
+          new import_obsidian7.Notice('Conflict: "' + mapping.path + '" was deleted on the server but edited locally. Local copy kept.', 8e3);
+          this.plugin.mapping.upsert({ ...mapping, remoteUpdatedTime: 0 });
+          return false;
+        }
+      } catch {
+      }
+    }
     if (f) {
       this.watcher.suppress(f.path);
       if (f instanceof import_obsidian7.TFile) {
@@ -2009,6 +2339,7 @@ var _DeltaPuller = class _DeltaPuller {
       this.watcher.release(f.path);
     }
     this.plugin.mapping.remove(id);
+    this.plugin.baseSnapshots?.delete(id);
     return true;
   }
   async writeFile(path, content) {
@@ -2039,13 +2370,10 @@ var _DeltaPuller = class _DeltaPuller {
       remoteUpdatedTime: item.updated_time,
       syncedAt: Date.now()
     });
+    this.plugin.baseSnapshots?.set(item.id, item.body ?? "");
   }
-  async applyResource(item) {
-    try {
-      await this.resources.downloadResource(item);
-    } catch (e) {
-      console.error("[joplin-sync] download resource failed: " + item.id, e);
-    }
+  async applyResource(item, forceBlob = false) {
+    await this.resources.downloadResource(item, forceBlob);
   }
   resolveFolderPath(parentId) {
     if (!parentId)
@@ -2095,16 +2423,9 @@ var _DeltaPuller = class _DeltaPuller {
     return p;
   }
 };
-/** Concurrency for parallel network work. Mirrors the proven forcePull batch
- *  size (B40): 5-at-a-time cut a 1000+ item pull from 15+ min to <30s on a
- *  local network. Kept modest so a slow/misbehaving server isn't hammered. */
-_DeltaPuller.DOWNLOAD_BATCH = 5;
-var DeltaPuller = _DeltaPuller;
-function chunk(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size)
-    out.push(arr.slice(i, i + size));
-  return out;
+function redactErr(e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.replace(/(X-API-AUTH\s*[:=]\s*)[^\s,;'"}]+/gi, "$1***");
 }
 
 // src/core/InitialSync.ts
@@ -2140,7 +2461,7 @@ var InitialSync = class {
     let done = 0;
     let fail = 0;
     if (!this.plugin.settings.syncFoldersOnly) {
-      for (const batch of chunk2(unmapped, 5)) {
+      for (const batch of chunk(unmapped, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
             const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -2243,11 +2564,74 @@ var InitialSync = class {
       remoteUpdatedTime: res.updated_time || now,
       syncedAt: now
     });
+    this.plugin.baseSnapshots?.set(id, content);
   }
   collectMarkdownFiles() {
     return this.plugin.app.vault.getMarkdownFiles().filter((f) => !this.plugin.engine.shouldExclude(f.path));
   }
 };
+
+// src/ui/SafetyGuards.ts
+var import_obsidian9 = require("obsidian");
+function confirmDestructive(app, opts) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => {
+      if (settled)
+        return;
+      settled = true;
+      modal.close();
+      resolve(v);
+    };
+    const modal = new import_obsidian9.Modal(app);
+    modal.titleEl.setText(opts.title);
+    modal.contentEl.createEl("p", { text: opts.message });
+    let input = null;
+    if (opts.requireText) {
+      modal.contentEl.createEl("p", {
+        text: 'Type "' + opts.requireText + '" to confirm:',
+        cls: "mod-warning"
+      });
+      input = modal.contentEl.createEl("input", { type: "text" });
+      input.style.width = "100%";
+    }
+    const btns = modal.contentEl.createDiv({ cls: "modal-button-container" });
+    const okBtn = btns.createEl("button", { text: opts.ctaText });
+    okBtn.addClass("mod-warning");
+    okBtn.addClass("mod-cta");
+    if (opts.requireText)
+      okBtn.setAttribute("disabled", "true");
+    const cancelBtn = btns.createEl("button", { text: "Cancel" });
+    cancelBtn.onclick = () => finish(false);
+    okBtn.onclick = () => {
+      if (opts.requireText && (input?.value ?? "").trim() !== opts.requireText) {
+        okBtn.setText("Type the name exactly");
+        return;
+      }
+      finish(true);
+    };
+    input?.addEventListener("input", () => {
+      const match = (input?.value ?? "").trim() === opts.requireText;
+      if (match)
+        okBtn.removeAttribute("disabled");
+      else
+        okBtn.setAttribute("disabled", "true");
+    });
+    modal.onClose = () => {
+      if (!settled) {
+        settled = true;
+        resolve(false);
+      }
+    };
+    modal.open();
+    input?.focus();
+  });
+}
+function remoteLooksIncomplete(mappedCount, remoteInScope) {
+  if (mappedCount < 5)
+    return false;
+  return remoteInScope < Math.max(1, Math.floor(mappedCount * 0.5));
+}
 
 // src/core/SyncEngine.ts
 var normDir = (p) => p.replace(/^\.\//, "").replace(/\/+$/, "");
@@ -2266,6 +2650,29 @@ var SyncEngine = class {
   }
   get configDir() {
     return this.plugin.app.vault.configDir ?? ".obsidian";
+  }
+  /** True only in the real Obsidian plugin (set in main.ts). Headless hosts
+   *  (tests / CLI) construct plugin stubs without it: confirmations are
+   *  skipped there instead of hanging on a stubbed Modal. */
+  get uiAvailable() {
+    return this.plugin.uiConfirmAvailable === true;
+  }
+  /** Typed confirmation for destructive ops. Returns false (do NOT proceed)
+   *  when the user declines OR when there is no UI and the operation must
+   *  not run unattended. */
+  async confirmDestructiveOp(kind) {
+    if (!this.uiAvailable)
+      return true;
+    if (this.plugin.settings.confirmDestructiveOps === false)
+      return true;
+    const vaultName = this.plugin.app.vault.getName() || "vault";
+    const msg = kind === "push" ? 'Force push will DELETE the server copy of vault "' + vaultName + '" (notes, folders, attachments under its own root) and re-upload the local vault. Items of other vaults on the same account are preserved. This cannot be undone.' : 'Force pull will DELETE every non-excluded local file in vault "' + vaultName + '" and replace it with the server copy. Local-only files are moved to the Obsidian trash where possible. This cannot be undone.';
+    return confirmDestructive(this.plugin.app, {
+      title: kind === "push" ? "Force push (overwrite server)" : "Force pull (overwrite local)",
+      message: msg,
+      requireText: vaultName,
+      ctaText: kind === "push" ? "Delete server copy & re-upload" : "Delete local copy & re-download"
+    });
   }
   /**
    * Provision + load the E2EE master key so the live sync path can encrypt.
@@ -2350,7 +2757,7 @@ var SyncEngine = class {
       }
       console.debug("[joplin-sync] E2EE: generated + uploaded first master key " + mkId);
     } else if (!anyLoaded && mkIds.length > 0) {
-      new import_obsidian9.Notice("E2EE password is wrong \u2014 none of the " + mkIds.length + " server master keys could be decrypted. Check the password.");
+      new import_obsidian10.Notice("E2EE password is wrong \u2014 none of the " + mkIds.length + " server master keys could be decrypted. Check the password.");
     }
     this.e2eeActive = anyLoaded;
     if (anyLoaded)
@@ -2385,7 +2792,7 @@ var SyncEngine = class {
   // ============ Phase 1: Legacy full upload ============
   async runFullUpload() {
     if (this.running) {
-      new import_obsidian9.Notice("Sync already in progress");
+      new import_obsidian10.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -2397,14 +2804,14 @@ var SyncEngine = class {
       const uploadCompatErr = await this.checkEncryptionCompatibility("forcePush");
       if (uploadCompatErr) {
         this.plugin.statusBar.setError(uploadCompatErr);
-        new import_obsidian9.Notice("Upload blocked: " + uploadCompatErr, 1e4);
+        new import_obsidian10.Notice("Upload blocked: " + uploadCompatErr, 1e4);
         return;
       }
       await this.enableE2EE();
       const files = this.collectMarkdownFiles();
       let done = 0, skipped = 0;
       const failed = [];
-      for (const batch of chunk2(files, 5)) {
+      for (const batch of chunk(files, 5)) {
         await Promise.all(batch.map(async (file) => {
           try {
             const changed = await this.uploadNote(file, "");
@@ -2416,7 +2823,7 @@ var SyncEngine = class {
         }));
         await this.plugin.mapping.flush();
       }
-      new import_obsidian9.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
+      new import_obsidian10.Notice("Upload done: " + done + " uploaded, " + skipped + " unchanged, " + failed.length + " failed");
       if (failed.length)
         console.error("[joplin-sync] failures:", failed);
     } finally {
@@ -2496,6 +2903,7 @@ var SyncEngine = class {
       remoteUpdatedTime: result.updated_time,
       syncedAt: Date.now()
     });
+    this.plugin.baseSnapshots?.set(id, content);
     return true;
   }
   collectMarkdownFiles() {
@@ -2535,7 +2943,7 @@ var SyncEngine = class {
   startScheduler() {
     const interval = this.plugin.settings.syncIntervalSec;
     if (interval > 0) {
-      this.timer = window.setInterval(() => this.syncCycle(), interval * 1e3);
+      this.timer = window.setInterval(() => this.syncCycle(), Math.max(60, interval) * 1e3);
     }
     if (this.plugin.settings.syncOnStartup) {
       window.setTimeout(() => this.syncCycle(), 5e3);
@@ -2544,7 +2952,7 @@ var SyncEngine = class {
   // ============ Phase 2: Sync Cycle ============
   async syncCycle() {
     if (this.running || this.state !== 0 /* Idle */) {
-      new import_obsidian9.Notice("Sync already in progress");
+      new import_obsidian10.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -2558,7 +2966,7 @@ var SyncEngine = class {
       if (compatErr) {
         this.state = 4 /* Error */;
         this.plugin.statusBar.setError(compatErr);
-        new import_obsidian9.Notice("Sync blocked: " + compatErr, 1e4);
+        new import_obsidian10.Notice("Sync blocked: " + compatErr, 1e4);
         return;
       }
       await this.enableE2EE();
@@ -2578,7 +2986,13 @@ var SyncEngine = class {
       for (const t of [...this.plugin.mapping.tombstones]) {
         try {
           await this.plugin.api.deleteItem(t.joplinId + ".md");
-        } catch {
+        } catch (e) {
+          const status = e.status;
+          if (typeof status === "number" && status === 404) {
+          } else {
+            console.warn("[joplin-sync] tombstone delete retry kept: " + t.joplinId + " - " + (e instanceof Error ? e.message : String(e)));
+            continue;
+          }
         }
         this.plugin.mapping.clearTombstone(t.joplinId);
       }
@@ -2592,15 +3006,18 @@ var SyncEngine = class {
       const parts = ["Created " + c, "Updated " + u, "Deleted " + d];
       if (totalFail)
         parts.push("Failed " + totalFail);
-      new import_obsidian9.Notice("Sync complete: " + parts.join(", ") + ". " + totalMapped + " item(s) mapped");
+      new import_obsidian10.Notice("Sync complete: " + parts.join(", ") + ". " + totalMapped + " item(s) mapped");
     } catch (e) {
       this.state = 4 /* Error */;
       const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
       console.error("[joplin-sync] sync cycle failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian9.Notice("Sync failed: " + msg, 8e3);
+      new import_obsidian10.Notice("Sync failed: " + msg, 8e3);
     } finally {
       await this.plugin.mapping.flush();
+      await this.plugin.baseSnapshots?.flush().catch?.(() => {
+      });
+      this.plugin.changeLog.prune();
       this.state = 0 /* Idle */;
       this.running = false;
     }
@@ -2608,6 +3025,12 @@ var SyncEngine = class {
   async shutdown() {
     if (this.timer)
       window.clearInterval(this.timer);
+    await this.plugin.changeLog?.flush().catch?.(() => {
+    });
+    await this.plugin.mapping?.flush().catch?.(() => {
+    });
+    await this.plugin.baseSnapshots?.flush().catch?.(() => {
+    });
   }
   /** SHA-256 of a TFile's current content (used by the watcher). */
   async sha256Of(file) {
@@ -2701,7 +3124,7 @@ var SyncEngine = class {
   }
   async forcePush() {
     if (this.running) {
-      new import_obsidian9.Notice("Sync already in progress");
+      new import_obsidian10.Notice("Sync already in progress");
       return;
     }
     this.running = true;
@@ -2715,7 +3138,12 @@ var SyncEngine = class {
       const pushCompatErr = await this.checkEncryptionCompatibility("forcePush");
       if (pushCompatErr) {
         this.plugin.statusBar.setError(pushCompatErr);
-        new import_obsidian9.Notice("Force push blocked: " + pushCompatErr, 1e4);
+        new import_obsidian10.Notice("Force push blocked: " + pushCompatErr, 1e4);
+        return;
+      }
+      if (!await this.confirmDestructiveOp("push")) {
+        this.plugin.statusBar.setIdle();
+        new import_obsidian10.Notice("Force push cancelled.");
         return;
       }
       const migratingToE2EE = this.plugin.settings.e2eeEnabled && !!this.plugin.settings.e2eePassword && !await this.serverIsEncrypted();
@@ -2723,7 +3151,7 @@ var SyncEngine = class {
         const ok = await this.confirmMigration();
         if (!ok) {
           this.plugin.statusBar.setIdle();
-          new import_obsidian9.Notice("Force push cancelled \u2014 server stays plaintext.");
+          new import_obsidian10.Notice("Force push cancelled \u2014 server stays plaintext.");
           return;
         }
       }
@@ -2810,6 +3238,7 @@ var SyncEngine = class {
           }
         }
         this.plugin.mapping.clearAll();
+        this.plugin.baseSnapshots?.clear();
         console.debug("[joplin-sync] force push reset: wiped " + wiped + " items, kept " + skipped + " (info.json/master keys/foreign vaults)");
       }
       const pushedNoteIds = /* @__PURE__ */ new Set();
@@ -2919,11 +3348,11 @@ var SyncEngine = class {
       let done = 0;
       let fail = 0;
       if (this.plugin.settings.syncFoldersOnly) {
-        new import_obsidian9.Notice("Force push: " + totalFolders + " folders synced (folders-only mode)");
+        new import_obsidian10.Notice("Force push: " + totalFolders + " folders synced (folders-only mode)");
         this.plugin.logSync("folders", totalFolders, 0);
         done = totalFolders;
       } else {
-        for (const batch of chunk2(files, 5)) {
+        for (const batch of chunk(files, 5)) {
           await Promise.all(batch.map(async (file) => {
             try {
               const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -2951,7 +3380,7 @@ var SyncEngine = class {
         const allFiles = this.plugin.app.vault.getFiles();
         const resourceFiles = allFiles.filter((f) => f.extension !== "md" && !this.shouldExclude(f.path));
         if (resourceFiles.length > 0) {
-          for (const batch of chunk2(resourceFiles, 5)) {
+          for (const batch of chunk(resourceFiles, 5)) {
             await Promise.all(batch.map(async (f) => {
               try {
                 const rid = await this.resources.uploadResource(f, true);
@@ -3103,7 +3532,7 @@ var SyncEngine = class {
         const totalPushed = done + rDone;
         const totalFail = fail + rFail;
         this.plugin.logSync("push", totalPushed, totalFail);
-        new import_obsidian9.Notice("Force push: " + totalPushed + " items" + (totalFail ? ", " + totalFail + " failed" : ""));
+        new import_obsidian10.Notice("Force push: " + totalPushed + " items" + (totalFail ? ", " + totalFail + " failed" : ""));
         if (totalFail) {
           this.plugin.statusBar.setError("push: " + totalFail + " failed");
         } else {
@@ -3123,7 +3552,11 @@ var SyncEngine = class {
   // ============ Force Pull: overwrite local with server ============
   async forcePull() {
     if (this.running) {
-      new import_obsidian9.Notice("Sync already in progress");
+      new import_obsidian10.Notice("Sync already in progress");
+      return;
+    }
+    if (!await this.confirmDestructiveOp("pull")) {
+      new import_obsidian10.Notice("Force pull cancelled.");
       return;
     }
     this.running = true;
@@ -3135,7 +3568,7 @@ var SyncEngine = class {
       const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian9.Notice("Force pull failed: " + msg, 8e3);
+      new import_obsidian10.Notice("Force pull failed: " + msg, 8e3);
     } finally {
       this.watcher?.resume();
       this.plugin.changeLog.clear();
@@ -3155,78 +3588,12 @@ var SyncEngine = class {
       const pullCompatErr = await this.checkEncryptionCompatibility("forcePull");
       if (pullCompatErr) {
         this.plugin.statusBar.setError(pullCompatErr);
-        new import_obsidian9.Notice("Force pull blocked: " + pullCompatErr, 1e4);
+        new import_obsidian10.Notice("Force pull blocked: " + pullCompatErr, 1e4);
         return;
       }
       await this.enableE2EE();
       await this.ensureRootFolder();
-      this.plugin.mapping.clearAll();
-      const adapter = this.plugin.app.vault.adapter;
-      const isKept = (p) => this.shouldExclude(p);
-      let delCount = 0, delDirCount = 0;
-      for (const f of this.plugin.app.vault.getFiles()) {
-        if (!isKept(f.path)) {
-          const fm = this.plugin.app.fileManager;
-          try {
-            if (fm?.trashFile)
-              await fm.trashFile(f);
-            else
-              await this.plugin.app.vault.remove(f);
-            delCount++;
-          } catch (e) {
-            console.warn("[joplin-sync] force pull file delete failed: " + f.path + " - " + (e instanceof Error ? e.message : String(e)));
-          }
-        }
-      }
-      const listAll = async (dir) => {
-        const result = [];
-        try {
-          if (adapter.list) {
-            const listing = await adapter.list(dir);
-            for (const sub of listing.folders) {
-              const clean = normDir(sub);
-              if (!clean || clean === "." || clean === "..")
-                continue;
-              const children = await listAll(clean);
-              result.push(...children, clean);
-            }
-          }
-        } catch {
-        }
-        return result;
-      };
-      let allLocalDirs = [];
-      try {
-        if (adapter.list) {
-          const root = await adapter.list("");
-          for (const d of root.folders) {
-            const clean = normDir(d);
-            if (!clean || clean === "." || clean === "..")
-              continue;
-            if (isKept(clean))
-              continue;
-            const subs = await listAll(clean);
-            allLocalDirs.push(...subs, clean);
-          }
-        }
-      } catch {
-      }
-      allLocalDirs = [...new Set(allLocalDirs)];
-      allLocalDirs.sort((a, b) => b.split("/").length - a.split("/").length);
-      for (const d of allLocalDirs) {
-        if (isKept(d))
-          continue;
-        try {
-          if (await adapter.exists(d)) {
-            await adapter.rmdir(d, false);
-            delDirCount++;
-          }
-        } catch (e) {
-          console.warn("[joplin-sync] force pull rmdir failed: " + d + " - " + (e instanceof Error ? e.message : String(e)));
-        }
-      }
-      this.plugin.mapping.setDeltaCursor("");
-      console.debug("[joplin-sync] force pull: deleted " + delCount + " files, " + delDirCount + " dirs");
+      const preMapped = this.plugin.mapping.all().length;
       console.debug("[joplin-sync] force pull: listing remote items...");
       const remoteStats = await this.listAllRemoteItems();
       console.debug("[joplin-sync] force pull: listed " + remoteStats.length + " remote items");
@@ -3241,7 +3608,7 @@ var SyncEngine = class {
       );
       console.debug("[joplin-sync] force pull: reading " + readStats.length + " item contents in batches of 5...");
       let batchNum = 0;
-      for (const batch of chunk2(readStats, 5)) {
+      for (const batch of chunk(readStats, 5)) {
         batchNum++;
         if (batchNum % 20 === 0)
           console.debug("[joplin-sync] force pull: read batch " + batchNum + "/" + Math.ceil(readStats.length / 5) + " (" + allItems.length + " items so far)");
@@ -3335,6 +3702,98 @@ var SyncEngine = class {
           console.debug("[joplin-sync] force pull root filter: kept " + allItems.length + "/" + before + " items (excluded foreign-vault items)");
         }
       }
+      const inScope = allItems.filter((i) => i.type_ === 1 /* Note */ || i.type_ === 2 /* Folder */).length;
+      if (remoteLooksIncomplete(preMapped, inScope)) {
+        let proceed = false;
+        if (this.uiAvailable && this.plugin.settings.confirmDestructiveOps !== false) {
+          proceed = await confirmDestructive(this.plugin.app, {
+            title: "Force pull: server looks incomplete",
+            message: "The server exposes " + inScope + " note(s)/folder(s) but this vault has " + preMapped + " mapped items. Continuing would replace the local vault with that much smaller set. Verify the server URL and account first \u2014 this may be the wrong sync target.",
+            requireText: this.plugin.app.vault.getName() || "vault",
+            ctaText: "Continue anyway (delete local extras)"
+          });
+        }
+        if (!proceed) {
+          const msg = "Force pull aborted: server exposes " + inScope + " in-scope item(s) but this vault has " + preMapped + " mapped. Wrong sync target or wiped server. Nothing was deleted locally.";
+          console.error("[joplin-sync] " + msg);
+          this.plugin.statusBar.setError("force pull blocked: remote incomplete");
+          new import_obsidian10.Notice(msg, 15e3);
+          const err = new Error("force pull blocked: remote looks incomplete (" + inScope + " in-scope vs " + preMapped + " mapped)");
+          err.__pullAborted = true;
+          throw err;
+        }
+      }
+      const keepRootId = this.plugin.mapping.rootFolderId;
+      this.plugin.mapping.clearAll();
+      this.plugin.baseSnapshots?.clear();
+      if (keepRootId)
+        this.plugin.mapping.setRootFolderId(keepRootId);
+      const adapter = this.plugin.app.vault.adapter;
+      const isKept = (p) => this.shouldExclude(p);
+      let delCount = 0, delDirCount = 0;
+      for (const f of this.plugin.app.vault.getFiles()) {
+        if (!isKept(f.path)) {
+          const fm = this.plugin.app.fileManager;
+          try {
+            if (fm?.trashFile)
+              await fm.trashFile(f);
+            else
+              await this.plugin.app.vault.remove(f);
+            delCount++;
+          } catch (e) {
+            console.warn("[joplin-sync] force pull file delete failed: " + f.path + " - " + (e instanceof Error ? e.message : String(e)));
+          }
+        }
+      }
+      const listAll = async (dir) => {
+        const result = [];
+        try {
+          if (adapter.list) {
+            const listing = await adapter.list(dir);
+            for (const sub of listing.folders) {
+              const clean = normDir(sub);
+              if (!clean || clean === "." || clean === "..")
+                continue;
+              const children = await listAll(clean);
+              result.push(...children, clean);
+            }
+          }
+        } catch {
+        }
+        return result;
+      };
+      let allLocalDirs = [];
+      try {
+        if (adapter.list) {
+          const root = await adapter.list("");
+          for (const d of root.folders) {
+            const clean = normDir(d);
+            if (!clean || clean === "." || clean === "..")
+              continue;
+            if (isKept(clean))
+              continue;
+            const subs = await listAll(clean);
+            allLocalDirs.push(...subs, clean);
+          }
+        }
+      } catch {
+      }
+      allLocalDirs = [...new Set(allLocalDirs)];
+      allLocalDirs.sort((a, b) => b.split("/").length - a.split("/").length);
+      for (const d of allLocalDirs) {
+        if (isKept(d))
+          continue;
+        try {
+          if (await adapter.exists(d)) {
+            await adapter.rmdir(d, false);
+            delDirCount++;
+          }
+        } catch (e) {
+          console.warn("[joplin-sync] force pull rmdir failed: " + d + " - " + (e instanceof Error ? e.message : String(e)));
+        }
+      }
+      this.plugin.mapping.setDeltaCursor("");
+      console.debug("[joplin-sync] force pull: deleted " + delCount + " files, " + delDirCount + " dirs");
       const folders = allItems.filter((i) => i.type_ === 2 /* Folder */);
       console.debug("[joplin-sync] force pull: build paths for " + folders.length + " folders");
       this.buildForcePullFolderPaths(folders);
@@ -3363,7 +3822,7 @@ var SyncEngine = class {
       const sortedDepths = [...foldersByDepth.keys()].sort((a, b) => a - b);
       for (const depth of sortedDepths) {
         const levelFolders = foldersByDepth.get(depth);
-        for (const batch of chunk2(levelFolders, 5)) {
+        for (const batch of chunk(levelFolders, 5)) {
           await Promise.all(batch.map(async (f) => {
             try {
               const parentPath = this.resolveForcePullFolderPath(f.parent_id);
@@ -3389,7 +3848,7 @@ var SyncEngine = class {
       }
       const notes = allItems.filter((i) => i.type_ === 1 /* Note */);
       const usedPaths = /* @__PURE__ */ new Set();
-      for (const batch of chunk2(notes, 5)) {
+      for (const batch of chunk(notes, 5)) {
         await Promise.all(batch.map(async (item) => {
           if (!item.title)
             return;
@@ -3409,7 +3868,7 @@ var SyncEngine = class {
             }
             const existing = this.plugin.app.vault.getAbstractFileByPath(path);
             const stamped = stampFrontmatter(item.body || "", item.id);
-            if (existing instanceof import_obsidian9.TFile) {
+            if (existing instanceof import_obsidian10.TFile) {
               await this.plugin.app.vault.modify(existing, stamped);
             } else if (!existing) {
               await this.plugin.app.vault.create(path, stamped);
@@ -3423,6 +3882,7 @@ var SyncEngine = class {
               remoteUpdatedTime: item.updated_time,
               syncedAt: Date.now()
             });
+            this.plugin.baseSnapshots?.set(item.id, item.body ?? "");
             done++;
           } catch (e) {
             failed++;
@@ -3470,7 +3930,7 @@ var SyncEngine = class {
       } else {
         this.plugin.statusBar.setOk(Date.now(), totalSynced);
       }
-      new import_obsidian9.Notice("Force pull: " + totalSynced + " items" + (totalFail ? ", " + totalFail + " failed" : ""));
+      new import_obsidian10.Notice("Force pull: " + totalSynced + " items" + (totalFail ? ", " + totalFail + " failed" : ""));
       this.plugin.logSync("pull", totalSynced, totalFail);
       let localRemoved = 0;
       for (const f of this.plugin.app.vault.getFiles()) {
@@ -3492,7 +3952,9 @@ var SyncEngine = class {
       const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
-      new import_obsidian9.Notice("Force pull failed: " + msg, 8e3);
+      new import_obsidian10.Notice("Force pull failed: " + msg, 8e3);
+      if (e?.__pullAborted)
+        throw e;
     } finally {
       await this.plugin.mapping.flush();
     }
@@ -3666,7 +4128,7 @@ var SyncEngine = class {
   }
   confirmMigration() {
     return new Promise((resolve) => {
-      const modal = new import_obsidian9.Modal(this.plugin.app);
+      const modal = new import_obsidian10.Modal(this.plugin.app);
       modal.titleEl.setText("Migrate to E2EE");
       modal.contentEl.createEl("p", {
         text: "This vault has E2EE enabled but the server is plaintext. Force Push will re-upload EVERYTHING as encrypted data and mark the server as E2EE \u2014 other plaintext clients will no longer be able to sync. Continue?"
@@ -3692,7 +4154,7 @@ async function sha256(text) {
   const digest = await crypto.subtle.digest("SHA-256", data);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
-function chunk2(arr, size) {
+function chunk(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size)
     out.push(arr.slice(i, i + size));
@@ -4017,8 +4479,8 @@ var EncryptionService = class {
   }
   buildCipherText(method, masterKeyId, chunks) {
     let out = this.buildHeader(method, masterKeyId);
-    for (const chunk3 of chunks) {
-      out += chunk3.length.toString(16).padStart(6, "0") + chunk3;
+    for (const chunk2 of chunks) {
+      out += chunk2.length.toString(16).padStart(6, "0") + chunk2;
     }
     return out;
   }
@@ -4089,6 +4551,7 @@ var EncryptionService = class {
 };
 
 // src/core/ChangeLogStore.ts
+var MAX_SYNCED_KEEP = 2e3;
 var ChangeLogStore = class {
   constructor(plugin) {
     this.plugin = plugin;
@@ -4103,7 +4566,8 @@ var ChangeLogStore = class {
     const adapter = this.plugin.app.vault.adapter;
     if (adapter.exists && await adapter.exists(this.filePath)) {
       try {
-        this.data = JSON.parse(await adapter.read(this.filePath));
+        const parsed = JSON.parse(await adapter.read(this.filePath));
+        this.data = parsed && Array.isArray(parsed.entries) ? parsed : { entries: [] };
       } catch {
         this.data = { entries: [] };
       }
@@ -4119,6 +4583,8 @@ var ChangeLogStore = class {
         this.data.entries.splice(existingIdx, 1);
       } else if (prev.op === "create" && entry.op === "update") {
         this.data.entries[existingIdx] = { ...prev, path: entry.path, hash: entry.hash, timestamp: now };
+      } else if (prev.op === "delete" && entry.op === "create") {
+        this.data.entries[existingIdx] = { ...prev, op: "update", path: entry.path, hash: entry.hash, oldPath: void 0, timestamp: now };
       } else {
         this.data.entries[existingIdx] = { ...prev, op: entry.op, path: entry.path, oldPath: entry.oldPath ?? prev.oldPath, hash: entry.hash ?? prev.hash, timestamp: now };
       }
@@ -4147,54 +4613,178 @@ var ChangeLogStore = class {
     this.data.entries = [];
     this.dirty = true;
   }
-  /** Remove synced entries older than the retention window. */
+  /** Remove synced entries older than the retention window and cap the total
+   *  number of retained synced entries. */
   prune(maxAgeMs = 7 * 24 * 3600 * 1e3) {
     const cutoff = Date.now() - maxAgeMs;
     const before = this.data.entries.length;
-    this.data.entries = this.data.entries.filter((e) => e.status === "pending" || e.timestamp >= cutoff);
+    const pending = this.data.entries.filter((e) => e.status === "pending");
+    const synced = this.data.entries.filter((e) => e.status === "synced" && e.timestamp >= cutoff).sort((a, b) => b.timestamp - a.timestamp).slice(0, MAX_SYNCED_KEEP);
+    this.data.entries = [...pending, ...synced];
     if (this.data.entries.length !== before) {
       this.dirty = true;
       void this.persist();
     }
   }
-  async persist() {
-    if (this.persistTimer)
-      return;
-    this.persistTimer = window.setTimeout(async () => {
+  persist() {
+    if (this.persistTimer !== null) {
+      window.clearTimeout(this.persistTimer);
       this.persistTimer = null;
-      try {
-        const adapter = this.plugin.app.vault.adapter;
-        const dir = this.plugin.manifest.dir + "/data";
-        if (!await adapter.exists(dir))
-          await adapter.mkdir(dir);
-        await adapter.write(this.filePath, JSON.stringify(this.data));
-        this.dirty = false;
-      } catch {
+    }
+    return new Promise((resolve) => {
+      this.persistTimer = window.setTimeout(async () => {
+        this.persistTimer = null;
+        await this.writeNow();
+        resolve();
+      }, 500);
+    });
+  }
+  async writeNow() {
+    try {
+      const adapter = this.plugin.app.vault.adapter;
+      const dir = this.plugin.manifest.dir + "/data";
+      if (!await adapter.exists(dir))
+        await adapter.mkdir(dir);
+      const tmp = this.filePath + ".tmp";
+      await adapter.write(tmp, JSON.stringify(this.data));
+      if (await adapter.exists(this.filePath))
+        await adapter.remove(this.filePath);
+      await adapter.rename(tmp, this.filePath);
+      this.dirty = false;
+    } catch {
+    }
+  }
+  async flush() {
+    if (this.persistTimer !== null) {
+      window.clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (!this.dirty)
+      return;
+    await this.writeNow();
+  }
+};
+
+// src/core/BaseSnapshotStore.ts
+var MAX_BODY_BYTES = 512 * 1024;
+var MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+var BaseSnapshotStore = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.data = { version: 1, bodies: {} };
+    this.dirty = false;
+    this.totalBytes = 0;
+  }
+  get filePath() {
+    return this.plugin.manifest.dir + "/data/base-snapshots.json";
+  }
+  async load() {
+    const adapter = this.plugin.app.vault.adapter;
+    try {
+      if (adapter.exists && await adapter.exists(this.filePath)) {
+        const parsed = JSON.parse(await adapter.read(this.filePath));
+        if (parsed && typeof parsed.bodies === "object" && parsed.bodies) {
+          this.data = { version: 1, bodies: parsed.bodies };
+          this.totalBytes = this.computeBytes();
+        }
       }
-    }, 500);
+    } catch (e) {
+      console.warn("[joplin-sync] base snapshot unreadable, starting fresh: " + (e instanceof Error ? e.message : String(e)));
+      this.data = { version: 1, bodies: {} };
+      this.totalBytes = 0;
+    }
+    this.prune();
+  }
+  get(id) {
+    const v = this.data.bodies[id];
+    return v === void 0 ? null : v;
+  }
+  set(id, body) {
+    if (typeof body !== "string")
+      return;
+    if (body.length * 2 > MAX_BODY_BYTES) {
+      this.delete(id);
+      return;
+    }
+    const prev = this.data.bodies[id];
+    if (prev === body)
+      return;
+    if (prev !== void 0)
+      this.totalBytes -= prev.length * 2;
+    if (this.totalBytes + body.length * 2 > MAX_TOTAL_BYTES) {
+      return;
+    }
+    this.data.bodies[id] = body;
+    this.totalBytes += body.length * 2;
+    this.dirty = true;
+  }
+  delete(id) {
+    const prev = this.data.bodies[id];
+    if (prev === void 0)
+      return;
+    this.totalBytes -= prev.length * 2;
+    delete this.data.bodies[id];
+    this.dirty = true;
+  }
+  /** Forget snapshots whose joplinId is no longer in the mapping. */
+  prune() {
+    const live = new Set(this.plugin.mapping.all().map((e) => e.joplinId));
+    let removed = 0;
+    for (const id of Object.keys(this.data.bodies)) {
+      if (!live.has(id)) {
+        this.delete(id);
+        removed++;
+      }
+    }
+    if (removed)
+      console.debug("[joplin-sync] base snapshot pruned " + removed + " stale entries");
+  }
+  get size() {
+    return Object.keys(this.data.bodies).length;
+  }
+  clear() {
+    this.data = { version: 1, bodies: {} };
+    this.totalBytes = 0;
+    this.dirty = true;
   }
   async flush() {
     if (!this.dirty)
       return;
     const adapter = this.plugin.app.vault.adapter;
+    const dir = this.plugin.manifest.dir + "/data";
     try {
-      const dir = this.plugin.manifest.dir + "/data";
       if (!await adapter.exists(dir))
         await adapter.mkdir(dir);
-      await adapter.write(this.filePath, JSON.stringify(this.data));
+      const tmp = this.filePath + ".tmp";
+      await adapter.write(tmp, JSON.stringify(this.data));
+      if (await adapter.exists(this.filePath))
+        await adapter.remove(this.filePath);
+      await adapter.rename(tmp, this.filePath);
       this.dirty = false;
-    } catch {
+    } catch (e) {
+      console.warn("[joplin-sync] base snapshot flush failed: " + (e instanceof Error ? e.message : String(e)));
     }
+  }
+  computeBytes() {
+    let n = 0;
+    for (const v of Object.values(this.data.bodies))
+      n += (v?.length ?? 0) * 2;
+    return n;
   }
 };
 
 // src/main.ts
-var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
+var JoplinSyncPlugin = class extends import_obsidian11.Plugin {
   constructor() {
     super(...arguments);
+    /** Real Obsidian UI is available for confirmations. Headless hosts (tests,
+     *  CLI) build plugin stubs without this, and the engine then skips Modal
+     *  prompts instead of hanging on them. */
+    this.uiConfirmAvailable = false;
     this.initialized = false;
   }
   async onload() {
+    this.uiConfirmAvailable = true;
     await this.loadSettings();
     this.api = new JoplinServerApi(() => ({
       baseUrl: this.settings.serverUrl,
@@ -4205,6 +4795,9 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
     await this.mapping.load();
     this.changeLog = new ChangeLogStore(this);
     await this.changeLog.load();
+    this.changeLog.prune();
+    this.baseSnapshots = new BaseSnapshotStore(this);
+    await this.baseSnapshots.load();
     this.statusBar = new StatusBar(this.addStatusBarItem());
     this.e2ee = new EncryptionService();
     this.identity = new FileIdentity(this);
@@ -4236,9 +4829,9 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
       callback: async () => {
         try {
           await this.api.login(true);
-          new import_obsidian10.Notice("Joplin Server: connection OK");
+          new import_obsidian11.Notice("Joplin Server: connection OK");
         } catch (e) {
-          new import_obsidian10.Notice("Connection failed: " + (e instanceof Error ? e.message : String(e)));
+          new import_obsidian11.Notice("Connection failed: " + (e instanceof Error ? e.message : String(e)));
         }
       }
     });
@@ -4247,7 +4840,8 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
       name: "About / Status",
       callback: () => {
         const total = this.mapping.all().length;
-        new import_obsidian10.Notice("v0.2.1\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no"));
+        const st = this.api.stats;
+        new import_obsidian11.Notice("v" + this.manifest.version + "\nMapped items: " + total + "\nDelta cursor: " + (this.mapping.getDeltaCursor() ? "yes" : "no") + "\nPending local changes: " + this.changeLog.pending().length + "\nRequests this session: " + st.requests + " (retries " + st.retries + ", throttled " + st.throttled + ")");
       }
     });
     if (this.settings.serverUrl) {
@@ -4260,6 +4854,8 @@ var JoplinSyncPlugin = class extends import_obsidian10.Plugin {
   onunload() {
     void this.engine?.shutdown();
     void this.mapping?.flush();
+    void this.changeLog?.flush();
+    void this.baseSnapshots?.flush();
   }
   async loadSettings() {
     const data = await this.loadData();

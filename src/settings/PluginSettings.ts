@@ -27,6 +27,9 @@ export interface PluginSettings {
   syncLog: SyncLogEntry[];
   e2eeEnabled: boolean;
   e2eePassword: string;
+  /** Ask (typed vault-name confirmation) before force push / force pull.
+   *  Headless runs (tests/CLI) have no UI and skip the prompt. */
+  confirmDestructiveOps: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -45,4 +48,5 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncLog: [],
   e2eeEnabled: false,
   e2eePassword: '',
+  confirmDestructiveOps: true,
 };

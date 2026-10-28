@@ -7,6 +7,7 @@ import { ModelType, JoplinItem } from '../api/models';
 import { sha256 } from './SyncEngine';
 import { ResourceManager } from '../resource/ResourceManager';
 import { ConflictResolver } from './ConflictResolver';
+import { mapConcurrent } from './netUtil';
 
 export class LocalPusher {
   private serializer = new JoplinSerializer();
@@ -19,21 +20,50 @@ export class LocalPusher {
   async pushAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
     const changes = this.changeLog.pending();
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
-    const failed: ChangeLogEntry[] = [];
-    for (const change of changes) {
-      try {
-        const op = await this.pushOne(change);
-        if (op === 'create') stats.created++;
-        else if (op === 'update') stats.updated++;
-        else if (op === 'delete') stats.deleted++;
-        this.changeLog.markSynced(change.fileId);
-      } catch (e) {
-        console.error('[joplin-sync] push failed: ' + change.path, e);
+    if (changes.length === 0) return stats;
+
+    // Folders first (serial): note pushes call ensureFolderChain on demand,
+    // but running every folder create in parallel could mint duplicate server
+    // folders for the same path. Folder ops are few; notes are the bulk.
+    const folderOps = changes.filter(c => c.type === ModelType.Folder);
+    const fileOps = changes.filter(c => c.type !== ModelType.Folder);
+
+    for (const change of folderOps) {
+      await this.pushOneTracked(change, stats);
+    }
+
+    // Files in parallel through the API gate. Network latency dominates a
+    // push (PUT + optional remote GET per file), so the gate's adaptive
+    // concurrency pays off directly here.
+    const results = await mapConcurrent(fileOps, this.plugin.api.gate, (change) => this.pushOne(change));
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const change = fileOps[i];
+      if (r.error !== undefined) {
+        console.error('[joplin-sync] push failed: ' + change.path, r.error);
         stats.fail++;
-        failed.push(change);
+        continue; // entry stays pending — retried next cycle
       }
+      const op = r.value;
+      if (op === 'create') stats.created++;
+      else if (op === 'update') stats.updated++;
+      else if (op === 'delete') stats.deleted++;
+      this.changeLog.markSynced(change.fileId);
     }
     return stats;
+  }
+
+  private async pushOneTracked(change: ChangeLogEntry, stats: { created: number; updated: number; deleted: number; fail: number }): Promise<void> {
+    try {
+      const op = await this.pushOne(change);
+      if (op === 'create') stats.created++;
+      else if (op === 'update') stats.updated++;
+      else if (op === 'delete') stats.deleted++;
+      this.changeLog.markSynced(change.fileId);
+    } catch (e) {
+      console.error('[joplin-sync] push failed: ' + change.path, e);
+      stats.fail++;
+    }
   }
 
   private async pushOne(c: ChangeLogEntry): Promise<'create' | 'update' | 'delete' | 'none'> {
@@ -123,19 +153,29 @@ export class LocalPusher {
       };
       const cipherSerialized = this.serializer.serialize(cipherItem);
       const res = await this.plugin.api.putItem(id + '.md', cipherSerialized);
-      this.plugin.mapping.upsert({
-        joplinId: id, path, type: ModelType.Note,
-        localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
-      });
+      this.recordSynced(id, path, hash, res.updated_time);
       return isNew ? 'create' : 'update';
     }
 
     const res = await this.plugin.api.putItem(id + '.md', this.serializer.serialize(item));
+    this.recordSynced(id, path, hash, res.updated_time);
+    return isNew ? 'create' : 'update';
+  }
+
+  /** Record the successful push: mapping + last-synced base snapshot (so a
+   *  future concurrent edit can be three-way merged instead of duplicated). */
+  private recordSynced(id: string, path: string, hash: string, remoteUpdatedTime: number): void {
     this.plugin.mapping.upsert({
       joplinId: id, path, type: ModelType.Note,
-      localHash: hash, remoteUpdatedTime: res.updated_time, syncedAt: Date.now(),
+      localHash: hash, remoteUpdatedTime, syncedAt: Date.now(),
     });
-    return isNew ? 'create' : 'update';
+    this.plugin.baseSnapshots?.delete(id);
+    const f = this.plugin.app.vault.getAbstractFileByPath(path);
+    if (f instanceof TFile) {
+      void this.plugin.app.vault.read(f).then(content => {
+        this.plugin.baseSnapshots?.set(id, content);
+      }).catch(() => { /* best effort */ });
+    }
   }
 
   private async deleteItem(path: string, fileId: string, isFolder: boolean): Promise<'delete' | 'none'> {
@@ -161,6 +201,7 @@ export class LocalPusher {
 
     await this.plugin.api.deleteItem(entry.joplinId + '.md');
     this.plugin.mapping.remove(entry.joplinId);
+    this.plugin.baseSnapshots?.delete(entry.joplinId);
     this.plugin.mapping.addTombstone(entry.joplinId, entry.type);
     return 'delete';
   }

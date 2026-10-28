@@ -6,6 +6,8 @@ import { MockVault, MockFileManager } from './mock/vault';
 import { JoplinServerApi } from '../src/api/JoplinServerApi';
 import { MappingStore } from '../src/mapping/MappingStore';
 import { SyncEngine } from '../src/core/SyncEngine';
+import { FileIdentity } from '../src/core/FileIdentity';
+import { safeFileName } from '../src/core/pathUtil';
 import { DEFAULT_SETTINGS } from '../src/settings/PluginSettings';
 
 const server = new MockJoplinServer();
@@ -24,6 +26,9 @@ function makePlugin(vaultRoot: string) {
     manifest: { dir: '/plugin-data' },
     statusBar: { setSyncing(){}, setProgress(){}, setIdle(){}, setOk(){}, setError(){} },
     logSync(){},
+    registerEvent(r: any){ return r; },
+    changeLog: { pending(){ return []; }, push(){}, markSynced(){}, clear(){}, flush: async () => {}, prune(){} },
+    baseSnapshots: { get(){ return null; }, set(){}, delete(){}, clear(){}, flush: async () => {} },
     e2ee: { feedMasterKey(){}, isEncrypted(){ return false; }, decryptItem(){ return null; } },
   };
   plugin.mapping = new MappingStore(plugin);
@@ -49,7 +54,6 @@ function walkAll(root: string): Map<string, string> {
 async function main() {
   const base = path.join(__dirname, 'fixtures');
   const srcDir = path.join(base, 'src');
-  const dstDir = path.join(base, 'dst');
   fs.rmSync(base, { recursive: true, force: true });
   fs.mkdirSync(srcDir, { recursive: true });
 
@@ -73,6 +77,8 @@ async function main() {
 
   const srcPlugin = makePlugin(srcDir);
   await srcPlugin.mapping.load();
+  srcPlugin.identity = new FileIdentity(srcPlugin);
+  srcPlugin.engine = new SyncEngine(srcPlugin);
   const enginePush = new SyncEngine(srcPlugin);
 
   // Simulate a polluted server: orphan note + a duplicate folder that the
@@ -85,20 +91,35 @@ async function main() {
   console.log('=== FORCE PUSH (src -> server) ===');
   await enginePush.forcePush();
 
-  // target vault (empty)
+  // target vault: a MIRROR of the source (same vault NAME, different path) —
+  // since 0.4.0 root isolation keeps differently-named vaults on a shared
+  // account strictly separate, so convergence requires the same vault name.
+  const dstDir = path.join(base, 'mirror', 'src');
   fs.mkdirSync(dstDir, { recursive: true });
   const dstPlugin = makePlugin(dstDir);
   await dstPlugin.mapping.load();
+  dstPlugin.identity = new FileIdentity(dstPlugin);
+  dstPlugin.engine = new SyncEngine(dstPlugin);
   const enginePull = new SyncEngine(dstPlugin);
 
   console.log('=== FORCE PULL (server -> dst) ===');
   await enginePull.forcePull();
 
   // ---- compare ----
-  const src = walkMd(srcDir);
-  const dst = walkMd(dstDir);
-  const srcKeys = new Set(src.keys());
-  const dstKeys = new Set(dst.keys());
+  // Pull-side filenames are the SANITIZED titles (safeFileName replaces
+  // characters that are illegal on common filesystems, e.g. ':'), so the
+  // comparison maps source names through the same function.
+  const src = walkAll(srcDir);
+  const dst = walkAll(dstDir);
+  const sanitizedSrc = new Map<string, string>();
+  for (const [k, v] of src) {
+    if (!k.endsWith('.md')) continue; // note-consistency check; resources verified separately
+    const dir = k.includes('/') ? k.slice(0, k.lastIndexOf('/') + 1) : '';
+    const base = k.slice(dir.length).replace(/\.md$/, '');
+    sanitizedSrc.set(dir + safeFileName(base) + '.md', v);
+  }
+  const srcKeys = new Set(sanitizedSrc.keys());
+  const dstKeys = new Set([...dst.keys()].filter(k => k.endsWith('.md')));
 
   const missingInDst: string[] = [];
   for (const k of srcKeys) if (!dstKeys.has(k)) missingInDst.push(k);
@@ -106,8 +127,8 @@ async function main() {
   for (const k of dstKeys) if (!srcKeys.has(k)) extraInDst.push(k);
   const contentDiff: string[] = [];
   for (const k of srcKeys) {
-    if (dstKeys.has(k) && src.get(k) !== dst.get(k)) {
-      contentDiff.push(k + '  [src ' + JSON.stringify(src.get(k)) + ' | dst ' + JSON.stringify(dst.get(k)) + ']');
+    if (dstKeys.has(k) && sanitizedSrc.get(k) !== dst.get(k)) {
+      contentDiff.push(k + '  [src ' + JSON.stringify(sanitizedSrc.get(k)) + ' | dst ' + JSON.stringify(dst.get(k)) + ']');
     }
   }
 

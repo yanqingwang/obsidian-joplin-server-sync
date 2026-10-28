@@ -91,6 +91,16 @@ export class JoplinSyncSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('Confirm force push / force pull')
+      .setDesc('Ask for a typed vault-name confirmation before overwriting the server or the local vault')
+      .addToggle(t => t
+        .setValue(this.plugin.settings.confirmDestructiveOps)
+        .onChange(async v => {
+          this.plugin.settings.confirmDestructiveOps = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
       .setName('Conflict strategy')
       .addDropdown(d => d
         .addOption('duplicate', 'Duplicate')

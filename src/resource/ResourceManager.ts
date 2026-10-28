@@ -131,7 +131,7 @@ export class ResourceManager {
     return accumulated;
   }
 
-  async downloadResource(meta: JoplinItem): Promise<string> {
+  async downloadResource(meta: JoplinItem, force = false): Promise<string> {
     // Decrypt the meta FIRST: under E2EE the passed-in meta is an encrypted
     // stub whose blob_updated_time is absent (0), so a skip check before
     // decryption would permanently skip every attachment update (B19).
@@ -144,8 +144,10 @@ export class ResourceManager {
 
     const existing = this.plugin.mapping.getById(meta.id);
     const correctPath = metaToUse.filename ? normalizePath(metaToUse.filename) : '';
-    // Skip only if mapped AND file exists on disk AT THE CORRECT PATH
-    if (existing && (metaToUse.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
+    // Skip only if mapped AND file exists on disk AT THE CORRECT PATH.
+    // `force` bypasses the skip: the delta reported the BLOB changed without
+    // touching the meta timestamps, so the time check cannot see it.
+    if (!force && existing && (metaToUse.blob_updated_time ?? 0) <= existing.remoteUpdatedTime) {
       if (correctPath && existing.path !== correctPath) {
         // Path changed (e.g. old version used attachments/) — re-download to correct path
         this.plugin.mapping.remove(existing.joplinId);

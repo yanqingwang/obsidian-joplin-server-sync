@@ -8,6 +8,7 @@ import { sha256 } from './SyncEngine';
 import { ResourceManager } from '../resource/ResourceManager';
 import { safeFileName } from './pathUtil';
 import { stampFrontmatter } from './FileIdentity';
+import { mapConcurrent, resourceBlobId } from './netUtil';
 
 export class DeltaPuller {
   private serializer = new JoplinSerializer();
@@ -69,15 +70,15 @@ export class DeltaPuller {
     return false;
   }
 
-  /** Concurrency for parallel network work. Mirrors the proven forcePull batch
-   *  size (B40): 5-at-a-time cut a 1000+ item pull from 15+ min to <30s on a
-   *  local network. Kept modest so a slow/misbehaving server isn't hammered. */
-  private static readonly DOWNLOAD_BATCH = 5;
-
+  /** Pull download concurrency is governed by the API client's shared
+   *  ConcurrencyGate: it starts at 6, grows on sustained success and halves
+   *  when the server answers 429/5xx — faster than the old fixed 5-batch on a
+   *  healthy server, safer than it on a slow one. */
   async pullAll(): Promise<{ created: number; updated: number; deleted: number; fail: number }> {
     const stats = { created: 0, updated: 0, deleted: 0, fail: 0 };
     const changes: DeltaItem[] = [];   // non-delete items whose content we must fetch
     const deletes: string[] = [];
+    const blobChangedIds = new Set<string>(); // `.resource/<id>` entries: blob changed, meta may not have
     let cursor = this.plugin.mapping.getDeltaCursor();
 
     // ---- Pass 1: page the delta, collecting change descriptors + delete ids ----
@@ -112,10 +113,14 @@ export class DeltaPuller {
           deletes.push(id);
           continue;
         }
+        // Resource blob change: the meta item may be untouched, so map it to
+        // its `<id>.md` meta name and fetch that too — otherwise a blob-only
+        // update (official Joplin client, crashed upload) is never pulled.
+        const blobId = resourceBlobId(d.name);
+        if (blobId) { blobChangedIds.add(blobId); continue; }
         // Only collect fetchable note/folder/resource metadata items
-        // (`<id>.md`); resource blobs (`.resource/<id>`) are pulled via their
-        // metadata item in pass 2.
-        if (!d.name.startsWith('.resource/') && /^[0-9a-f]{32}\.md$/.test(d.name)) {
+        // (`<id>.md`).
+        if (/^[0-9a-f]{32}\.md$/.test(d.name)) {
           changes.push(d);
         }
       }
@@ -138,18 +143,19 @@ export class DeltaPuller {
     }
     const goneIds = new Set<string>();
     if (deletes.length > 0) {
-      for (const batch of chunk(deletes, DeltaPuller.DOWNLOAD_BATCH)) {
-        const results = await Promise.all(batch.map(async (id) => {
-          try {
-            const stillThere = await this.plugin.api.getItem(id + '.md');
-            return stillThere === null ? id : null;
-          } catch (e: unknown) {
-            console.warn('[joplin-sync] delete verification failed for ' + id + ', skipping local delete: '
-              + (e instanceof Error ? e.message : String(e)));
-            return null;
-          }
-        }));
-        for (const id of results) if (id) goneIds.add(id);
+      const results = await mapConcurrent(deletes, this.plugin.api.gate, async (id) => {
+        const stillThere = await this.plugin.api.getItem(id + '.md');
+        return stillThere === null ? id : null;
+      });
+      for (const r of results) {
+        if (r.error !== undefined) {
+          // A delete we could not verify is a delete we must not apply: the
+          // server may still have the item (flaky network ≠ confirmation).
+          console.warn('[joplin-sync] delete verification failed for ' + r.item + ', skipping local delete: '
+            + redactErr(r.error));
+          continue;
+        }
+        if (r.value) goneIds.add(r.value);
       }
     }
     for (const id of deletes) {
@@ -162,27 +168,30 @@ export class DeltaPuller {
       catch (e) { stats.fail++; console.error('[joplin-sync] delta delete failed', id, e); }
     }
 
-    // ---- Pass 2: parallel batch download of changed-item content ----
+    // ---- Pass 2: parallel download of changed-item content ----
     const downloaded: { d: DeltaItem; raw: string }[] = [];
+    // Fetch meta items for blob-only changes (deduped against `changes`).
+    const changeNames = new Set(changes.map(c => c.name));
+    for (const blobId of blobChangedIds) {
+      const name = blobId + '.md';
+      if (changeNames.has(name)) continue;
+      changes.push({ name, type: DeltaChangeType.Update, updated_time: 0 });
+      changeNames.add(name);
+    }
     if (changes.length > 0) {
-      console.debug('[joplin-sync] pull: downloading ' + changes.length + ' changed items in parallel batches of '
-        + DeltaPuller.DOWNLOAD_BATCH + '...');
-      let batchNum = 0;
-      for (const batch of chunk(changes, DeltaPuller.DOWNLOAD_BATCH)) {
-        batchNum++;
-        if (batchNum % 40 === 0) console.debug('[joplin-sync] pull: download batch ' + batchNum + '/'
-          + Math.ceil(changes.length / DeltaPuller.DOWNLOAD_BATCH) + ' (' + downloaded.length + ' so far)');
-        const results = await Promise.all(batch.map(async (d) => {
-          try {
-            const raw = await this.plugin.api.getItem(d.name);
-            return raw !== null ? { d, raw } : null;
-          } catch (e: unknown) {
-            stats.fail++;
-            console.error('[joplin-sync] pull download failed', d.name, e);
-            return null;
-          }
-        }));
-        for (const r of results) if (r) downloaded.push(r);
+      console.debug('[joplin-sync] pull: downloading ' + changes.length + ' changed items (gate limit '
+        + this.plugin.api.gate.limit + ')...');
+      const results = await mapConcurrent(changes, this.plugin.api.gate, async (d) => {
+        const raw = await this.plugin.api.getItem(d.name);
+        return raw !== null ? { d, raw } : null;
+      });
+      for (const r of results) {
+        if (r.error !== undefined) {
+          stats.fail++;
+          console.error('[joplin-sync] pull download failed', r.item.name, r.error);
+          continue;
+        }
+        if (r.value) downloaded.push(r.value);
       }
     }
 
@@ -231,15 +240,21 @@ export class DeltaPuller {
       }
     }
 
-    // Resources: download blobs in parallel batches (network-heavy, like the
-    // note content above). Downloads are independent; mapping writes are safe
-    // (in-memory until the cycle flushes).
+    // Resources: download blobs through the shared gate (network-heavy).
+    // Downloads are independent; mapping writes are safe (in-memory until the
+    // cycle flushes). Blob-only delta changes force the re-download: their
+    // meta blob_updated_time did not move, so the normal skip check would
+    // wrongly treat the attachment as up-to-date.
     if (resources.length > 0) {
-      for (const batch of chunk(resources, DeltaPuller.DOWNLOAD_BATCH)) {
-        await Promise.all(batch.map(async (r) => {
-          try { await this.applyResource(r); stats.created++; }
-          catch (e) { stats.fail++; console.error('[joplin-sync] resource apply failed', r.id, e); }
-        }));
+      const results = await mapConcurrent(resources, this.plugin.api.gate, (r) =>
+        this.applyResource(r, blobChangedIds.has(r.id)));
+      for (const r of results) {
+        if (r.error !== undefined) {
+          stats.fail++;
+          console.error('[joplin-sync] resource apply failed', r.item.id, r.error);
+        } else {
+          stats.created++;
+        }
       }
     }
 
@@ -360,12 +375,29 @@ export class DeltaPuller {
 
   /** Remove a locally-mapped item from the vault + mapping. The server
    *  existence check is done up front in pullAll (in parallel); this only does
-   *  the local removal for ids already confirmed gone on the server. */
+   *  the local removal for ids already confirmed gone on the server.
+   *
+   *  Remote delete + local edit is a genuine conflict: the file changed here
+   *  since the last sync, so deleting it would destroy work the server never
+   *  saw. Keep the file and zero remoteUpdatedTime so the next push re-uploads
+   *  it (delete is effectively rejected). Unchanged files are deleted. */
   private async applyDeleteLocal(id: string): Promise<boolean> {
     const mapping = this.plugin.mapping.getById(id);
     if (!mapping) return false;
 
     const f = this.plugin.app.vault.getAbstractFileByPath(mapping.path.replace(/\/$/, ''));
+    if (f instanceof TFile && mapping.type === ModelType.Note && mapping.localHash) {
+      try {
+        const content = await this.plugin.app.vault.read(f);
+        if ((await sha256(content)) !== mapping.localHash) {
+          console.warn('[joplin-sync] remote delete for ' + mapping.path
+            + ' conflicts with local edits — keeping the file and re-uploading it');
+          new Notice('Conflict: "' + mapping.path + '" was deleted on the server but edited locally. Local copy kept.', 8000);
+          this.plugin.mapping.upsert({ ...mapping, remoteUpdatedTime: 0 });
+          return false;
+        }
+      } catch { /* unreadable — fall through to delete */ }
+    }
     if (f) {
       this.watcher.suppress(f.path);
       if (f instanceof TFile) {
@@ -378,6 +410,7 @@ export class DeltaPuller {
       this.watcher.release(f.path);
     }
     this.plugin.mapping.remove(id);
+    this.plugin.baseSnapshots?.delete(id);
     return true;
   }
 
@@ -403,14 +436,12 @@ export class DeltaPuller {
       localHash: await sha256(stampFrontmatter(item.body ?? '', item.id)),
       remoteUpdatedTime: item.updated_time, syncedAt: Date.now(),
     });
+    // The downloaded body IS the new three-way-merge base.
+    this.plugin.baseSnapshots?.set(item.id, item.body ?? '');
   }
 
-  private async applyResource(item: JoplinItem): Promise<void> {
-    try {
-      await this.resources.downloadResource(item);
-    } catch (e) {
-      console.error('[joplin-sync] download resource failed: ' + item.id, e);
-    }
+  private async applyResource(item: JoplinItem, forceBlob = false): Promise<void> {
+    await this.resources.downloadResource(item, forceBlob);
   }
 
   private resolveFolderPath(parentId: string): string {
@@ -465,9 +496,8 @@ export class DeltaPuller {
   }
 }
 
-/** Split an array into fixed-size chunks (for bounded parallelism). */
-function chunk<T>(arr: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
+function redactErr(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  // API errors can echo auth headers; keep them out of the console.
+  return msg.replace(/(X-API-AUTH\s*[:=]\s*)[^\s,;'"}]+/gi, '$1***');
 }

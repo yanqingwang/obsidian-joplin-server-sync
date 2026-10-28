@@ -8,9 +8,13 @@ Bidirectional sync between Obsidian and a [Joplin Server](https://github.com/lau
 - **Attachments** — files are synced as Joplin resources and restored on the other side
 - **End-to-end encryption (E2EE)** — optionally encrypt everything (notes, folders, attachments) before upload, using the official Joplin E2EE protocol. Enabled with one toggle + password, and verified against the master keys already stored on the server (one account, one password, no duplicate key generation)
 - **Multi-client consistency** — every local file carries a stable `joplin-file-id` in its frontmatter, and a persistent change log drives conflict-free merge across multiple syncing clients
+- **True three-way merge** — the last-synced body of every note is persisted, so edits to different regions of the same note merge automatically; only genuinely overlapping edits fall back to the conflict strategy
+- **Destructive-op protection** — `Force push` / `Force pull` require a typed vault-name confirmation (toggleable), and a force pull that would shrink the vault far below its mapped size is blocked (wrong sync target / wiped server), *before* any local file is deleted
+- **Delete vs. edit safety** — a note deleted on the server while it was edited locally is kept locally and re-uploaded instead of being destroyed
 - **Folder & file moves/renames** — moving or renaming files and folders in Obsidian propagates to the server and to other clients
 - **Conflict resolution** — duplicate, local-wins, or remote-wins strategies; three-way auto-merge for compatible changes
 - **Force sync** — `Force push` wipes the server (protecting `info.json` and E2EE master keys) then re-uploads everything; `Force pull` wipes local files then re-downloads everything
+- **Resilient transport** — per-request timeouts, jittered exponential backoff, 401 re-auth, an adaptive concurrency gate that speeds up on healthy servers and backs off on 429/5xx, and credentials/session tokens redacted from all logs
 - **Sync history** — a settings panel table shows every sync cycle with created/updated/deleted/failed counts
 - **Link & tag conversion** — Obsidian wiki-links and tags are converted to Joplin-compatible Markdown on upload and back on download
 - **Exclude patterns** — skip paths (e.g. `.obsidian/`, `_conflicts/`, `templates/`) via comma-separated prefixes
@@ -60,6 +64,7 @@ Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](
 | Email / Password | Joplin Server account credentials (password stored in plugin `data.json`) |
 | Auto sync interval | Seconds between automatic syncs. `0` = manual only (min 60) |
 | Sync on startup | Run a sync when Obsidian starts |
+| Confirm force push / force pull | Ask for a typed vault-name confirmation before overwriting the server or the local vault |
 | Conflict strategy | `Duplicate`, `Local wins`, or `Remote wins` |
 | Sync folders only | Sync folder structure only, no note content (useful for testing) |
 | Exclude patterns | Comma-separated path prefixes to skip |
@@ -84,12 +89,26 @@ npm run dev
 npm run build
 ```
 
-Run the test suite:
+Run the offline test suites (no server needed):
 
 ```bash
-npx esbuild test/full-change-sync.test.ts --bundle --platform=node --format=esm --outfile=test/full-change-sync.mjs --alias:obsidian=./test/mock/obsidian-real.ts
-node test/full-change-sync.mjs
+# reliability regressions: delete-vs-edit safety, blob-only delta pull,
+# incomplete-server guard, changelog durability, three-way merge, redaction
+npx esbuild test/reliability.test.ts --bundle --platform=node --format=cjs \
+  --alias:obsidian=./test/mock/obsidian.ts --outfile=test/reliability-out.cjs --log-level=error
+node test/reliability-out.cjs
+
+# E2EE protocol vectors
+npx esbuild test/e2ee.test.ts --bundle --platform=node --format=esm --outfile=test/e2ee-out.mjs --log-level=error
+node test/e2ee-out.mjs
+
+# force push → server → force pull round-trip (in-memory mock server)
+npx esbuild test/run.ts --bundle --platform=node --format=cjs \
+  --alias:obsidian=./test/mock/obsidian.ts --outfile=test/run-out.cjs --log-level=error
+node test/run-out.cjs
 ```
+
+The suites under `test/*.test.ts` that import `test/mock/obsidian-real.ts` drive a REAL Joplin Server (credentials read from a local vault) and are used for release verification.
 
 ## License
 

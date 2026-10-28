@@ -141,6 +141,8 @@ export class InitialSync {
       joplinId: id, path: file.path, type: ModelType.Note,
       localHash: hash, remoteUpdatedTime: res.updated_time || now, syncedAt: now,
     });
+    // The uploaded content is the new three-way-merge base.
+    this.plugin.baseSnapshots?.set(id, content);
   }
 
   private collectMarkdownFiles(): TFile[] {

@@ -126,7 +126,7 @@ export async function mapConcurrent<T, R>(
   gate: ConcurrencyGate,
   fn: (item: T, index: number) => Promise<R>,
 ): Promise<{ value?: R; error?: unknown; item: T }[]> {
-  const out: { value?: R; error?: unknown; item: T }[] = new Array(items.length);
+  const out: { value?: R; error?: unknown; item: T }[] = items.map((item) => ({ item }));
   await Promise.all(items.map((item, i) => gate.run(async () => {
     try {
       out[i] = { value: await fn(item, i), item };
@@ -138,5 +138,28 @@ export async function mapConcurrent<T, R>(
 }
 
 export function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+/**
+ * Human-readable text for a thrown value.
+ *
+ * `String(e)` on a plain object prints `[object Object]`, which is what the
+ * notices showed when a non-Error was thrown; prefer a `message` when the value
+ * carries one and fall back to JSON so the text is still actionable.
+ */
+export function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  if (e && typeof e === 'object') {
+    const message = (e as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+    try {
+      return JSON.stringify(e);
+    } catch {
+      return Object.prototype.toString.call(e);
+    }
+  }
+  if (typeof e === 'number' || typeof e === 'boolean' || typeof e === 'bigint') return String(e);
+  return 'Unknown error';
 }

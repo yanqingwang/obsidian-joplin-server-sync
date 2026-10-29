@@ -352,7 +352,7 @@ export class EncryptionService {
     if (isNaN(mdSize) || !mdSize) throw new Error('Invalid E2EE header metadata size: ' + mdSizeHex);
     const md = ct.slice(HEADER_IDENTIFIER.length + 6, HEADER_IDENTIFIER.length + 6 + mdSize);
     // md layout: [2-hex method][32-hex masterKeyId]
-    const method = parseInt(md.slice(0, 2), 16) as EncryptionMethod;
+    const method: EncryptionMethod = parseInt(md.slice(0, 2), 16);
     const masterKeyId = md.slice(2, 34);
     if (masterKeyId.length !== 32) throw new Error('Invalid E2EE header master key ID size');
     return { version: 1, method, masterKeyId };

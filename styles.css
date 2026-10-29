@@ -3,3 +3,5 @@
 .joplin-sync-status.syncing { color: var(--text-accent); }
 .joplin-sync-status.ok { color: var(--text-success); }
 .joplin-sync-status.error { color: var(--text-error); }
+/* Typed-confirmation field: full width without an inline style. */
+.joplin-sync-confirm-input { width: 100%; }

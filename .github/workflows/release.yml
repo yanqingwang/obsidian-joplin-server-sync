@@ -2,9 +2,10 @@ name: Release
 
 on:
   push:
+    # Obsidian matches the release tag against manifest.json verbatim, so only
+    # plain `x.y.z` tags are allowed; a `v`-prefixed tag fails the guard below.
     tags:
-      - 'v*'
-      - '[0-9]*'
+      - '[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -23,7 +24,19 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - run: npm run lint
+      - run: npm test
       - run: npm run build
+
+      # Obsidian only accepts a release whose tag equals the manifest version,
+      # with no `v` prefix.
+      - name: Check tag matches manifest version
+        run: |
+          ver="$(node -p "require('./manifest.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match manifest.json version $ver"
+            exit 1
+          fi
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1

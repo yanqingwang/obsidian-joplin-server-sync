@@ -58,13 +58,15 @@ export class ChangeQueue {
   private persistTimer: number | null = null;
   private persist(): void {
     if (this.persistTimer) return;
-    this.persistTimer = window.setTimeout(async () => {
+    this.persistTimer = window.setTimeout(() => {
       this.persistTimer = null;
       const adapter = this.plugin.app.vault.adapter;
-      await adapter.write(
-        this.plugin.manifest.dir + '/data/queue.json',
-        JSON.stringify([...this.items.values()]),
-      );
+      void adapter
+        .write(
+          this.plugin.manifest.dir + '/data/queue.json',
+          JSON.stringify([...this.items.values()]),
+        )
+        .catch((e: unknown) => console.error('[joplin-sync] queue persist failed', e));
     }, 500);
   }
 

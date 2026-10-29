@@ -285,7 +285,7 @@ var ConcurrencyGate = class {
   }
 };
 async function mapConcurrent(items, gate, fn) {
-  const out = new Array(items.length);
+  const out = items.map((item) => ({ item }));
   await Promise.all(items.map((item, i) => gate.run(async () => {
     try {
       out[i] = { value: await fn(item, i), item };
@@ -296,7 +296,26 @@ async function mapConcurrent(items, gate, fn) {
   return out;
 }
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+function errorMessage(e) {
+  if (e instanceof Error)
+    return e.message;
+  if (typeof e === "string")
+    return e;
+  if (e && typeof e === "object") {
+    const message = e.message;
+    if (typeof message === "string" && message)
+      return message;
+    try {
+      return JSON.stringify(e);
+    } catch {
+      return Object.prototype.toString.call(e);
+    }
+  }
+  if (typeof e === "number" || typeof e === "boolean" || typeof e === "bigint")
+    return String(e);
+  return "Unknown error";
 }
 
 // src/api/JoplinServerApi.ts
@@ -529,11 +548,9 @@ var _JoplinServerApi = class _JoplinServerApi {
       if (item.item_name)
         item.name = item.item_name;
       const jut = item.jop_updated_time;
-      if (jut !== void 0 && jut !== null) {
-        const n = typeof jut === "number" ? jut : Date.parse(String(jut));
-        if (Number.isFinite(n) && n > 0)
-          item.updated_time = n;
-      }
+      const jutMs = typeof jut === "number" ? jut : typeof jut === "string" ? Date.parse(jut) : NaN;
+      if (Number.isFinite(jutMs) && jutMs > 0)
+        item.updated_time = jutMs;
       if (item.type !== void 0 && item.type !== null)
         item.type = Number(item.type);
     }
@@ -887,6 +904,19 @@ var DEFAULTS = {
   deleted_time: 0,
   icon: ""
 };
+function scalarText(value) {
+  if (typeof value === "string")
+    return value;
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint")
+    return String(value);
+  if (value === null || value === void 0)
+    return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
 var JoplinSerializer = class {
   serialize(item) {
     const order = this.fieldOrder(item.type_);
@@ -900,7 +930,7 @@ var JoplinSerializer = class {
     for (const key of order) {
       const rawValue = item[key];
       const value = rawValue ?? DEFAULTS[key] ?? "";
-      lines.push(key + ": " + (TIME_FIELDS.has(key) ? this.formatTime(Number(value)) : String(value)));
+      lines.push(key + ": " + (TIME_FIELDS.has(key) ? this.formatTime(Number(value)) : scalarText(value)));
     }
     return lines.join("\n");
   }
@@ -2592,8 +2622,7 @@ function confirmDestructive(app, opts) {
         text: 'Type "' + opts.requireText + '" to confirm:',
         cls: "mod-warning"
       });
-      input = modal.contentEl.createEl("input", { type: "text" });
-      input.style.width = "100%";
+      input = modal.contentEl.createEl("input", { type: "text", cls: "joplin-sync-confirm-input" });
     }
     const btns = modal.contentEl.createDiv({ cls: "modal-button-container" });
     const okBtn = btns.createEl("button", { text: opts.ctaText });
@@ -2649,7 +2678,7 @@ var SyncEngine = class {
     this.resources = new ResourceManager(plugin);
   }
   get configDir() {
-    return this.plugin.app.vault.configDir ?? ".obsidian";
+    return this.plugin.app.vault.configDir;
   }
   /** True only in the real Obsidian plugin (set in main.ts). Headless hosts
    *  (tests / CLI) construct plugin stubs without it: confirmations are
@@ -2943,10 +2972,14 @@ var SyncEngine = class {
   startScheduler() {
     const interval = this.plugin.settings.syncIntervalSec;
     if (interval > 0) {
-      this.timer = window.setInterval(() => this.syncCycle(), Math.max(60, interval) * 1e3);
+      this.timer = window.setInterval(() => {
+        void this.syncCycle();
+      }, Math.max(60, interval) * 1e3);
     }
     if (this.plugin.settings.syncOnStartup) {
-      window.setTimeout(() => this.syncCycle(), 5e3);
+      window.setTimeout(() => {
+        void this.syncCycle();
+      }, 5e3);
     }
   }
   // ============ Phase 2: Sync Cycle ============
@@ -3009,7 +3042,7 @@ var SyncEngine = class {
       new import_obsidian10.Notice("Sync complete: " + parts.join(", ") + ". " + totalMapped + " item(s) mapped");
     } catch (e) {
       this.state = 4 /* Error */;
-      const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
+      const msg = errorMessage(e);
       console.error("[joplin-sync] sync cycle failed:", msg);
       this.plugin.statusBar.setError(msg);
       new import_obsidian10.Notice("Sync failed: " + msg, 8e3);
@@ -3565,7 +3598,7 @@ var SyncEngine = class {
     try {
       await this.forcePullInner();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
+      const msg = errorMessage(e);
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
       new import_obsidian10.Notice("Force pull failed: " + msg, 8e3);
@@ -3949,7 +3982,7 @@ var SyncEngine = class {
       if (localRemoved)
         console.debug("[joplin-sync] force pull removed " + localRemoved + " stale local files");
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e ?? "Unknown error");
+      const msg = errorMessage(e);
       console.error("[joplin-sync] force pull failed:", msg);
       this.plugin.statusBar.setError(msg);
       new import_obsidian10.Notice("Force pull failed: " + msg, 8e3);
@@ -4632,10 +4665,9 @@ var ChangeLogStore = class {
       this.persistTimer = null;
     }
     return new Promise((resolve) => {
-      this.persistTimer = window.setTimeout(async () => {
+      this.persistTimer = window.setTimeout(() => {
         this.persistTimer = null;
-        await this.writeNow();
-        resolve();
+        void this.writeNow().then(resolve, resolve);
       }, 500);
     });
   }

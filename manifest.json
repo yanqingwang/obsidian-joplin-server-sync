@@ -1,10 +1,10 @@
 {
-  "id": "joplin-server-sync",
-  "name": "Joplin Server Sync",
-  "version": "0.4.5",
-  "minAppVersion": "1.7.4",
-  "description": "Bidirectional sync with Joplin Server: notes, folders, attachments, E2EE, multi-client merge.",
-  "author": "rosswang",
-  "authorUrl": "https://github.com/yanqingwang",
-  "isDesktopOnly": false
+	"id": "joplin-server-sync",
+	"name": "Joplin Server Sync",
+	"version": "0.4.6",
+	"minAppVersion": "1.7.4",
+	"description": "Bidirectional sync with Joplin Server: notes, folders, attachments, E2EE, multi-client merge.",
+	"author": "rosswang",
+	"authorUrl": "https://github.com/yanqingwang",
+	"isDesktopOnly": false
 }

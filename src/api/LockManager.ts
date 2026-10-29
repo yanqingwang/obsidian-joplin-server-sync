@@ -42,13 +42,17 @@ export class LockManager {
 
   private startAutoRefresh(): void {
     this.stopAutoRefresh();
-    this.refreshTimer = window.setInterval(async () => {
-      try {
-        this.currentLock = await this.api.acquireLock(LockType.Sync, this.clientType, this.clientId);
-      } catch (e) {
-        console.error('[joplin-sync] lock refresh failed', e);
-        this.onLockLost?.();
-      }
+    this.refreshTimer = window.setInterval(() => {
+      // The timer callback must not return a promise; the work is fire-and-forget
+      // and every failure is handled inside.
+      void (async () => {
+        try {
+          this.currentLock = await this.api.acquireLock(LockType.Sync, this.clientType, this.clientId);
+        } catch (e) {
+          console.error('[joplin-sync] lock refresh failed', e);
+          this.onLockLost?.();
+        }
+      })();
     }, REFRESH_INTERVAL_MS);
   }
 

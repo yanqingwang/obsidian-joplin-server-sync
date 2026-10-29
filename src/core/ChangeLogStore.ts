@@ -116,10 +116,9 @@ export class ChangeLogStore {
       this.persistTimer = null;
     }
     return new Promise<void>((resolve) => {
-      this.persistTimer = window.setTimeout(async () => {
+      this.persistTimer = window.setTimeout(() => {
         this.persistTimer = null;
-        await this.writeNow();
-        resolve();
+        void this.writeNow().then(resolve, resolve);
       }, 500);
     });
   }

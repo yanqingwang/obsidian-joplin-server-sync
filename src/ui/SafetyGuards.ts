@@ -35,8 +35,7 @@ export function confirmDestructive(app: App, opts: {
         text: 'Type "' + opts.requireText + '" to confirm:',
         cls: 'mod-warning',
       });
-      input = modal.contentEl.createEl('input', { type: 'text' });
-      input.style.width = '100%';
+      input = modal.contentEl.createEl('input', { type: 'text', cls: 'joplin-sync-confirm-input' });
     }
     const btns = modal.contentEl.createDiv({ cls: 'modal-button-container' });
     const okBtn = btns.createEl('button', { text: opts.ctaText });

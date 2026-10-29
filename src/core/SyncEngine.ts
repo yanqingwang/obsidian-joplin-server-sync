@@ -1,6 +1,7 @@
 import { Notice, Modal, TFile, TAbstractFile, TFolder } from 'obsidian';
 import type JoplinSyncPlugin from '../main';
 import { JoplinSerializer } from '../convert/JoplinSerializer';
+import { errorMessage } from './netUtil';
 import { SyncInfoHandler } from './SyncInfo';
 import { createJoplinId } from '../mapping/IdGenerator';
 import { ModelType, JoplinItem } from '../api/models';
@@ -34,7 +35,7 @@ export class SyncEngine {
   resources!: ResourceManager;
 
   private get configDir(): string {
-    return this.plugin.app.vault.configDir ?? '.obsidian';
+    return this.plugin.app.vault.configDir;
   }
 
   /** True only in the real Obsidian plugin (set in main.ts). Headless hosts
@@ -321,10 +322,10 @@ export class SyncEngine {
     if (interval > 0) {
       // Clamp to ≥60s (matching the setting's documented minimum): a typo like
       // "5" would otherwise fire a full sync cycle 12×/minute.
-      this.timer = window.setInterval(() => this.syncCycle(), Math.max(60, interval) * 1000);
+      this.timer = window.setInterval(() => { void this.syncCycle(); }, Math.max(60, interval) * 1000);
     }
     if (this.plugin.settings.syncOnStartup) {
-      window.setTimeout(() => this.syncCycle(), 5000);
+      window.setTimeout(() => { void this.syncCycle(); }, 5000);
     }
   }
 
@@ -395,7 +396,7 @@ export class SyncEngine {
       new Notice('Sync complete: ' + parts.join(', ') + '. ' + totalMapped + ' item(s) mapped');
     } catch (e: unknown) {
       this.state = SyncState.Error;
-      const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');
+      const msg = errorMessage(e);
       console.error('[joplin-sync] sync cycle failed:', msg);
       this.plugin.statusBar.setError(msg);
       new Notice('Sync failed: ' + msg, 8000);
@@ -897,7 +898,7 @@ export class SyncEngine {
     try {
       await this.forcePullInner();
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');
+      const msg = errorMessage(e);
       console.error('[joplin-sync] force pull failed:', msg);
       this.plugin.statusBar.setError(msg);
       new Notice('Force pull failed: ' + msg, 8000);
@@ -1282,7 +1283,7 @@ export class SyncEngine {
       if (localRemoved) console.debug('[joplin-sync] force pull removed ' + localRemoved + ' stale local files');
 
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e ?? 'Unknown error');
+      const msg = errorMessage(e);
       console.error('[joplin-sync] force pull failed:', msg);
       this.plugin.statusBar.setError(msg);
       new Notice('Force pull failed: ' + msg, 8000);

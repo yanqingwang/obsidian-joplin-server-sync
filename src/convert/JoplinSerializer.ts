@@ -46,6 +46,22 @@ const DEFAULTS: Record<string, string | number> = {
   master_key_id: '', user_data: '', deleted_time: 0, icon: '',
 };
 
+/**
+ * Text for a frontmatter value. `String()` on an object prints `[object Object]`,
+ * which would silently write a corrupt field, so anything non-primitive is
+ * JSON-encoded instead.
+ */
+function scalarText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  if (value === null || value === undefined) return '';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '';
+  }
+}
+
 export class JoplinSerializer {
 
   serialize(item: JoplinItem): string {
@@ -62,7 +78,7 @@ export class JoplinSerializer {
     for (const key of order) {
       const rawValue = (item as Record<string, unknown>)[key];
       const value = rawValue ?? DEFAULTS[key] ?? '';
-      lines.push(key + ': ' + (TIME_FIELDS.has(key) ? this.formatTime(Number(value)) : String(value)));
+      lines.push(key + ': ' + (TIME_FIELDS.has(key) ? this.formatTime(Number(value)) : scalarText(value)));
     }
     return lines.join('\n');
   }

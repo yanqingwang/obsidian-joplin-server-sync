@@ -1,17 +1,22 @@
 {
   "name": "obsidian-joplin-server-sync",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Sync Obsidian vault with Joplin Server",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "lint": "eslint src",
+    "test": "node test/build.mjs && node test/out.cjs && npx esbuild test/reliability.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/mock/obsidian.ts --outfile=test/reliability-out.cjs --log-level=error && node test/reliability-out.cjs && npx esbuild test/e2ee.test.ts --bundle --platform=node --format=esm --outfile=test/e2ee-out.mjs --log-level=error && node test/e2ee-out.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "esbuild": "^0.19.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-obsidianmd": "^0.4.2",
     "obsidian": "^1.6.0",
     "tslib": "^2.6.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "typescript-eslint": "^8.72.1"
   }
 }

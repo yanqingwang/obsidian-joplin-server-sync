@@ -259,10 +259,8 @@ export class JoplinServerApi {
       // jop_updated_time is the SERVER write time; prefer it, but only when it
       // is a usable timestamp (some builds send it as a string).
       const jut = item.jop_updated_time;
-      if (jut !== undefined && jut !== null) {
-        const n = typeof jut === 'number' ? jut : Date.parse(String(jut));
-        if (Number.isFinite(n) && n > 0) item.updated_time = n;
-      }
+      const jutMs = typeof jut === 'number' ? jut : typeof jut === 'string' ? Date.parse(jut) : NaN;
+      if (Number.isFinite(jutMs) && jutMs > 0) item.updated_time = jutMs;
       if (item.type !== undefined && item.type !== null) item.type = Number(item.type);
     }
     const page = { items, has_more: !!raw.has_more, cursor: raw.cursor as string | undefined };
